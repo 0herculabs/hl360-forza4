@@ -1,0 +1,23 @@
+diff --git a/include/rex/system/xam/content_manager.h b/include/rex/system/xam/content_manager.h
+index 949d185..05adb71 100644
+--- a/include/rex/system/xam/content_manager.h
++++ b/include/rex/system/xam/content_manager.h
+@@ -68,9 +68,15 @@ struct XCONTENT_DATA {
+   }
+ 
+   std::string file_name() const {
+-    std::string value;
+-    value.assign(file_name_raw, std::min(strlen(file_name_raw), countof(file_name_raw)));
+-    return value;
++    // fm3-recomp: content file names are printable ASCII; stop at the first
++    // byte that is not (a name filling all 42 chars may be followed by game
++    // data rather than a terminator), so later UTF-8 conversions can't throw.
++    size_t length = 0;
++    while (length < countof(file_name_raw) && file_name_raw[length] >= 0x20 &&
++           static_cast<unsigned char>(file_name_raw[length]) < 0x7F) {
++      ++length;
++    }
++    return std::string(file_name_raw, length);
+   }
+ 
+   void set_display_name(const std::u16string_view value) {

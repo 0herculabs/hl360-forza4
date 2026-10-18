@@ -1,0 +1,44 @@
+setjmp_address = 0x82768B30
+longjmp_address = 0x82768700
+
+# FM4 USA Rev 1, default.xex 0.0.0.14. Boundaries verified in the dumped PPC image.
+[functions]
+0x827EB668 = { size = 0x10 }
+0x827EB680 = { size = 0x08 }
+0x827EB688 = { size = 0x08 }
+0x827EB690 = { size = 0x08 }
+0x827EB698 = { size = 0x08 }
+0x827EB6A0 = { size = 0x0C }
+0x82A58878 = { size = 0x18 }
+0x82A758C8 = { size = 0x08 }
+# Getter with a shared epilogue after its first blr.
+0x82B0E420 = { end = 0x82B0E4B0 }
+0x8280B760 = { size = 0x08 }
+0x8280B768 = { size = 0x08 }
+0x8280B770 = { size = 0x08 }
+0x8280B778 = { size = 0x14 }
+
+0x82C85380 = { end = 0x82C8578C }
+
+# Independently verified prologue/epilogue; prevents a merged truncated body.
+0x825D1710 = { end = 0x825D1764 }
+
+0x825D12F0 = { end = 0x825D1630 }
+0x825D1630 = { end = 0x825D1710 }
+
+[rexcrt]
+ConvertThreadToFiber = 0x82C829F0
+ConvertFiberToThread = 0x82C82A80
+CreateFiber = 0x82C82AD0
+DeleteFiber = 0x82C82BB0
+SwitchToFiber = 0x82C85380
+
+
+
+
+# Byte-indexed computed branch, guarded by cmplwi r3,9. Automatic
+# discovery scanned beyond its ten entries into adjacent byte data.
+[[switch_tables]]
+address = 0x825D1350
+register = 28
+labels = [0x825D1354, 0x825D1378, 0x825D13A0, 0x825D13AC, 0x825D13B8, 0x825D13C4, 0x825D13D0, 0x825D1360, 0x825D1420, 0x825D136C]

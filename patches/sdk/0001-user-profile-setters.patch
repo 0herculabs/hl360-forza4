@@ -1,0 +1,15 @@
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index ec37017..84f68c0 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -223,6 +223,10 @@ class UserProfile {
+ 
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+ 
++  // fm3-recomp: let the host app sign in a launcher-selected profile.
++  void set_xuid(uint64_t xuid) { xuid_ = xuid; }
++  void set_name(std::string name) { name_ = std::move(name); }
++
+   void AddSetting(std::unique_ptr<Setting> setting);
+   Setting* GetSetting(uint32_t setting_id);
+ 

@@ -1,0 +1,29 @@
+# Local game data and user content
+/game/
+/user/
+/work/
+
+# Builds, generated recompilation output and diagnostics
+/out/
+/generated/default/
+*.log
+*.dmp
+
+# Third-party release archives are not redistributed
+/*.zip
+
+# Local publishing scratch directory
+/.publish-review/
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+/thirdparty/sdk/
+/generated/xmedia/
+/generated/speech/
+/generated/default.dll_manifest.h
+/generated/dll_targets.cmake

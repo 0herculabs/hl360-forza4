@@ -1,0 +1,27 @@
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..376bb9d 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -914,6 +914,22 @@ void KernelState::RegisterRecompiledModule(const char* pe_name, const char* gues
+ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModule(
+     std::string_view guest_path) {
+   auto global_lock = global_critical_region_.Acquire();
++  // UserModule stores a VFS absolute path, while registrations are title-relative.
++  // Resolve both to the same file so unloading also removes the recompiled DLL.
++  auto requested_entry = file_system_->ResolvePath(guest_path);
++  if (requested_entry && executable_module_) {
++    const auto base_path =
++        rex::string::utf8_find_base_guest_path(executable_module_->path());
++    for (const auto& info : recompiled_modules_) {
++      const auto registered_path =
++          rex::string::utf8_join_guest_paths(base_path, info.guest_path);
++      auto registered_entry = file_system_->ResolvePath(registered_path);
++      if (registered_entry && rex::string::utf8_equal_case(
++              requested_entry->absolute_path(), registered_entry->absolute_path())) {
++        return info;
++      }
++    }
++  }
+   auto normalized = NormalizeGuestPath(guest_path);
+   for (const auto& info : recompiled_modules_) {
+     if (info.guest_path == normalized)

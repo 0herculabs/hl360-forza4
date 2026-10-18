@@ -1,0 +1,6 @@
+# XMediaFacade_default.xex: virtual tail-call target used by a thunk.
+[functions]
+0x88055B60 = { size = 0x10 }
+
+# Indirect-call straight-line tail thunks from data pointers.
+0x88244AC0 = { size = 0xC }

@@ -1,0 +1,11 @@
+# Initial settings inherited from the FM3 runtime; FM4 validation is ongoing.
+gpu_backend = "d3d12"
+vsync = true
+readback_resolve = "fast"
+audio_maxqframes = 16
+async_shader_compilation = false
+gpu_allow_invalid_fetch_constants = true
+execute_unclipped_draw_vs_on_cpu = true
+
+# Diagnostics are opt-in through the game command line.
+frame_stats = false
