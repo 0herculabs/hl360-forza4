@@ -1,0 +1,25 @@
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -268,7 +268,11 @@
+     endif()
+ endif()
+ set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+-set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
++if(APPLE)
++    set(SDL_HAPTIC ON CACHE BOOL "" FORCE)
++else()
++    set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
++endif()
+ set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+ set(SDL_POWER OFF CACHE BOOL "" FORCE)
+ set(SDL_FILESYSTEM OFF CACHE BOOL "" FORCE)
+@@ -286,7 +290,7 @@
+ # Disable dummy drivers
+ set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
+ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+-set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
++set(SDL_DUMMYVIDEO ${APPLE} CACHE BOOL "" FORCE)
+ 
+ # Linux video and audio backends. Both video drivers are always built so the
+ # one in use stays a runtime choice.

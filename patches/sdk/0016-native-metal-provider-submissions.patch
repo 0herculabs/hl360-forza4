@@ -1,0 +1,632 @@
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -134,6 +134,12 @@
+         PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+ endif()
+ 
++
++# Headless provider/submission and watched-memory port.
++if(REXGLUE_BUILD_METAL_SHADER_TOOLS)
++    add_subdirectory("${REXGLUE_ROOT}/src/ui/metal" "${CMAKE_CURRENT_BINARY_DIR}/metal-native")
++endif()
++
+ # Everything PRIVATE: the plugin has no consumers. Never link the OBJECT
+ # libraries (rexcore/rexui) here; rexruntime already contains those objects
+ # and relinking them would duplicate global state.
+diff --git a/include/rex/ui/metal/api.h b/include/rex/ui/metal/api.h
+new file mode 100644
+index 0000000..33ae027
+--- /dev/null
++++ b/include/rex/ui/metal/api.h
+@@ -0,0 +1,3 @@
++#pragma once
++// metal-cpp definitions live in src/ui/metal/api.cpp only.
++#include <Metal/Metal.hpp>
+diff --git a/include/rex/ui/metal/provider.h b/include/rex/ui/metal/provider.h
+new file mode 100644
+index 0000000..9fbb7f0
+--- /dev/null
++++ b/include/rex/ui/metal/provider.h
+@@ -0,0 +1,31 @@
++#pragma once
++/**
++ * Adapted from Xenia-Alloy's metal_provider.h/cc.
++ * Copyright 2026 Ben Vanik. All rights reserved.
++ * Released under the BSD license; see LICENSE in the SDK root.
++ */
++#include <rex/ui/graphics_provider.h>
++#include <rex/ui/metal/api.h>
++
++namespace rex::ui::metal {
++
++// First provider milestone supports offscreen command submission only.
++// Presenter and immediate drawer creation fail explicitly until ported.
++class MetalProvider final : public GraphicsProvider {
++ public:
++  static std::unique_ptr<MetalProvider> Create(bool with_presentation = false);
++  static bool IsMetalAPIAvailable();
++  ~MetalProvider() override;
++  MTL::Device* GetDevice() const { return device_; }
++  MTL::CommandQueue* GetCommandQueue() const { return command_queue_; }
++  std::unique_ptr<Presenter> CreatePresenter(
++      Presenter::HostGpuLossCallback callback = Presenter::FatalErrorHostGpuLossCallback) override;
++  std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() override;
++
++ private:
++  MetalProvider() = default;
++  bool Initialize();
++  MTL::Device* device_ = nullptr;
++  MTL::CommandQueue* command_queue_ = nullptr;
++};
++}  // namespace rex::ui::metal
+diff --git a/include/rex/ui/metal/submission_tracker.h b/include/rex/ui/metal/submission_tracker.h
+new file mode 100644
+index 0000000..0351ca9
+--- /dev/null
++++ b/include/rex/ui/metal/submission_tracker.h
+@@ -0,0 +1,50 @@
++#pragma once
++/**
++ * Adapted from Xenia-Alloy's metal_gpu_completion_timeline.h/cc.
++ * Copyright 2026 Ben Vanik. All rights reserved.
++ * Released under the BSD license; see LICENSE in the SDK root.
++ */
++#include <cstdint>
++#include <deque>
++#include <memory>
++#include <string>
++#include <rex/ui/metal/api.h>
++
++namespace rex::ui::metal {
++// Single owner thread, one queue per tracker, like ReXGlue's Vulkan tracker.
++// Submit owns commit, so a dropped/uncommitted buffer never advances the index.
++// Completed means retired (safe to release resources); await returns false if
++// any submission through the requested index failed, so readback must stop.
++class MetalSubmissionTracker {
++ public:
++  static std::unique_ptr<MetalSubmissionTracker> Create(
++      MTL::CommandQueue* queue, bool use_shared_event = true);
++  ~MetalSubmissionTracker();
++  MetalSubmissionTracker(const MetalSubmissionTracker&) = delete;
++  MetalSubmissionTracker& operator=(const MetalSubmissionTracker&) = delete;
++
++  uint64_t GetCurrentSubmission() const { return upcoming_; }
++  uint64_t UpdateAndGetCompletedSubmission();
++  bool AwaitSubmissionCompletion(uint64_t submission);
++  bool AwaitAllSubmissionsCompletion() { return AwaitSubmissionCompletion(upcoming_ - 1); }
++  // Buffer must be from this queue, not enqueued/committed, with all encoders ended.
++  // Returns 0 for rejected buffers (no index consumed). Retains submitted buffers.
++  uint64_t Submit(MTL::CommandBuffer* buffer);
++  bool has_failed_submission() const { return first_failed_ != 0; }
++  const std::string& last_error() const { return last_error_; }
++  // For future encoder dependencies. Host waits use command-buffer status too:
++  // on GPU error a shared event may never signal.
++  MTL::SharedEvent* shared_event() const { return event_; }
++
++ private:
++  explicit MetalSubmissionTracker(MTL::CommandQueue* queue);
++  struct Pending { uint64_t index; MTL::CommandBuffer* buffer; };
++  MTL::CommandQueue* queue_;
++  MTL::SharedEvent* event_ = nullptr;
++  uint64_t upcoming_ = 1;
++  uint64_t completed_ = 0;
++  uint64_t first_failed_ = 0;
++  std::string last_error_;
++  std::deque<Pending> pending_;
++};
++}  // namespace rex::ui::metal
+diff --git a/src/ui/metal/CMakeLists.txt b/src/ui/metal/CMakeLists.txt
+new file mode 100644
+index 0000000..4f22167
+--- /dev/null
++++ b/src/ui/metal/CMakeLists.txt
+@@ -0,0 +1,17 @@
++# Offscreen provider and ordered submission tracking; not a guest renderer yet.
++if(NOT EXISTS "${REXGLUE_METAL_DEPS_ROOT}/metal-cpp/include/Metal/Metal.hpp")
++    message(FATAL_ERROR "Stage metal-cpp with tools/Build-Metal.py")
++endif()
++add_library(rexmetal-native STATIC
++    api.cpp provider.cpp submission_tracker.cpp)
++target_include_directories(rexmetal-native PUBLIC
++    "${REXGLUE_METAL_DEPS_ROOT}/metal-cpp/include")
++target_compile_options(rexmetal-native PUBLIC -fblocks)
++target_link_libraries(rexmetal-native PUBLIC rexruntime
++    "-framework Metal" "-framework Foundation" "-framework QuartzCore")
++add_executable(rex-metal-submission-check ../../graphics/metal/submission_check.cpp)
++target_link_libraries(rex-metal-submission-check PRIVATE rexmetal-native)
++add_library(rexmetal-memory STATIC ../../graphics/metal/shared_memory.cpp ../../graphics/shared_memory.cpp)
++target_link_libraries(rexmetal-memory PUBLIC rexmetal-native)
++add_executable(rex-metal-memory-check ../../graphics/metal/shared_memory_check.cpp)
++target_link_libraries(rex-metal-memory-check PRIVATE rexmetal-memory)
+diff --git a/src/ui/metal/api.cpp b/src/ui/metal/api.cpp
+new file mode 100644
+index 0000000..784998a
+--- /dev/null
++++ b/src/ui/metal/api.cpp
+@@ -0,0 +1,19 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// This file provides the single implementation point for metal-cpp to avoid
++// duplicate symbol errors. It should be linked by all Metal backend files
++// that need Metal API access.
++
++#define NS_PRIVATE_IMPLEMENTATION
++#define MTL_PRIVATE_IMPLEMENTATION
++#define CA_PRIVATE_IMPLEMENTATION
++#include "Foundation/Foundation.hpp"
++#include "Metal/Metal.hpp"
++#include "QuartzCore/QuartzCore.hpp"
+diff --git a/src/ui/metal/provider.cpp b/src/ui/metal/provider.cpp
+new file mode 100644
+index 0000000..da4cddf
+--- /dev/null
++++ b/src/ui/metal/provider.cpp
+@@ -0,0 +1,54 @@
++/**
++ * Adapted from Xenia-Alloy's metal_provider.cc.
++ * Copyright 2026 Ben Vanik. All rights reserved.
++ * Released under the BSD license; see LICENSE in the SDK root.
++ */
++#include <rex/ui/metal/provider.h>
++#include <rex/logging.h>
++
++namespace rex::ui::metal {
++bool MetalProvider::IsMetalAPIAvailable() {
++  auto* device = MTL::CreateSystemDefaultDevice();
++  if (!device) return false;
++  device->release();
++  return true;
++}
++
++std::unique_ptr<MetalProvider> MetalProvider::Create(bool with_presentation) {
++  if (with_presentation) {
++    REXLOG_ERROR("Metal presentation has not been integrated yet");
++    return nullptr;
++  }
++  auto provider = std::unique_ptr<MetalProvider>(new MetalProvider());
++  return provider->Initialize() ? std::move(provider) : nullptr;
++}
++
++bool MetalProvider::Initialize() {
++  device_ = MTL::CreateSystemDefaultDevice();
++  if (!device_) {
++    REXLOG_ERROR("Metal device unavailable");
++    return false;
++  }
++  command_queue_ = device_->newCommandQueue();
++  if (!command_queue_) {
++    REXLOG_ERROR("Failed to create Metal command queue");
++    return false;
++  }
++  REXLOG_INFO("Metal headless provider: {}", device_->name()->utf8String());
++  return true;
++}
++
++MetalProvider::~MetalProvider() {
++  if (command_queue_) command_queue_->release();
++  if (device_) device_->release();
++}
++
++std::unique_ptr<Presenter> MetalProvider::CreatePresenter(Presenter::HostGpuLossCallback) {
++  REXLOG_ERROR("Metal presenter is not implemented");
++  return nullptr;
++}
++std::unique_ptr<ImmediateDrawer> MetalProvider::CreateImmediateDrawer() {
++  REXLOG_ERROR("Metal immediate drawer is not implemented");
++  return nullptr;
++}
++}  // namespace rex::ui::metal
+diff --git a/src/ui/metal/submission_tracker.cpp b/src/ui/metal/submission_tracker.cpp
+new file mode 100644
+index 0000000..d0c362d
+--- /dev/null
++++ b/src/ui/metal/submission_tracker.cpp
+@@ -0,0 +1,82 @@
++/**
++ * Adapted from Xenia-Alloy's metal_gpu_completion_timeline.cc.
++ * Copyright 2026 Ben Vanik. All rights reserved.
++ * Released under the BSD license; see LICENSE in the SDK root.
++ */
++#include <rex/ui/metal/submission_tracker.h>
++#include <limits>
++#include <rex/logging.h>
++
++namespace rex::ui::metal {
++std::unique_ptr<MetalSubmissionTracker> MetalSubmissionTracker::Create(
++    MTL::CommandQueue* queue, bool use_shared_event) {
++  if (!queue) return nullptr;
++  auto tracker = std::unique_ptr<MetalSubmissionTracker>(new MetalSubmissionTracker(queue));
++  if (use_shared_event) {
++    tracker->event_ = queue->device()->newSharedEvent();
++    if (tracker->event_) {
++      tracker->event_->setLabel(NS::String::string("ReXGlueSubmissionTimeline", NS::UTF8StringEncoding));
++    } else {
++      REXLOG_INFO("Metal shared event unavailable; tracking command-buffer completion");
++    }
++  }
++  return tracker;
++}
++MetalSubmissionTracker::MetalSubmissionTracker(MTL::CommandQueue* queue)
++    : queue_(queue->retain()) {}
++MetalSubmissionTracker::~MetalSubmissionTracker() {
++  AwaitAllSubmissionsCompletion();
++  if (event_) event_->release();
++  queue_->release();
++}
++uint64_t MetalSubmissionTracker::Submit(MTL::CommandBuffer* buffer) {
++  UpdateAndGetCompletedSubmission();
++  if (!buffer || buffer->commandQueue() != queue_ ||
++      buffer->status() != MTL::CommandBufferStatusNotEnqueued || first_failed_ ||
++      upcoming_ == std::numeric_limits<uint64_t>::max()) {
++    return 0;
++  }
++  const uint64_t submission = upcoming_;
++  if (event_) buffer->encodeSignalEvent(event_, submission);
++  // Retain and record before commit; no callbacks capture the tracker's lifetime.
++  pending_.push_back({submission, buffer});
++  buffer->retain();
++  buffer->commit();
++  ++upcoming_;
++  return submission;
++}
++uint64_t MetalSubmissionTracker::UpdateAndGetCompletedSubmission() {
++  // Do not use max(callback indices): callbacks need not retire in order.
++  while (!pending_.empty()) {
++    auto& entry = pending_.front();
++    auto status = entry.buffer->status();
++    if (status != MTL::CommandBufferStatusCompleted && status != MTL::CommandBufferStatusError) break;
++    if (status == MTL::CommandBufferStatusError && !first_failed_) {
++      first_failed_ = entry.index;
++      auto* error = entry.buffer->error();
++      last_error_ = error ? error->localizedDescription()->utf8String() : "Metal command buffer failed";
++      REXLOG_ERROR("Metal submission {} failed: {}", entry.index, last_error_);
++    }
++    completed_ = entry.index;
++    entry.buffer->release();
++    pending_.pop_front();
++  }
++  return completed_;
++}
++bool MetalSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission) {
++  if (submission >= upcoming_) return false;
++  UpdateAndGetCompletedSubmission();
++  if (submission > completed_) {
++    // Waiting for the target queue buffer includes all earlier queue work.
++    // Unlike an event-only wait, this also returns if execution ends in error.
++    for (const auto& entry : pending_) {
++      if (entry.index == submission) {
++        entry.buffer->waitUntilCompleted();
++        break;
++      }
++    }
++    UpdateAndGetCompletedSubmission();
++  }
++  return completed_ >= submission && (!first_failed_ || submission < first_failed_);
++}
++}  // namespace rex::ui::metal
+diff --git a/include/rex/graphics/metal/shared_memory.h b/include/rex/graphics/metal/shared_memory.h
+new file mode 100644
+index 0000000..6c6ccfa
+--- /dev/null
++++ b/include/rex/graphics/metal/shared_memory.h
+@@ -0,0 +1,33 @@
++#pragma once
++/**
++ * Adapted from Xenia-Alloy's metal_shared_memory.h/cc.
++ * Copyright 2026 Ben Vanik. All rights reserved.
++ * Released under the BSD license; see LICENSE in the SDK root.
++ */
++#include <rex/graphics/shared_memory.h>
++#include <rex/ui/metal/provider.h>
++#include <rex/ui/metal/submission_tracker.h>
++
++namespace rex::graphics::metal {
++// Conservative copy-mode port. Provider, tracker and guest memory must outlive
++// this object. Single GPU-owner thread; guest invalidations use the base locks.
++// Request ranges BEFORE encoding references. Submit all previously encoded
++// references before requesting new uploads; uploads drain submitted GPU work.
++class MetalSharedMemory final : public SharedMemory {
++ public:
++  MetalSharedMemory(ui::metal::MetalProvider& provider,
++                    ui::metal::MetalSubmissionTracker& tracker, memory::Memory& memory);
++  ~MetalSharedMemory() override;
++  bool Initialize();
++  void Shutdown();
++  MTL::Buffer* GetBuffer() const { return buffer_; }
++
++ protected:
++  bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) override;
++
++ private:
++  ui::metal::MetalProvider& provider_;
++  ui::metal::MetalSubmissionTracker& tracker_;
++  MTL::Buffer* buffer_ = nullptr;
++};
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/shared_memory.cpp b/src/graphics/metal/shared_memory.cpp
+new file mode 100644
+index 0000000..6abc4e5
+--- /dev/null
++++ b/src/graphics/metal/shared_memory.cpp
+@@ -0,0 +1,57 @@
++/**
++ * Adapted from Xenia-Alloy's metal_shared_memory.cc.
++ * Copyright 2026 Ben Vanik. All rights reserved.
++ * Released under the BSD license; see LICENSE in the SDK root.
++ */
++#include <rex/graphics/metal/shared_memory.h>
++#include <rex/logging.h>
++#include <cstring>
++
++namespace rex::graphics::metal {
++MetalSharedMemory::MetalSharedMemory(ui::metal::MetalProvider& provider,
++                                     ui::metal::MetalSubmissionTracker& tracker,
++                                     memory::Memory& memory)
++    : SharedMemory(memory), provider_(provider), tracker_(tracker) {}
++MetalSharedMemory::~MetalSharedMemory() { Shutdown(); }
++bool MetalSharedMemory::Initialize() {
++  if (buffer_) return true;
++  if (!memory().physical_membase() || !provider_.GetDevice()) return false;
++  buffer_ = provider_.GetDevice()->newBuffer(kBufferSize, MTL::ResourceStorageModeShared);
++  if (!buffer_) {
++    REXLOG_ERROR("Failed to allocate Metal guest-memory copy");
++    return false;
++  }
++  // Upload only requested pages. Do not read unallocated guest pages or alias
++  // live guest CPU writes into a buffer referenced by an in-flight GPU draw.
++  InitializeCommon();
++  return true;
++}
++void MetalSharedMemory::Shutdown() {
++  if (!buffer_) return;
++  // Error completion still retires resources; do not read data on failure.
++  tracker_.AwaitAllSubmissionsCompletion();
++  ShutdownCommon();
++  buffer_->release();
++  buffer_ = nullptr;
++}
++bool MetalSharedMemory::UploadRanges(
++    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
++  if (!buffer_) return false;
++  if (ranges.empty()) return true;
++  // This initial port deliberately waits before any CPU overwrite. A staging
++  // ring and blit copies can replace this once the command processor is ported.
++  if (!tracker_.AwaitAllSubmissionsCompletion()) return false;
++  auto* destination = static_cast<uint8_t*>(buffer_->contents());
++  const auto* source = memory().TranslatePhysical(0);
++  for (const auto& [page, count] : ranges) {
++    const uint64_t start = uint64_t(page) << page_size_log2();
++    const uint64_t length = uint64_t(count) << page_size_log2();
++    if (start >= kBufferSize || length > kBufferSize - start) return false;
++    // Base-class contract: mark before copying so concurrent guest writes
++    // invalidate the range rather than being silently swallowed.
++    MakeRangeValid(uint32_t(start), uint32_t(length), false);
++    std::memcpy(destination + start, source + start, size_t(length));
++  }
++  return true;
++}
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/shared_memory_check.cpp b/src/graphics/metal/shared_memory_check.cpp
+new file mode 100644
+index 0000000..233b27a
+--- /dev/null
++++ b/src/graphics/metal/shared_memory_check.cpp
+@@ -0,0 +1,91 @@
++// Checks watched guest uploads and an in-flight GPU/CPU overwrite boundary.
++#include <rex/graphics/metal/shared_memory.h>
++#include <Foundation/NSSharedPtr.hpp>
++#include <rex/logging.h>
++#include <chrono>
++#include <cstdio>
++#include <stdexcept>
++#include <thread>
++
++namespace {
++void Require(bool ok, const char* message) {
++  if (!ok) throw std::runtime_error(message);
++}
++void CheckMemory() {
++  rex::memory::Memory memory;
++  Require(memory.Initialize(), "Guest memory initialization failed");
++  auto provider = rex::ui::metal::MetalProvider::Create();
++  Require(bool(provider), "Metal provider unavailable");
++  auto tracker = rex::ui::metal::MetalSubmissionTracker::Create(provider->GetCommandQueue());
++  Require(bool(tracker), "Submission tracker unavailable");
++  const uint32_t page_size = uint32_t(rex::memory::page_size());
++  const uint32_t guest = memory.SystemHeapAlloc(page_size * 2, page_size, rex::memory::kSystemHeapPhysical);
++  Require(guest != 0, "Physical allocation failed");
++  const uint32_t physical = memory.GetPhysicalAddress(guest);
++  Require(physical != UINT32_MAX, "Physical address translation failed");
++  {
++    rex::graphics::metal::MetalSharedMemory shared(*provider, *tracker, memory);
++    Require(shared.Initialize() && shared.Initialize(), "Shared memory initialization failed");
++    Require(!shared.IsRangeValid(physical, page_size * 2), "Unrequested memory marked valid");
++    memory.Fill(guest, page_size * 2, 0x31);
++    Require(shared.RequestRange(physical, page_size * 2), "Initial upload failed");
++    Require(shared.IsRangeValid(physical, page_size * 2), "Initial upload not tracked");
++    auto readback = NS::TransferPtr(provider->GetDevice()->newBuffer(page_size * 2, MTL::ResourceStorageModeShared));
++    auto gate = NS::TransferPtr(provider->GetDevice()->newSharedEvent());
++    Require(bool(readback) && bool(gate), "Readback/event allocation failed");
++    auto* commands = provider->GetCommandQueue()->commandBuffer();
++    Require(commands != nullptr, "Command buffer creation failed");
++    commands->encodeWait(gate.get(), 1);
++    auto* blit = commands->blitCommandEncoder();
++    Require(blit != nullptr, "Blit encoder creation failed");
++    blit->copyFromBuffer(shared.GetBuffer(), physical, readback.get(), 0, page_size * 2);
++    blit->endEncoding();
++    // Always open the gate even on a later failed assertion, before tracker
++    // destruction waits for the pending buffer. No callback captures tracker.
++    std::jthread release_gate([event = gate.get()] {
++      std::this_thread::sleep_for(std::chrono::milliseconds(50));
++      event->setSignaledValue(1);
++    });
++    const auto submission = tracker->Submit(commands);
++    Require(submission == 1, "First submission failed");
++    // The real guest virtual write fault invokes ReXGlue's invalidation callback.
++    memory.Fill(guest, page_size, 0x72);
++    Require(!shared.IsRangeValid(physical, page_size), "Guest write did not invalidate cached page");
++    // The base cache may invalidate surrounding CPU-uploaded pages too.
++    // Their contents must remain intact even when their valid bits are cleared.
++    Require(shared.RequestRange(physical, page_size), "Re-upload failed");
++    Require(tracker->UpdateAndGetCompletedSubmission() == submission, "Upload did not drain older GPU use");
++    for (uint32_t i = 0; i < page_size * 2; ++i) {
++      Require(static_cast<const uint8_t*>(readback->contents())[i] == 0x31, "Old GPU snapshot was overwritten");
++      auto expected = i < page_size ? 0x72 : 0x31;
++      Require(static_cast<const uint8_t*>(shared.GetBuffer()->contents())[physical + i] == expected,
++              "Re-upload corrupted page contents");
++    }
++    Require(!shared.RequestRange(rex::graphics::SharedMemory::kBufferSize - 8, 16), "Out-of-bounds request accepted");
++    shared.InvalidateAllPages();
++    Require(!shared.IsRangeValid(physical, page_size * 2), "Explicit invalidation failed");
++    Require(shared.RequestRange(physical, page_size * 2), "Upload after explicit invalidation failed");
++    shared.Shutdown();
++    shared.Shutdown();
++    Require(shared.GetBuffer() == nullptr, "Shutdown retained buffer");
++    Require(shared.Initialize(), "Reinitialization failed");
++    Require(!shared.IsRangeValid(physical, page_size * 2), "Reinitialization retained validity");
++    Require(shared.RequestRange(physical, page_size * 2), "Reinitialization upload failed");
++  }
++  // Callback was unregistered: writes after cache destruction remain valid.
++  memory.Fill(guest, page_size * 2, 0xA1);
++  memory.SystemHeapFree(guest);
++  std::printf("Native Metal shared memory: %u-byte pages, watched writes, GPU snapshot, re-upload and teardown passed\n", page_size);
++}
++}  // namespace
++int main() {
++  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++  try {
++    rex::InitLogging();
++    CheckMemory();
++    return 0;
++  } catch (const std::exception& error) {
++    std::fprintf(stderr, "Native Metal shared-memory check failed: %s\n", error.what());
++    return 1;
++  }
++}
+diff --git a/src/graphics/metal/submission_check.cpp b/src/graphics/metal/submission_check.cpp
+new file mode 100644
+index 0000000..32e9a69
+--- /dev/null
++++ b/src/graphics/metal/submission_check.cpp
+@@ -0,0 +1,113 @@
++// Native GPU work through the provider and tracker, without guest/game startup.
++#include <rex/ui/metal/provider.h>
++#include <rex/ui/metal/submission_tracker.h>
++#include <Foundation/NSSharedPtr.hpp>
++#include <cstdio>
++#include <stdexcept>
++
++namespace {
++void Require(bool ok, const char* message) {
++  if (!ok) throw std::runtime_error(message);
++}
++void CheckQueue(bool shared_event) {
++  namespace metal = rex::ui::metal;
++  auto provider = metal::MetalProvider::Create();
++  Require(bool(provider), "Metal provider unavailable (GPU access requires leaving the sandbox)");
++  auto* device = provider->GetDevice();
++  auto* queue = provider->GetCommandQueue();
++  auto tracker = metal::MetalSubmissionTracker::Create(queue, shared_event);
++  Require(bool(tracker), "Tracker creation failed");
++  if (shared_event) Require(tracker->shared_event() != nullptr, "Expected shared event on Apple Silicon");
++  else Require(tracker->shared_event() == nullptr, "Fallback unexpectedly uses shared events");
++  Require(tracker->AwaitSubmissionCompletion(0), "Empty wait failed");
++  Require(!tracker->AwaitSubmissionCompletion(1), "Accepted future submission");
++  Require(tracker->Submit(nullptr) == 0, "Accepted null buffer");
++  {
++    auto foreign_queue = NS::TransferPtr(device->newCommandQueue());
++    Require(bool(foreign_queue), "Foreign queue allocation failed");
++    auto* foreign = foreign_queue->commandBuffer();
++    Require(foreign && tracker->Submit(foreign) == 0, "Accepted foreign command queue");
++  }
++  { // A recorded, dropped command buffer must not consume a submission ID.
++    auto* dropped = queue->commandBuffer();
++    Require(dropped != nullptr, "Failed to create dropped buffer");
++  }
++  Require(tracker->GetCurrentSubmission() == 1, "Rejected buffer consumed submission ID");
++  NS::Error* error = nullptr;
++  auto library = NS::TransferPtr(device->newLibrary(NS::String::string(R"(
++#include <metal_stdlib>
++using namespace metal;
++kernel void fill(device uint* data [[buffer(0)]], constant uint& seed [[buffer(1)]],
++                 uint i [[thread_position_in_grid]]) {
++  data[i] = seed ^ (i * 0x9E3779B9u);
++})", NS::UTF8StringEncoding), nullptr, &error));
++  if (!library && error) std::fprintf(stderr, "%s\n", error->localizedDescription()->utf8String());
++  Require(bool(library), "Native compute library compile failed");
++  auto function = NS::TransferPtr(library->newFunction(NS::String::string("fill", NS::UTF8StringEncoding)));
++  Require(bool(function), "Missing compute function");
++  auto pipeline = NS::TransferPtr(device->newComputePipelineState(function.get(), &error));
++  Require(bool(pipeline), "Compute pipeline failed");
++  constexpr size_t words = 1024, submissions = 64, bytes = words * sizeof(uint32_t);
++  auto gpu = NS::TransferPtr(device->newBuffer(bytes, MTL::ResourceStorageModePrivate));
++  auto readback = NS::TransferPtr(device->newBuffer(bytes * submissions, MTL::ResourceStorageModeShared));
++  Require(bool(gpu) && bool(readback), "Buffer allocation failed");
++  for (uint32_t n = 0; n < submissions; ++n) {
++    auto* buffer = queue->commandBuffer();
++    Require(buffer != nullptr, "Command buffer creation failed");
++    auto* compute = buffer->computeCommandEncoder();
++    Require(compute != nullptr, "Compute encoder creation failed");
++    compute->setComputePipelineState(pipeline.get());
++    compute->setBuffer(gpu.get(), 0, 0);
++    uint32_t seed = n * 13u + 7u;
++    compute->setBytes(&seed, sizeof(seed), 1);
++    compute->dispatchThreads(MTL::Size(words, 1, 1), MTL::Size(64, 1, 1));
++    compute->endEncoding();
++    auto* blit = buffer->blitCommandEncoder();
++    Require(blit != nullptr, "Blit encoder creation failed");
++    blit->copyFromBuffer(gpu.get(), 0, readback.get(), n * bytes, bytes);
++    blit->endEncoding();
++    Require(tracker->Submit(buffer) == n + 1, "Unexpected submission ID");
++    Require(tracker->Submit(buffer) == 0, "Accepted duplicate commit");
++  }
++  Require(tracker->AwaitSubmissionCompletion(submissions), "GPU completion failed");
++  Require(tracker->UpdateAndGetCompletedSubmission() == submissions, "Completion did not advance");
++  Require(tracker->AwaitSubmissionCompletion(1), "Earlier completed submission wait failed");
++  Require(!tracker->AwaitSubmissionCompletion(submissions + 1), "Future wait accepted");
++  if (shared_event) Require(tracker->shared_event()->signaledValue() == submissions, "Shared event did not advance");
++  auto* data = static_cast<const uint32_t*>(readback->contents());
++  for (uint32_t n = 0; n < submissions; ++n) {
++    for (uint32_t i = 0; i < words; ++i) {
++      Require(data[n * words + i] == ((n * 13u + 7u) ^ (i * 0x9E3779B9u)), "GPU readback mismatch");
++    }
++  }
++  // The tracker retains its queue and submitted buffers and drains on destruction.
++  auto final_buffer = NS::RetainPtr(queue->commandBuffer());
++  Require(bool(final_buffer), "Final buffer creation failed");
++  auto* blit = final_buffer->blitCommandEncoder();
++  Require(blit != nullptr, "Final encoder creation failed");
++  blit->fillBuffer(readback.get(), NS::Range(0, bytes), 0xA5);
++  blit->endEncoding();
++  Require(tracker->Submit(final_buffer.get()) == submissions + 1, "Final submit failed");
++  provider.reset();
++  tracker.reset();
++  Require(final_buffer->status() == MTL::CommandBufferStatusCompleted, "Destructor did not drain GPU");
++  for (size_t i = 0; i < bytes; ++i) {
++    Require(static_cast<const uint8_t*>(readback->contents())[i] == 0xA5, "Shutdown readback mismatch");
++  }
++  std::printf("%s: 65 submissions, 65536 compute words and shutdown fill passed\n",
++              shared_event ? "Shared-event tracking" : "Command-buffer fallback");
++}
++}  // namespace
++int main() {
++  auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++  try {
++    Require(!rex::ui::metal::MetalSubmissionTracker::Create(nullptr), "Accepted null queue");
++    CheckQueue(true);
++    CheckQueue(false);
++    std::puts("Native Metal provider/submission check passed");
++    return 0;
++  } catch (const std::exception& error) {
++    std::fprintf(stderr, "Native Metal provider/submission check failed: %s\n", error.what());
++    return 1;
++  }
++}

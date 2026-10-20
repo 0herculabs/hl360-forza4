@@ -1,0 +1,67 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4473,6 +4473,8 @@
+     readback.memories[index] = new_memory;
+     readback.mapped_data[index] = new_mapping;
+     readback.sizes[index] = size;
++    readback.submission_written[index] = 0;
++    readback.written_size[index] = 0;
+     return true;
+   };
+ 
+@@ -4484,6 +4486,21 @@
+   uint32_t readback_size = AlignReadbackBufferSize(written_length);
+   if (!ensure_readback_slot(readback, write_index, readback_size)) {
+     return true;
++  }
++
++  // A slot may be reused multiple times within one guest frame. Neither the
++  // double buffer nor a host-coherent allocation guarantees GPU completion.
++  // Finish the previous write before reusing the slot (including writes in the
++  // currently open submission), then reopen command recording if needed.
++  const uint64_t previous_write = readback.submission_written[write_index];
++  if (previous_write > submission_completed_) {
++    CheckSubmissionFenceAndDeviceLoss(previous_write);
++    if (device_lost_ || previous_write > submission_completed_) {
++      return false;
++    }
++  }
++  if (!BeginSubmission(true)) {
++    return false;
+   }
+ 
+   if (is_scaled) {
+@@ -4652,6 +4669,8 @@
+   PushBufferMemoryBarrier(readback.buffers[write_index], 0, written_length,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
++  readback.submission_written[write_index] = GetCurrentSubmission();
++  readback.written_size[write_index] = written_length;
+ 
+   bool use_delayed_sync =
+       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+@@ -4665,7 +4684,9 @@
+   bool is_cache_miss = false;
+   if (use_delayed_sync && (readback.buffers[read_index] == VK_NULL_HANDLE ||
+                            written_length > readback.sizes[read_index] ||
+-                           readback.mapped_data[read_index] == nullptr)) {
++                           readback.mapped_data[read_index] == nullptr ||
++                           !readback.submission_written[read_index] ||
++                           written_length > readback.written_size[read_index])) {
+     is_cache_miss = true;
+     read_index = write_index;
+     if (!AwaitAllQueueOperationsCompletion()) {
+@@ -4676,6 +4697,13 @@
+   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+   if (should_copy && readback.buffers[read_index] != VK_NULL_HANDLE &&
+       written_length <= readback.sizes[read_index] && readback.mapped_data[read_index] != nullptr) {
++    // Invalidating non-coherent memory only makes completed GPU writes visible;
++    // it does not wait for those writes. This is also required for coherent RAM.
++    const uint64_t read_submission = readback.submission_written[read_index];
++    CheckSubmissionFenceAndDeviceLoss(read_submission);
++    if (device_lost_ || read_submission > submission_completed_) {
++      return false;
++    }
+     VkMappedMemoryRange readback_memory_range = {};
+     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+     readback_memory_range.memory = readback.memories[read_index];

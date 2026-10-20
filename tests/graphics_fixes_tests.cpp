@@ -1,5 +1,7 @@
 #include "graphics_fixes.h"
 #include "settings.h"
+#include "safe_path.h"
+#include "package_path.h"
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -17,6 +19,47 @@ int main() {
   const auto root = fs::current_path() / ("fm4-graphics-test-" +
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   try {
+    Require(NormalizeGuestRelativePath("") == std::optional<std::string>(""), "device root rejected");
+    Require(NormalizeGuestRelativePath("Media\\Cars\\file.bin") ==
+        std::optional<std::string>("Media/Cars/file.bin"), "guest separator normalization failed");
+    Require(!NormalizeGuestRelativePath("..\\escape") && !NormalizeGuestRelativePath("C:\\escape"),
+        "unsafe guest path accepted");
+#if defined(__APPLE__)
+    Require(PackageDirectory("/tmp/package/FM4 Launcher.app/Contents/Resources/") == "/tmp/package",
+        "Finder bundle package path incorrect");
+#endif
+    fs::create_directories(root);
+    const auto users = root / "saved-users";
+    for (const auto& id : {"B13EBABEBABEBABE", "0000000000000000", "not-a-valid-xuid"}) {
+      Put(users / id / "4D530910/00000001/ForzaProfile/ForzaProfile", "profile");
+      Put(users / id / "4D530910/00000001/ForzaProfile/PlayerDatabase", "database");
+    }
+    fs::create_directories(users / "E000000000001234");
+    const auto saved = DiscoverSavedProfiles(users);
+    Require(saved.size() == 1 && saved[0].xuid == "B13EBABEBABEBABE" && saved[0].name == "User",
+        "existing direct-launch save profile was not recovered");
+    Require(DiscoverSavedProfiles(root / "missing-users").empty(), "missing user folder not handled");
+    Settings capped;
+    capped.fm4_frame_limit = 30;
+    capped.experimental_120fps = true;  // Conflicting legacy controls.
+    capped.controller_vibration = true;
+#if defined(__APPLE__)
+    capped.gpu_backend = "metal";
+#endif
+    Require(capped.Save(root / "cap.toml"), "cap settings save failed");
+    Settings roundtrip;
+    Require(roundtrip.Load(root / "cap.toml") && roundtrip.fm4_frame_limit == 30 &&
+        roundtrip.controller_vibration && !roundtrip.experimental_120fps, "cap/vibration settings lost or legacy 120 Hz conflict retained");
+#if defined(__APPLE__)
+    Require(roundtrip.gpu_backend == "metal", "Metal setting lost");
+#endif
+    Put(root / "invalid-cap.toml", "fm4_frame_limit = 15\ngpu_backend = 'd3d12'\ninput_backend = 'xinput'\n");
+    Require(roundtrip.Load(root / "invalid-cap.toml") && roundtrip.fm4_frame_limit == 0,
+        "invalid host cap accepted");
+#if defined(__APPLE__)
+    Require(roundtrip.gpu_backend == "vulkan", "invalid macOS renderer accepted");
+    Require(roundtrip.input_backend == "sdl", "unsupported macOS input backend accepted");
+#endif
     const auto race = root / "Media/RenderScenarios/16-Car_Race.xml";
     const auto ui = root / "Media/RenderScenarios/UI_Car.xml";
     const std::string xml = "<DynamicRenderSettings>\r\n  <FrameRate value=\"60\"/>\r\n</DynamicRenderSettings>\r\n";

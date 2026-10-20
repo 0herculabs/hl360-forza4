@@ -1,0 +1,134 @@
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -28,6 +28,7 @@
+     .allowed({"sdl", "xinput"});
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++REXCVAR_DEFINE_BOOL(controller_vibration, true, "Input", "Enable controller vibration");
+ namespace rex::input {
+ 
+ namespace {
+@@ -253,6 +254,10 @@
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+   SCOPE_profile_cpu_f("hid");
++  // Send zero rather than dropping the request, so disabling vibration also
++  // stops a motor that was already running. Preserve device/error semantics.
++  X_INPUT_VIBRATION silent{};
++  if (!REXCVAR_GET(controller_vibration)) vibration = &silent;
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -38,6 +38,8 @@
+   void Then(rex::thread::Fence* fence);
+ 
+   void Draw();
++  // Informational HUDs can draw only when the guest presents a frame.
++  virtual bool WantsContinuousRepaint() const { return true; }
+ 
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+diff --git a/include/rex/ui/overlay/debug_overlay.h b/include/rex/ui/overlay/debug_overlay.h
+--- a/include/rex/ui/overlay/debug_overlay.h
++++ b/include/rex/ui/overlay/debug_overlay.h
+@@ -31,6 +31,7 @@
+   ~DebugOverlayDialog();
+ 
+   void SetStatsProvider(FrameStatsProvider provider) { stats_provider_ = std::move(provider); }
++  bool WantsContinuousRepaint() const override { return false; }
+ 
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <cfloat>
+ #include <cstring>
+ #include <filesystem>
+@@ -436,7 +437,8 @@
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
+-  if (!dialogs_.empty()) {
++  if (std::any_of(dialogs_.begin(), dialogs_.end(),
++                  [](const ImGuiDialog* dialog) { return dialog->WantsContinuousRepaint(); })) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+     if (presenter_) {
+diff --git a/src/graphics/metal_runtime/metal_command_processor.cpp b/src/graphics/metal_runtime/metal_command_processor.cpp
+--- a/src/graphics/metal_runtime/metal_command_processor.cpp
++++ b/src/graphics/metal_runtime/metal_command_processor.cpp
+@@ -2355,9 +2355,21 @@
+ 
+   if (REXCVAR_GET(metal_pipeline_prewarm) &&
+       !pipeline_disk_cache_entries_.empty()) {
++    REXLOG_INFO("Metal preparation: preparing {} cached pipeline descriptions",
++                pipeline_disk_cache_entries_.size());
+     StartPipelinePrewarm(pipeline_disk_cache_entries_);
+-  }
+-
++  } else {
++    REXLOG_INFO("Metal preparation: no cached pipelines to prepare; new effects compile on first use");
++  }
++
++  // The caller requests blocking initialization before starting guest code.
++  // Do not let known pipeline compilation compete with the first race frames.
++  // Joining directly keeps the prepared pipelines; StopPipelinePrewarm clears them.
++  if (blocking && pipeline_prewarm_thread_.joinable()) {
++    REXLOG_INFO("Metal preparation: waiting for cached pipelines before starting game");
++    pipeline_prewarm_thread_.join();
++    REXLOG_INFO("Metal preparation: cached pipelines ready");
++  }
+   return true;
+ }
+ 
+@@ -2746,6 +2758,10 @@
+     if (!seen.insert(stable_key).second) {
+       continue;
+     }
++    if (!(seen.size() % 32)) {
++      REXLOG_INFO("Metal preparation: visited {} of {} pipeline descriptions ({} ready)",
++                  seen.size(), entries.size(), from_archive + compiled);
++    }
+     struct PoolScope {
+       NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+       ~PoolScope() { pool->release(); }
+diff --git a/src/graphics/metal_runtime/runtime_check.cpp b/src/graphics/metal_runtime/runtime_check.cpp
+--- a/src/graphics/metal_runtime/runtime_check.cpp
++++ b/src/graphics/metal_runtime/runtime_check.cpp
+@@ -242,6 +242,26 @@
+   for(auto address:allocations) memory.SystemHeapFree(address);
+ }
+ }
++// root must be a disposable copy: shader-storage shutdown persists its archive.
++extern "C" REX_GPU_PLUGIN_EXPORT int rex_gpu_metal_prewarm_validate(const char* root) {
++  try {
++    auto pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++    REXCVAR_GET(metal_shader_disk_cache) = true;
++    REXCVAR_GET(metal_pipeline_disk_cache) = true;
++    REXCVAR_GET(metal_pipeline_binary_archive) = true;
++    rex::memory::Memory memory;
++    Require(memory.Initialize(), "Prewarm guest memory initialization failed");
++    DiagnosticGS graphics;
++    Require(graphics.Start(memory), "Prewarm backend initialization failed");
++    graphics.command_processor()->InitializeShaderStorage(root, 0x4D53084D, true);
++    graphics.Shutdown();
++    return 0;
++  } catch (const std::exception& error) {
++    std::fprintf(stderr, "Metal prewarm check failed: %s\n", error.what());
++    return 1;
++  }
++}
++
+ extern "C" REX_GPU_PLUGIN_EXPORT int rex_gpu_metal_validate(const char* cache,const char* output) {
+   try { Run(cache,output); return 0; }
+   catch(const std::exception& e) { std::fprintf(stderr,"Full Metal backend check failed: %s\n",e.what()); return 2; }

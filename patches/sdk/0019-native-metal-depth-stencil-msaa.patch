@@ -1,0 +1,348 @@
+diff --git a/src/graphics/metal/command/command_processor.cpp b/src/graphics/metal/command/command_processor.cpp
+--- a/src/graphics/metal/command/command_processor.cpp
++++ b/src/graphics/metal/command/command_processor.cpp
+@@ -26,6 +26,14 @@
+ namespace {
+ using Translator = DxbcShaderTranslator;
+ constexpr size_t kCBVBytes = 4096, kUniformBytes = 5 * kCBVBytes;
++struct Target {
++  NS::SharedPtr<MTL::Texture> texture, multisample;
++  uint32_t samples = 1, tiles = 0;
++};
++struct DepthTarget {
++  NS::SharedPtr<MTL::Texture> texture;
++  uint32_t samples = 1, tiles = 0;
++};
+ struct Stage {
+   NS::SharedPtr<MTL::Library> library;
+   NS::SharedPtr<MTL::Function> function;
+@@ -40,8 +48,10 @@
+   MetalShaderConverter metal;
+   std::map<std::pair<uint32_t, uint64_t>, std::unique_ptr<DxbcShader>> shaders;
+   std::unique_ptr<MetalTextureCache> textures;
+-  std::map<std::pair<uint32_t, uint32_t>, NS::SharedPtr<MTL::Texture>> targets;
++  std::map<std::pair<uint32_t, uint32_t>, Target> targets;
+   std::set<std::pair<uint32_t, uint32_t>> initialized_targets;
++  std::map<uint32_t, DepthTarget> depth_targets;
++  std::set<uint32_t> initialized_depth;
+   NS::SharedPtr<MTL::Texture> target;
+   uint64_t resolves = 0;
+   NS::SharedPtr<NS::AutoreleasePool> pool;
+@@ -73,7 +83,7 @@
+   descriptor->setUsage(MTL::TextureUsageRenderTarget);
+   impl_->target = NS::TransferPtr(impl_->provider->GetDevice()->newTexture(descriptor.get()));
+   impl_->width = width; impl_->height = height;
+-  impl_->targets.emplace(std::make_pair(0u, width), impl_->target);
++  impl_->targets.emplace(std::make_pair(0u, width), Target{impl_->target, {}, 1, ((width + 79) / 80) * ((height + 15) / 16)});
+   return impl_->target ? true : Fail("Offscreen target allocation failed");
+ }
+ bool MetalCommandProcessor::SetupContext() {
+@@ -92,6 +102,7 @@
+ void MetalCommandProcessor::ShutdownContext() {
+   if (impl_->submissions) impl_->submissions->AwaitAllSubmissionsCompletion();
+   impl_->shared.reset(); impl_->submissions.reset();
++  impl_->depth_targets.clear(); impl_->initialized_depth.clear();
+   impl_->target.reset(); impl_->targets.clear(); impl_->initialized_targets.clear(); impl_->textures.reset(); impl_->shaders.clear(); impl_->translator.reset();
+   impl_->provider = nullptr; impl_->pool.reset();
+ }
+@@ -143,10 +154,11 @@
+   auto found = impl_->targets.find(key);
+   if (found == impl_->targets.end() || !impl_->initialized_targets.contains(key))
+     return Fail("Resolve source is not an initialized render target");
++  if (found->second.samples != 1) return Fail("Guest MSAA resolves are not implemented");
+   const uint32_t length = texture_util::GetTiledAddressUpperBound2D(impl_->width, impl_->height, impl_->width, 2);
+   if (uint64_t(base) + length > SharedMemory::kBufferSize ||
+       !impl_->shared->RequestRange(base, length)) return Fail("Resolve destination is unavailable");
+-  impl_->target = found->second;
++  impl_->target = found->second.texture;
+   std::vector<uint8_t> rgba;
+   if (!ReadbackRGBA(rgba)) return false;
+   // GPU completion is established by ReadbackRGBA before either host copy is
+@@ -200,8 +212,12 @@
+     return Fail("Only triangle lists are implemented");
+   if (register_file_->Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena)
+     return Fail("Primitive restart is not implemented");
+-  if (register_file_->Get<reg::RB_DEPTHCONTROL>().value)
+-    return Fail("Guest depth/stencil state is not implemented in the offscreen subset");
++  const auto depth_control = register_file_->Get<reg::RB_DEPTHCONTROL>();
++  const auto depth_info = register_file_->Get<reg::RB_DEPTH_INFO>();
++  const bool use_depth = depth_control.z_enable || depth_control.stencil_enable;
++  // Float24 requires guest precision/range conversion; do not treat it as D24.
++  if (use_depth && (depth_info.depth_format != xenos::DepthRenderTargetFormat::kD24S8 || depth_info.depth_base_bit_11))
++    return Fail("Only non-wrapped D24S8 depth/stencil targets are implemented");
+   auto& vs = *static_cast<DxbcShader*>(active_vertex_shader_);
+   auto& ps = *static_cast<DxbcShader*>(active_pixel_shader_);
+   if (vs.memexport_eM_written() || ps.memexport_eM_written() || ps.writes_depth() ||
+@@ -232,18 +248,55 @@
+   const auto surface = register_file_->Get<reg::RB_SURFACE_INFO>();
+   const auto color_info = register_file_->Get<reg::RB_COLOR_INFO>();
+   const uint32_t pitch = surface.surface_pitch ? uint32_t(surface.surface_pitch) : impl_->width;
+-  if (surface.msaa_samples != xenos::MsaaSamples::k1X || pitch != impl_->width ||
++  if (uint32_t(surface.msaa_samples) > 2) return Fail("Invalid MSAA sample count");
++  const uint32_t sample_count = 1u << uint32_t(surface.msaa_samples);
++  if (!device->supportsTextureSampleCount(sample_count)) return Fail("Native MSAA sample count is unsupported by this device");
++  if (pitch != impl_->width ||
+       color_info.color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 || color_info.color_exp_bias)
+-    return Fail("Only 1x RGBA8 render targets at the offscreen pitch are implemented");
++    return Fail("Only RGBA8 render targets at the offscreen pitch are implemented");
++  const uint32_t tiles = ((pitch * (sample_count == 4 ? 2 : 1) + 79) / 80) *
++                         ((impl_->height * (sample_count > 1 ? 2 : 1) + 15) / 16);
++  const uint32_t depth_base = depth_info.depth_base;
++  auto overlaps = [tiles](uint32_t a, uint32_t b, uint32_t other_tiles) { return a < b + other_tiles && b < a + tiles; };
++  // Keep color and depth ownership disjoint until EDRAM alias conversion exists.
++  for (const auto& [base, texture] : impl_->depth_targets)
++    if (overlaps(color_info.color_base, base, texture.tiles)) return Fail("Color/depth EDRAM aliases are not implemented");
++  if (use_depth) {
++    if (depth_base + tiles > 2048 || overlaps(color_info.color_base, depth_base, tiles))
++      return Fail("Wrapped/aliased depth EDRAM targets are not implemented");
++    for (const auto& [other, texture] : impl_->targets)
++      if (overlaps(depth_base, other.first, texture.tiles)) return Fail("Depth/color EDRAM aliases are not implemented");
++    for (const auto& [base, texture] : impl_->depth_targets)
++      if (base != depth_base && overlaps(depth_base, base, texture.tiles)) return Fail("Depth EDRAM aliases are not implemented");
++  }
++  NS::SharedPtr<MTL::Texture> depth_target;
++  if (use_depth) {
++    auto found = impl_->depth_targets.find(depth_base);
++    if (found == impl_->depth_targets.end()) {
++      if (impl_->depth_targets.size() >= 16) return Fail("Depth target limit reached");
++      auto descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
++      descriptor->setTextureType(sample_count > 1 ? MTL::TextureType2DMultisample : MTL::TextureType2D);
++      descriptor->setSampleCount(sample_count);
++      // Apple silicon has no native D24S8. Host float32 retains depth across
++      // draws, but D24 quantization and EDRAM packing are not emulated here.
++      descriptor->setPixelFormat(MTL::PixelFormatDepth32Float_Stencil8);
++      descriptor->setWidth(impl_->width); descriptor->setHeight(impl_->height);
++      descriptor->setUsage(MTL::TextureUsageRenderTarget); descriptor->setStorageMode(MTL::StorageModePrivate);
++      auto texture = NS::TransferPtr(device->newTexture(descriptor.get()));
++      if (!texture) return Fail("Depth/stencil allocation failed");
++      found = impl_->depth_targets.emplace(depth_base, DepthTarget{texture, sample_count, tiles}).first;
++    }
++    if (found->second.samples != sample_count) return Fail("Depth target MSAA aliases are not implemented");
++    depth_target = found->second.texture;
++  }
+   auto key = std::make_pair(uint32_t(color_info.color_base), pitch);
+   auto target_it = impl_->targets.find(key);
+   bool clear_target = false;
+   if (target_it == impl_->targets.end()) {
+     if (impl_->targets.size() >= 16) return Fail("Offscreen render target limit reached");
+-    const uint32_t tiles = ((pitch + 79) / 80) * ((impl_->height + 15) / 16);
+     if (key.first + tiles > 2048) return Fail("Wrapped EDRAM targets are not implemented");
+     for (const auto& [other, texture] : impl_->targets) {
+-      if (key.first < other.first + tiles && other.first < key.first + tiles)
++      if (key.first < other.first + texture.tiles && other.first < key.first + tiles)
+         return Fail("Overlapping EDRAM render target aliases are not implemented");
+     }
+     auto descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+@@ -252,9 +305,16 @@
+     descriptor->setUsage(MTL::TextureUsageRenderTarget); descriptor->setStorageMode(MTL::StorageModePrivate);
+     auto texture = NS::TransferPtr(device->newTexture(descriptor.get()));
+     if (!texture) return Fail("Render target allocation failed");
+-    target_it = impl_->targets.emplace(key, texture).first; clear_target = true;
+-  }
+-  impl_->target = target_it->second;
++    Target target{texture, {}, sample_count, tiles};
++    if (sample_count > 1) {
++      descriptor->setTextureType(MTL::TextureType2DMultisample); descriptor->setSampleCount(sample_count);
++      target.multisample = NS::TransferPtr(device->newTexture(descriptor.get()));
++      if (!target.multisample) return Fail("Multisample color allocation failed");
++    }
++    target_it = impl_->targets.emplace(key, target).first; clear_target = true;
++  }
++  if (target_it->second.samples != sample_count) return Fail("Color target MSAA aliases are not implemented");
++  impl_->target = target_it->second.texture;
+   // The original diagnostic target has not been initialized before its first draw.
+   clear_target = !impl_->initialized_targets.contains(key);
+   const auto& map = vs.constant_register_map();
+@@ -303,8 +363,33 @@
+   }
+   REXLOG_DEBUG("Metal stage libraries loaded; creating render pipeline");
+   auto pd = NS::TransferPtr(MTL::RenderPipelineDescriptor::alloc()->init());
++  pd->setRasterSampleCount(sample_count);
+   pd->setVertexFunction(stages[0].function.get()); pd->setFragmentFunction(stages[1].function.get());
+   pd->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
++  if (use_depth) {
++    pd->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float_Stencil8);
++    pd->setStencilAttachmentPixelFormat(MTL::PixelFormatDepth32Float_Stencil8);
++  }
++  auto dd = NS::TransferPtr(MTL::DepthStencilDescriptor::alloc()->init());
++  dd->setDepthCompareFunction(depth_control.z_enable ? MTL::CompareFunction(depth_control.zfunc) : MTL::CompareFunctionAlways);
++  dd->setDepthWriteEnabled(depth_control.z_enable && depth_control.z_write_enable);
++  const auto front_mask = register_file_->Get<reg::RB_STENCILREFMASK>();
++  const auto back_mask = depth_control.backface_enable ? reg::RB_STENCILREFMASK{(*register_file_)[XE_GPU_REG_RB_STENCILREFMASK_BF]} : front_mask;
++  if (depth_control.stencil_enable) {
++    for (unsigned face = 0; face < 2; ++face) {
++      const bool back = face && depth_control.backface_enable;
++      const auto mask = face ? back_mask : front_mask;
++      auto stencil = NS::TransferPtr(MTL::StencilDescriptor::alloc()->init());
++      stencil->setStencilCompareFunction(MTL::CompareFunction(back ? depth_control.stencilfunc_bf : depth_control.stencilfunc));
++      stencil->setStencilFailureOperation(MTL::StencilOperation(back ? depth_control.stencilfail_bf : depth_control.stencilfail));
++      stencil->setDepthFailureOperation(MTL::StencilOperation(back ? depth_control.stencilzfail_bf : depth_control.stencilzfail));
++      stencil->setDepthStencilPassOperation(MTL::StencilOperation(back ? depth_control.stencilzpass_bf : depth_control.stencilzpass));
++      stencil->setReadMask(mask.stencilmask); stencil->setWriteMask(mask.stencilwritemask);
++      if (face) dd->setBackFaceStencil(stencil.get()); else dd->setFrontFaceStencil(stencil.get());
++    }
++  }
++  auto depth_state = NS::TransferPtr(device->newDepthStencilState(dd.get()));
++  if (!depth_state) return Fail("Depth/stencil state creation failed");
+   NS::Error* pipeline_error = nullptr;
+   auto pipeline = NS::TransferPtr(device->newRenderPipelineState(pd.get(), &pipeline_error));
+   if (!pipeline) return Fail(pipeline_error ? pipeline_error->localizedDescription()->utf8String() : "Render pipeline creation failed");
+@@ -381,11 +466,23 @@
+   if (!commands) return Fail("Command buffer allocation failed");
+   auto pass = NS::TransferPtr(MTL::RenderPassDescriptor::alloc()->init());
+   auto* color = pass->colorAttachments()->object(0);
+-  color->setTexture(impl_->target.get()); color->setLoadAction(clear_target ? MTL::LoadActionClear : MTL::LoadActionLoad);
+-  color->setStoreAction(MTL::StoreActionStore); color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
++  color->setTexture(sample_count > 1 ? target_it->second.multisample.get() : impl_->target.get()); color->setLoadAction(clear_target ? MTL::LoadActionClear : MTL::LoadActionLoad);
++  color->setStoreAction(sample_count > 1 ? MTL::StoreActionStoreAndMultisampleResolve : MTL::StoreActionStore);
++  if (sample_count > 1) color->setResolveTexture(impl_->target.get());
++  color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
++  if (use_depth) {
++    const auto load = impl_->initialized_depth.contains(depth_base) ? MTL::LoadActionLoad : MTL::LoadActionClear;
++    auto* depth = pass->depthAttachment(); depth->setTexture(depth_target.get());
++    depth->setLoadAction(load); depth->setStoreAction(MTL::StoreActionStore); depth->setClearDepth(1.0);
++    auto* stencil = pass->stencilAttachment(); stencil->setTexture(depth_target.get());
++    stencil->setLoadAction(load); stencil->setStoreAction(MTL::StoreActionStore); stencil->setClearStencil(0);
++  }
+   auto* encoder = commands->renderCommandEncoder(pass.get());
+   if (!encoder) return Fail("Render encoder creation failed");
+   encoder->setRenderPipelineState(pipeline.get());
++  encoder->setDepthStencilState(depth_state.get());
++  encoder->setStencilReferenceValues(front_mask.stencilref, back_mask.stencilref);
++  encoder->setFrontFacingWinding(register_file_->Get<reg::PA_SU_SC_MODE_CNTL>().face ? MTL::WindingClockwise : MTL::WindingCounterClockwise);
+   encoder->setViewport(MTL::Viewport{0, 0, double(impl_->width), double(impl_->height), 0, 1});
+   encoder->setCullMode(MTL::CullModeNone);
+   for (auto* buffer : {uniform.get(), resource.get(), samplers.get(), cbv.get(), top.get(), impl_->shared->GetBuffer()})
+@@ -404,6 +501,7 @@
+   const auto submission = impl_->submissions->Submit(commands);
+   if (!submission || !impl_->submissions->AwaitSubmissionCompletion(submission)) return Fail("Guest draw GPU submission failed");
+   impl_->initialized_targets.insert(key);
++  if (use_depth) impl_->initialized_depth.insert(depth_base);
+   ++impl_->draws; impl_->error.clear();
+   return true;
+ }
+@@ -413,7 +511,9 @@
+   const auto key = std::make_pair(uint32_t(color_info.color_base), surface.surface_pitch ? uint32_t(surface.surface_pitch) : impl_->width);
+   auto found = impl_->targets.find(key);
+   if (found == impl_->targets.end() || !impl_->initialized_targets.contains(key)) return Fail("No rendered offscreen target");
+-  impl_->target = found->second;
++  if (uint32_t(surface.msaa_samples) > 2 || found->second.samples != (1u << uint32_t(surface.msaa_samples)))
++    return Fail("Readback target MSAA configuration mismatch");
++  impl_->target = found->second.texture;
+   const size_t row = (size_t(impl_->width) * 4 + 255) & ~size_t(255);
+   auto readback = NS::TransferPtr(impl_->provider->GetDevice()->newBuffer(row * impl_->height, MTL::ResourceStorageModeShared));
+   auto* commands = impl_->provider->GetCommandQueue()->commandBuffer();
+diff --git a/src/graphics/metal/command/draw_check.cpp b/src/graphics/metal/command/draw_check.cpp
+--- a/src/graphics/metal/command/draw_check.cpp
++++ b/src/graphics/metal/command/draw_check.cpp
+@@ -383,6 +383,110 @@
+   std::puts("Swapped resolve, bilinear filtering, unsupported texture and invalid DMA/resolve checks passed");
+ 
+   std::ofstream(output / "resources-receipt.txt") << "15 successful guest draws, 2 resolves: indexed/endian textures, base-vertex, retained targets, resolve/sample roundtrips, filtering and invalid request rejection passed\n";
++  // Retained D24S8 state, using widely separated depths so this check does
++  // not depend on the still-unimplemented D24 quantization boundary behavior.
++  write_reg(XE_GPU_REG_RB_COLOR_INFO, 832);
++  write_reg(XE_GPU_REG_VGT_INDX_OFFSET, 0);
++  write_reg(XE_GPU_REG_RB_DEPTH_INFO, 1536);
++  auto solid = [&](float z, std::array<float, 4> color) {
++    const float positions[6] = {-.75f,-.75f,.75f,-.75f,0,.75f};
++    auto* destination = memory.TranslateVirtual<uint32_t*>(vertex_guest);
++    for (unsigned v = 0; v < 3; ++v) {
++      float data[7] = {positions[v*2], positions[v*2+1], z, color[0],color[1],color[2],color[3]};
++      for (unsigned i = 0; i < 7; ++i) destination[v*7+i] = std::byteswap(std::bit_cast<uint32_t>(data[i]));
++    }
++    const auto before = cp.draw_count(); draw(kPS);
++    if (cp.draw_count() != before + 1) throw std::runtime_error(cp.last_error());
++    Require(cp.ReadbackRGBA(rgba), "Depth fixture readback failed");
++  };
++  auto center = [&](unsigned r, unsigned g, unsigned b) {
++    const auto* p = rgba.data() + (64*128+64)*4;
++    Require(p[0] == r && p[1] == g && p[2] == b && p[3] == 255, "Depth/stencil center mismatch");
++  };
++  reg::RB_DEPTHCONTROL depth{}; depth.z_enable = 1; depth.z_write_enable = 1; depth.zfunc = xenos::CompareFunction::kLess;
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.4f, {1,0,0,1}); center(255,0,0); const auto red = rgba;
++  solid(.8f, {0,1,0,1}); Require(rgba == red, "Farther draw bypassed depth test");
++  depth.z_write_enable = 0; write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.2f, {0,0,1,1}); center(0,0,255);
++  depth.z_write_enable = 1; write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.3f, {1,1,0,1}); center(255,255,0); const auto yellow = rgba;
++  solid(.35f, {1,0,1,1}); Require(rgba == yellow, "Depth write-disable modified stored depth");
++  depth.z_enable = 0; depth.stencil_enable = 1; depth.stencilfunc = xenos::CompareFunction::kAlways;
++  depth.stencilzpass = xenos::StencilOp::kReplace;
++  reg::RB_STENCILREFMASK stencil{}; stencil.stencilref = 0xA5; stencil.stencilmask = 255; stencil.stencilwritemask = 0x0F;
++  write_reg(XE_GPU_REG_RB_STENCILREFMASK, stencil.value);
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.9f, {1,1,0,1});
++  depth.stencilfunc = xenos::CompareFunction::kEqual; depth.stencilzpass = xenos::StencilOp::kKeep;
++  stencil.stencilref = 0xB5; stencil.stencilmask = 0x0F; stencil.stencilwritemask = 0;
++  write_reg(XE_GPU_REG_RB_STENCILREFMASK, stencil.value); write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.9f, {0,1,1,1}); center(0,255,255); const auto cyan = rgba;
++  stencil.stencilref = 6; write_reg(XE_GPU_REG_RB_STENCILREFMASK, stencil.value);
++  solid(.1f, {1,0,1,1}); Require(rgba == cyan, "Stencil rejection altered target");
++  // Front/back reference state must be selected from the actual triangle face.
++  depth.backface_enable = 1; depth.stencilfunc_bf = xenos::CompareFunction::kAlways;
++  reg::RB_STENCILREFMASK back{}; back.stencilmask = 255;
++  write_reg(XE_GPU_REG_RB_STENCILREFMASK_BF, back.value);
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  reg::PA_SU_SC_MODE_CNTL raster{}; raster.face = 1;
++  write_reg(XE_GPU_REG_PA_SU_SC_MODE_CNTL, raster.value);
++  solid(.1f, {0,1,0,1}); center(0,255,0);
++  raster.face = 0; write_reg(XE_GPU_REG_PA_SU_SC_MODE_CNTL, raster.value);
++  solid(.1f, {1,0,0,1}); center(0,255,0);
++  Save(output / "depth-stencil.rgba", rgba);
++  // A second color target shares the retained depth/stencil surface.
++  write_reg(XE_GPU_REG_RB_COLOR_INFO, 896); write_reg(XE_GPU_REG_RB_DEPTHCONTROL, 0);
++  solid(.8f, {1,0,0,1}); center(255,0,0); const auto second_red = rgba;
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.1f, {0,0,1,1}); Require(rgba == second_red, "Stencil was not retained across color target switch");
++  depth.stencil_enable = 0; depth.z_enable = 1; depth.zfunc = xenos::CompareFunction::kLess;
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.4f, {0,1,0,1}); Require(rgba == second_red, "Depth was not retained across color target switch");
++  const auto before_reject = cp.draw_count();
++  write_reg(XE_GPU_REG_RB_DEPTH_INFO, 1536 | (1u << 16)); draw(kPS);
++  Require(cp.draw_count() == before_reject && !cp.last_error().empty(), "Float24 target silently accepted");
++  write_reg(XE_GPU_REG_RB_DEPTH_INFO, 896); draw(kPS);
++  Require(cp.draw_count() == before_reject && !cp.last_error().empty(), "Color/depth alias silently accepted");
++  Require(cp.ReadbackRGBA(rgba) && rgba == second_red, "Rejected depth draw altered color target");
++  std::ofstream(output / "depth-stencil-receipt.txt") << "13 retained depth/stencil draws passed: depth rejection/write masks, stencil reference/read/write masks, front/back state and color-target switching; float24 and color/depth alias rejection passed\n";
++  std::puts("Retained depth/stencil state, masks, front/back selection and alias rejection passed");
++  write_reg(XE_GPU_REG_RB_COLOR_INFO, 1024);
++  write_reg(XE_GPU_REG_RB_DEPTH_INFO, 1792);
++  reg::RB_SURFACE_INFO multisample{}; multisample.surface_pitch = 128; multisample.msaa_samples = xenos::MsaaSamples::k4X;
++  write_reg(XE_GPU_REG_RB_SURFACE_INFO, multisample.value);
++  depth = {}; depth.z_enable = 1; depth.z_write_enable = 1; depth.zfunc = xenos::CompareFunction::kLess;
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, depth.value);
++  solid(.4f, {1,0,0,1}); center(255,0,0); const auto msaa_red = rgba;
++  size_t partial = 0, interior = 0;
++  for (size_t i = 0; i < rgba.size(); i += 4) {
++    Require(rgba[i+1] == 0 && rgba[i+2] == 0 && rgba[i+3] == 255, "MSAA red channels mismatch");
++    if (rgba[i] && rgba[i] < 255) {
++      Require(rgba[i] == 64 || rgba[i] == 128 || rgba[i] == 191, "MSAA resolve is not averaging four samples");
++      ++partial;
++    }
++    if (rgba[i] == 255) ++interior;
++  }
++  Require(partial > 50 && interior > 3500, "MSAA fixture lacks sample coverage");
++  solid(.8f, {0,1,0,1}); Require(rgba == msaa_red, "MSAA retained depth/color was lost");
++  solid(.2f, {0,0,1,1}); center(0,0,255);
++  for (size_t i = 0; i < rgba.size(); i += 4)
++    Require(rgba[i] == 0 && rgba[i+1] == 0 && rgba[i+2] == msaa_red[i] && rgba[i+3] == 255,
++            "MSAA nearer draw coverage mismatch");
++  Save(output / "msaa4.rgba", rgba); const auto msaa_blue = rgba;
++  // Reusing EDRAM with another sample configuration needs alias conversion.
++  multisample.msaa_samples = xenos::MsaaSamples::k1X;
++  write_reg(XE_GPU_REG_RB_SURFACE_INFO, multisample.value);
++  const auto before_msaa_reject = cp.draw_count(); draw(kPS);
++  Require(cp.draw_count() == before_msaa_reject && !cp.last_error().empty(), "MSAA alias silently accepted");
++  write_reg(XE_GPU_REG_RB_DEPTHCONTROL, 0); draw(kPS);
++  Require(cp.draw_count() == before_msaa_reject && !cp.last_error().empty(), "Color-only MSAA alias silently accepted");
++  multisample.msaa_samples = xenos::MsaaSamples::k4X;
++  write_reg(XE_GPU_REG_RB_SURFACE_INFO, multisample.value);
++  Require(cp.ReadbackRGBA(rgba) && rgba == msaa_blue, "Rejected MSAA alias altered target");
++  std::ofstream(output / "msaa-receipt.txt") << "3 native 4x MSAA draws passed; " << partial
++      << " partially covered pixels, " << interior << " interior pixels; averaged readback, retained multisample color/depth and sample-config alias rejection passed\n";
++  std::printf("Native 4x MSAA: %zu partial and %zu interior pixels; retained color/depth passed\n", partial, interior);
+   graphics.Shutdown(); graphics.Shutdown();
+   for (auto guest : allocations) memory.SystemHeapFree(guest);
+   std::puts("Native Metal guest PM4 draw check passed");

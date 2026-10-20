@@ -45,7 +45,13 @@ struct Settings {
   bool experimental_120fps = false;
 
   // Quality
-  std::string gpu_backend = "d3d12";  // d3d12 | vulkan
+#if defined(__APPLE__)
+  std::string gpu_backend = "vulkan";
+#else
+  std::string gpu_backend = "d3d12";
+#endif
+  int fm4_frame_limit = 0;  // Host presentation cap: 0, 30 or 60.
+  bool controller_vibration = false;
   int resolution_scale = 1;      // internal render scale over 1280x720
   int anisotropic_override = 3;  // 0..5 = off,1x,2x,4x,8x,16x
   std::string swap_post_effect = "none";    // none | fxaa | fxaa_extreme
@@ -85,6 +91,9 @@ struct LauncherState {
 
 // Gamertag rules shared with the game: 1-15 letters, digits and single spaces.
 bool IsValidGamertag(const std::string& name);
+
+// Recover accounts created by direct game launches before creating a new profile.
+std::vector<Profile> DiscoverSavedProfiles(const std::filesystem::path& user_root);
 
 // Random offline XUID (0xE000xxxxxxxxxxxx) with the restricted-account bits clear.
 std::string GenerateXuid();

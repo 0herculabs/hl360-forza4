@@ -27,3 +27,8 @@ Thumbs.db
 /generated/speech/
 /generated/default.dll_manifest.h
 /generated/dll_targets.cmake
+
+# Local macOS SDK and Python caches
+/thirdparty/rexglue-sdk/
+__pycache__/
+*.pyc

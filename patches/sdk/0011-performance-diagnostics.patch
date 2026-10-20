@@ -1,0 +1,223 @@
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1,3 +1,4 @@
++#include <rex/graphics/performance.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -2271,6 +2272,7 @@
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::Swap);
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -3590,6 +3592,7 @@
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::Draw);
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -4401,6 +4404,7 @@
+ }
+ 
+ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::Resolve);
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -4970,9 +4974,12 @@
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
+-    VkResult wait_result =
+-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
++    VkResult wait_result;
++    {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::FenceWait);
++      wait_result = dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++    }
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5230,6 +5237,7 @@
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::Submission);
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -5417,6 +5425,7 @@
+     {
+       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::QueueSubmit);
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+     }
+     if (submit_result != VK_SUCCESS) {
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1,3 +1,4 @@
++#include <rex/graphics/performance.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -977,6 +978,7 @@
+ 
+ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
+                                                        uint32_t count) {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::WaitRegMem);
+   SCOPE_profile_cpu_f("gpu");
+ 
+   // wait until a register or memory location is a specific value
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1,3 +1,4 @@
++#include <rex/graphics/performance.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -3480,8 +3481,12 @@
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++  VkResult create_result;
++  {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::PipelineCompile);
++    create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1,3 +1,4 @@
++#include <rex/graphics/performance.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -1575,9 +1576,12 @@
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index;
+-  VkResult acquire_result =
+-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
++  VkResult acquire_result;
++  {
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::Acquire);
++    acquire_result = dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                 VK_NULL_HANDLE, &swapchain_image_index);
++  }
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+@@ -2248,6 +2252,7 @@
+   {
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
++  rex::graphics::performance::Scope perf_scope(rex::graphics::performance::Stage::Present);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
+   switch (present_result) {
+diff --git a/include/rex/graphics/performance.h b/include/rex/graphics/performance.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/graphics/performance.h
+@@ -0,0 +1,59 @@
++// Optional CPU elapsed-time diagnostics. These are inclusive wall times,
++// not GPU timestamps. Nested stages and different threads must not be summed.
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <cstdint>
++#include <rex/logging.h>
++
++namespace rex::graphics::performance {
++enum class Stage { Draw, Resolve, FenceWait, Submission, QueueSubmit, Swap,
++                   PipelineCompile, WaitRegMem, Acquire, Present, PresenterWait, Count };
++inline constexpr const char* kNames[] = {"draw", "resolve", "fence_wait", "submission",
++    "queue_submit", "swap", "pipeline_compile", "wait_reg_mem", "acquire", "present", "presenter_wait"};
++inline bool Enabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("FM3_PERF_LOG");
++    return value && value[0] == '1';
++  }();
++  return enabled;
++}
++using Clock = std::chrono::steady_clock;
++struct Counter { uint64_t calls = 0; double total = 0, maximum = 0; };
++struct Window {
++  Clock::time_point start = Clock::now();
++  std::array<Counter, size_t(Stage::Count)> counters{};
++};
++inline Window& GetWindow() { static thread_local Window window; return window; }
++class Scope {
++ public:
++  explicit Scope(Stage stage) : stage_(stage), enabled_(Enabled()) {
++    if (enabled_) start_ = Clock::now();
++  }
++  ~Scope() {
++    if (!enabled_) return;
++    auto now = Clock::now();
++    double ms = std::chrono::duration<double, std::milli>(now - start_).count();
++    auto& window = GetWindow();
++    auto& counter = window.counters[size_t(stage_)];
++    ++counter.calls;
++    counter.total += ms;
++    if (ms > counter.maximum) counter.maximum = ms;
++    double seconds = std::chrono::duration<double>(now - window.start).count();
++    if (seconds < 1.0) return;
++    for (size_t i = 0; i < window.counters.size(); ++i) {
++      auto& c = window.counters[i];
++      if (c.calls) REXLOG_INFO("perf_cpu: window_s={:.6f} stage={} calls={} total_ms={:.3f} max_ms={:.3f}",
++                              seconds, kNames[i], c.calls, c.total, c.maximum);
++      c = {};
++    }
++    window.start = now;
++  }
++ private:
++  Stage stage_;
++  bool enabled_;
++  Clock::time_point start_{};
++};
++}  // namespace rex::graphics::performance
+diff --git a/src/ui/vulkan/vulkan_submission_tracker.cpp b/src/ui/vulkan/vulkan_submission_tracker.cpp
+--- a/src/ui/vulkan/vulkan_submission_tracker.cpp
++++ b/src/ui/vulkan/vulkan_submission_tracker.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/ui/vulkan/submission_tracker.h>
++#include <rex/graphics/performance.h>
+ #include <rex/ui/vulkan/util.h>
+ 
+ namespace rex {
+@@ -119,8 +120,13 @@
+       assert_true(pending_pair.first > submission_completed_on_gpu_);
+       if (pending_pair.first <= submission_index) {
+         // Wait if requested.
+-        if (dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX) ==
+-            VK_SUCCESS) {
++        VkResult wait_result;
++        {
++          rex::graphics::performance::Scope perf_scope(
++              rex::graphics::performance::Stage::PresenterWait);
++          wait_result = dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX);
++        }
++        if (wait_result == VK_SUCCESS) {
+           break;
+         }
+       }

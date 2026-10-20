@@ -1,0 +1,87 @@
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -13,12 +13,16 @@
+ #include <cctype>
+ #include <charconv>
+ #include <filesystem>
++#include <future>
+ #include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ 
+ #include <spdlog/sinks/rotating_file_sink.h>
+ #include <spdlog/sinks/stdout_color_sinks.h>
++#include <spdlog/async_logger.h>
++#include <spdlog/details/thread_pool.h>
++#include <spdlog/sinks/base_sink.h>
+ 
+ #include <toml++/toml.hpp>
+ 
+@@ -43,6 +47,8 @@
+     .debug_only();
+ 
+ REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
++REXCVAR_DEFINE_BOOL(log_async, false, "Log", "Write logs on a worker thread (bounded queue; preserves messages)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
+     .range(0, 60)
+@@ -69,6 +75,15 @@
+ bool g_initialized = false;
+ std::mutex g_mutex;
+ LogConfig g_config;
++std::shared_ptr<spdlog::details::thread_pool> g_log_pool;
++
++class LogFlushBarrier final : public spdlog::sinks::base_sink<std::mutex> {
++ public:
++  std::promise<void> ready;
++ protected:
++  void sink_it_(const spdlog::details::log_msg&) override { ready.set_value(); }
++  void flush_() override {}
++};
+ 
+ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
+                                             std::string_view app_name) {
+@@ -134,7 +149,14 @@
+ // Create a logger and register it
+ std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
+   auto sinks = BuildCategorySinks(name);
+-  auto logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
++  std::shared_ptr<spdlog::logger> logger;
++  if (REXCVAR_GET(log_async)) {
++    if (!g_log_pool) g_log_pool = std::make_shared<spdlog::details::thread_pool>(8192, 1);
++    logger = std::make_shared<spdlog::async_logger>(name, sinks.begin(), sinks.end(),
++                                                  g_log_pool, spdlog::async_overflow_policy::block);
++  } else {
++    logger = std::make_shared<spdlog::logger>(name, sinks.begin(), sinks.end());
++  }
+   logger->set_level(ResolveCategoryLevel(name));
+   logger->flush_on(g_config.flush_level);
+   spdlog::register_logger(logger);
+@@ -280,6 +302,8 @@
+ 
+   spdlog::shutdown();
+   g_registry.clear();
++  // Drain queued writes/flushes before releasing their sinks.
++  g_log_pool.reset();
+   g_console_sink.reset();
+   g_file_sink.reset();
+   g_early_sink.reset();
+@@ -293,6 +317,16 @@
+   for (auto& entry : g_registry)
+     if (entry.logger)
+       entry.logger->flush();
++  if (g_log_pool) {
++    // A single FIFO worker processes the marker after all previously queued
++    // messages and flushes. Preserve this API's hard-exit durability contract.
++    auto barrier = std::make_shared<LogFlushBarrier>();
++    auto ready = barrier->ready.get_future();
++    auto marker = std::make_shared<spdlog::async_logger>(
++        "flush-barrier", barrier, g_log_pool, spdlog::async_overflow_policy::block);
++    marker->info("flush");
++    ready.wait();
++  }
+ }
+ 
+ LogCategoryId RegisterLogCategory(const char* name) {

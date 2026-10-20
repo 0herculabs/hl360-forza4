@@ -1,0 +1,12 @@
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -72,7 +72,7 @@
+ 
+ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
+                      "Fake sample count for occlusion queries")
+-    .range(1, 100000)
++    .range(0, 100000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",

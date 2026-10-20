@@ -1,0 +1,205 @@
+diff --git a/include/rex/ui/metal_runtime/metal_performance.h b/include/rex/ui/metal_runtime/metal_performance.h
+--- a/include/rex/ui/metal_runtime/metal_performance.h
++++ b/include/rex/ui/metal_runtime/metal_performance.h
+@@ -20,6 +20,15 @@
+   kGuestRefresh,
+   kPresent,
+   kDrawable,
++  kSwapRetire,
++  kSwapEncoder,
++  kSwapCommit,
++  kSwapFrameEnd,
++  kSwapPageState,
++  kSwapTexture,
++  kSwapGamma,
++  kSwapDiagnostics,
++  kSwapMemoryTracking,
+   kCount,
+ };
+ 
+@@ -28,6 +37,28 @@
+   uint64_t max_ns = 0;
+   uint64_t calls = 0;
+ };
++
++// GPU completion callbacks update this independently of CPU timing windows.
++// Sum of command-buffer execution intervals, not frame latency or total GPU load.
++class GpuTimingCounter {
++ public:
++  void Add(uint64_t ns) {
++    total_ns_.fetch_add(ns, std::memory_order_relaxed);
++    calls_.fetch_add(1, std::memory_order_relaxed);
++    auto old = max_ns_.load(std::memory_order_relaxed);
++    while (old < ns && !max_ns_.compare_exchange_weak(old, ns, std::memory_order_relaxed)) {}
++  }
++  PerfStageSample Take() {
++    return {total_ns_.exchange(0), max_ns_.exchange(0), calls_.exchange(0)};
++  }
++ private:
++  std::atomic<uint64_t> total_ns_{0}, max_ns_{0}, calls_{0};
++};
++
++inline GpuTimingCounter& GetGpuCommandTimings() {
++  static GpuTimingCounter counter;
++  return counter;
++}
+ 
+ // Shared by the emulation and UI threads. Snapshots are approximate reporting
+ // windows: a concurrent sample may straddle a reset, but is never discarded.
+diff --git a/src/graphics/metal_runtime/metal_command_processor.cpp b/src/graphics/metal_runtime/metal_command_processor.cpp
+--- a/src/graphics/metal_runtime/metal_command_processor.cpp
++++ b/src/graphics/metal_runtime/metal_command_processor.cpp
+@@ -764,7 +764,11 @@
+         p.sync_waits[4], p.sync_waits[5]);
+     constexpr const char* stage_names[] = {
+         "draw", "texture_requests", "texture_create", "texture_upload",
+-        "swap", "submit", "guest_refresh", "present", "drawable_wait"};
++        "swap", "submit", "guest_refresh", "present", "drawable_wait",
++        "swap_retire", "swap_encoder", "swap_commit", "swap_frame_end",
++        "swap_page_state", "swap_texture", "swap_gamma",
++        "swap_diagnostics", "swap_memory_tracking"};
++    static_assert(std::size(stage_names) == size_t(ui::metal_runtime::PerfStage::kCount));
+     auto& counters = ui::metal_runtime::GetPerfStageCounters();
+     std::string stages;
+     for (size_t i = 0; i < counters.size(); ++i) {
+@@ -776,6 +780,9 @@
+     }
+     REXLOG_INFO("PerfStages: window={:.3f}s guest_frames={}{}", secs, p.swaps,
+            stages);
++    const auto gpu = ui::metal_runtime::GetGpuCommandTimings().Take();
++    REXLOG_INFO("PerfGPU: scope=command_processor window={:.3f}s completed_buffers={} execution_ms={:.3f} max_buffer_ms={:.3f}",
++                secs, gpu.calls, gpu.total_ns / 1e6, gpu.max_ns / 1e6);
+     auto waits = ui::metal_runtime::GetWaitRegMemCounters().Take();
+     REXLOG_INFO(
+         "PerfWaitRegMem: window={:.3f}s calls={} blocked={} mem={} reg={} "
+@@ -2967,7 +2974,14 @@
+                                       uint32_t frontbuffer_height) {
+   ui::metal_runtime::ScopedPerfStage swap_timer(ui::metal_runtime::PerfStage::kSwap,
+                                        REXCVAR_GET(metal_perf_log));
+-  ProcessCompletedSubmissions();
++  {
++    ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapRetire,
++                                            REXCVAR_GET(metal_perf_log));
++    ProcessCompletedSubmissions();
++  }
++  {
++  ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapDiagnostics,
++                                          REXCVAR_GET(metal_perf_log));
+   ++swap_count_;
+   if (REXCVAR_GET(metal_debug_log_resolves_every) &&
+       swap_count_ % REXCVAR_GET(metal_debug_log_resolves_every) <= 1) {
+@@ -3035,12 +3049,19 @@
+   last_swap_ptr_ = frontbuffer_ptr;
+   last_swap_width_ = frontbuffer_width;
+   last_swap_height_ = frontbuffer_height;
++  }
+ 
+   // End any active render encoder
+-  EndRenderEncoder();
++  {
++    ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapEncoder,
++                                            REXCVAR_GET(metal_perf_log));
++    EndRenderEncoder();
++  }
+ 
+   // Submit and wait for command buffer
+   if (current_command_buffer_) {
++    ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapCommit,
++                                            REXCVAR_GET(metal_perf_log));
+ #if METAL_SHADER_CONVERTER_AVAILABLE
+     ScheduleDrawRingRelease(current_command_buffer_);
+ #else
+@@ -3063,13 +3084,21 @@
+   }
+ 
+   if (primitive_processor_ && frame_open_) {
++    ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapFrameEnd,
++                                            REXCVAR_GET(metal_perf_log));
+     primitive_processor_->EndFrame();
+     frame_open_ = false;
+   }
+   // Frame boundary reached - resolved memory tracking is only needed within a
+   // frame when trace playback writes memory.
+-  ClearResolvedMemory();
++  {
++    ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapMemoryTracking,
++                                            REXCVAR_GET(metal_perf_log));
++    ClearResolvedMemory();
++  }
+   if (shared_memory_ && REXCVAR_GET(clear_memory_page_state)) {
++    ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapPageState,
++                                            REXCVAR_GET(metal_perf_log));
+     shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+   }
+ 
+@@ -3091,8 +3120,12 @@
+       uint32_t swap_width = 0;
+       uint32_t swap_height = 0;
+       xenos::TextureFormat swap_format = xenos::TextureFormat::k_8_8_8_8;
+-      source_texture = texture_cache_->RequestSwapTexture(
+-          swap_width, swap_height, swap_format);
++      {
++        ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapTexture,
++                                                REXCVAR_GET(metal_perf_log));
++        source_texture = texture_cache_->RequestSwapTexture(
++            swap_width, swap_height, swap_format);
++      }
+       g_render_stats.last_swap_w = swap_width;
+       g_render_stats.last_swap_h = swap_height;
+       g_render_stats.last_swap_fmt = uint32_t(swap_format);
+@@ -3131,6 +3164,8 @@
+         if (presenter) {
+           if (!gamma_ramp_256_entry_table_up_to_date_ ||
+               !gamma_ramp_pwl_up_to_date_) {
++            ui::metal_runtime::ScopedPerfStage timer(ui::metal_runtime::PerfStage::kSwapGamma,
++                                                    REXCVAR_GET(metal_perf_log));
+             constexpr size_t kGammaRampTableBytes =
+                 sizeof(reg::DC_LUT_30_COLOR) * 256;
+             constexpr size_t kGammaRampPwlBytes =
+@@ -5936,7 +5971,14 @@
+ 
+   ++submission_current_;
+   pending_completion_handlers_.fetch_add(1, std::memory_order_relaxed);
+-  current_command_buffer_->addCompletedHandler([this](MTL::CommandBuffer* completed) {
++  const bool record_gpu_timing = REXCVAR_GET(metal_perf_log);
++  current_command_buffer_->addCompletedHandler([this, record_gpu_timing](MTL::CommandBuffer* completed) {
++    if (record_gpu_timing && completed->status() == MTL::CommandBufferStatusCompleted) {
++      const double start = completed->GPUStartTime(), end = completed->GPUEndTime();
++      if (start > 0.0 && end >= start) {
++        ui::metal_runtime::GetGpuCommandTimings().Add(uint64_t((end - start) * 1e9));
++      }
++    }
+     if (completed->status() == MTL::CommandBufferStatusError) {
+       auto* error = completed->error();
+       REXLOG_ERROR("Metal command buffer failed: {}", error ? error->localizedDescription()->utf8String() : "unknown GPU error");
+diff --git a/src/graphics/metal_runtime/runtime_check.cpp b/src/graphics/metal_runtime/runtime_check.cpp
+--- a/src/graphics/metal_runtime/runtime_check.cpp
++++ b/src/graphics/metal_runtime/runtime_check.cpp
+@@ -7,6 +7,7 @@
+ #include <rex/graphics/pipeline/shader/shader.h>
+ #include <rex/graphics/pipeline/texture/util.h>
+ #include <rex/ui/metal_runtime/metal_provider.h>
++#include <rex/ui/metal_runtime/metal_performance.h>
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ #include <SDL3/SDL.h>
+@@ -91,6 +92,8 @@
+   REXCVAR_GET(metal_shader_disk_cache) = false;
+   REXCVAR_GET(metal_pipeline_disk_cache) = false;
+   REXCVAR_GET(metal_pipeline_binary_archive) = false;
++  REXCVAR_GET(metal_perf_log) = true;
++  rex::ui::metal_runtime::GetGpuCommandTimings().Take();
+   rex::memory::Memory memory;
+   Require(memory.Initialize(), "Guest memory initialization failed");
+   DiagnosticGS graphics;
+@@ -239,6 +242,10 @@
+   std::ofstream(std::filesystem::path(output)/"receipt.txt") << "Full Metal game backend: plugin factory, presenter, UI drawer, runtime shader kernels and PM4 guest triangle passed; " << matched << " interpolated pixels and " << texture_matched << " tiled DXT1 pixels matched; guest output refresh/capture passed\n";
+   std::printf("Full Metal game-backend check passed: %zu interpolated and %zu tiled DXT1 pixels, presenter refresh/capture passed\n",matched,texture_matched);
+   graphics.Shutdown();
++  const auto gpu = rex::ui::metal_runtime::GetGpuCommandTimings().Take();
++  Require(gpu.calls > 0 && gpu.total_ns > 0, "Metal GPU timestamps unavailable");
++  std::printf("GPU timestamp check passed: %llu buffers, %.3fms execution, %.3fms maximum\n",
++              static_cast<unsigned long long>(gpu.calls), gpu.total_ns / 1e6, gpu.max_ns / 1e6);
+   for(auto address:allocations) memory.SystemHeapFree(address);
+ }
+ }

@@ -1,0 +1,33 @@
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -17,6 +17,7 @@
+ #include <fmt/format.h>
+ #include <rex/assert.h>
+ #include <rex/image_info.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ppc/function.h>
+@@ -896,6 +897,21 @@
+   info.pe_name = pe_name ? pe_name : "";
+   info.guest_path = guest_path ? NormalizeGuestPath(guest_path) : "";
+   info.shared_lib_name = shared_lib_name ? shared_lib_name : "";
++#if REX_PLATFORM_MAC
++  // Generated registries carry a CMake target stem. Unlike LoadLibrary,
++  // dlopen does not add the native prefix/suffix or search beside the game.
++  if (!info.shared_lib_name.empty()) {
++    auto library_path = std::filesystem::path(info.shared_lib_name);
++    if (!library_path.has_extension()) {
++      library_path = library_path.parent_path() /
++          ("lib" + library_path.filename().string() + ".dylib");
++    }
++    if (library_path.is_relative()) {
++      library_path = rex::filesystem::GetExecutableFolder() / library_path;
++    }
++    info.shared_lib_name = library_path.string();
++  }
++#endif
+ 
+   for (const auto& existing : recompiled_modules_) {
+     if (existing.guest_path == info.guest_path) {

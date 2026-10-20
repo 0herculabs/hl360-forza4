@@ -1,0 +1,753 @@
+diff --git a/include/rex/graphics/metal/command_processor.h b/include/rex/graphics/metal/command_processor.h
+--- a/include/rex/graphics/metal/command_processor.h
++++ b/include/rex/graphics/metal/command_processor.h
+@@ -16,6 +16,7 @@
+   void Shutdown() override;
+   bool ReadbackRGBA(std::vector<uint8_t>& rgba);
+   uint64_t draw_count() const;
++  uint64_t resolve_count() const;
+   const std::string& last_error() const;
+   void InvalidateGpuMemory() override;
+   void IssueSwap(uint32_t, uint32_t, uint32_t) override;
+diff --git a/src/graphics/metal/command/CMakeLists.txt b/src/graphics/metal/command/CMakeLists.txt
+--- a/src/graphics/metal/command/CMakeLists.txt
++++ b/src/graphics/metal/command/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ # Offscreen guest PM4 draw subset. Does not alter the runtime plugin factory.
+ add_library(rexmetal-command STATIC
+-    command_processor.cpp graphics_system.cpp ir_runtime.cpp
++    command_processor.cpp graphics_system.cpp ir_runtime.cpp texture_cache.cpp
+     ../../graphics_system.cpp ../../command_processor.cpp
+     ../../register_file.cpp ../../packet_disassembler.cpp)
+ target_include_directories(rexmetal-command PRIVATE "${REXGLUE_METAL_DEPS_ROOT}/msc/include")
+diff --git a/src/graphics/metal/command/command_processor.cpp b/src/graphics/metal/command/command_processor.cpp
+--- a/src/graphics/metal/command/command_processor.cpp
++++ b/src/graphics/metal/command/command_processor.cpp
+@@ -17,6 +17,10 @@
+ #include <bit>
+ #include <cstring>
+ #include <map>
++#include <set>
++#include "texture_cache.h"
++#include <rex/graphics/util/draw.h>
++#include <rex/graphics/pipeline/texture/util.h>
+ 
+ namespace rex::graphics::metal {
+ namespace {
+@@ -35,7 +39,11 @@
+   DxbcToDxilConverter dxil;
+   MetalShaderConverter metal;
+   std::map<std::pair<uint32_t, uint64_t>, std::unique_ptr<DxbcShader>> shaders;
++  std::unique_ptr<MetalTextureCache> textures;
++  std::map<std::pair<uint32_t, uint32_t>, NS::SharedPtr<MTL::Texture>> targets;
++  std::set<std::pair<uint32_t, uint32_t>> initialized_targets;
+   NS::SharedPtr<MTL::Texture> target;
++  uint64_t resolves = 0;
+   NS::SharedPtr<NS::AutoreleasePool> pool;
+   uint32_t width = 0, height = 0;
+   uint64_t draws = 0;
+@@ -51,10 +59,11 @@
+ }
+ const std::string& MetalCommandProcessor::last_error() const { return impl_->error; }
+ uint64_t MetalCommandProcessor::draw_count() const { return impl_->draws; }
++uint64_t MetalCommandProcessor::resolve_count() const { return impl_->resolves; }
+ bool MetalCommandProcessor::InitializeOffscreen(uint32_t width, uint32_t height) {
+   if (offscreen_ || !width || !height || width > 4096 || height > 4096) return false;
+   offscreen_ = true;
+-  impl_->draws = 0; impl_->error.clear();
++  impl_->draws = 0; impl_->resolves = 0; impl_->error.clear();
+   if (!SetupContext()) return false;
+   auto descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
+   descriptor->setTextureType(MTL::TextureType2D);
+@@ -64,6 +73,7 @@
+   descriptor->setUsage(MTL::TextureUsageRenderTarget);
+   impl_->target = NS::TransferPtr(impl_->provider->GetDevice()->newTexture(descriptor.get()));
+   impl_->width = width; impl_->height = height;
++  impl_->targets.emplace(std::make_pair(0u, width), impl_->target);
+   return impl_->target ? true : Fail("Offscreen target allocation failed");
+ }
+ bool MetalCommandProcessor::SetupContext() {
+@@ -74,6 +84,7 @@
+   if (!impl_->submissions) return Fail("Submission tracker creation failed");
+   impl_->shared = std::make_unique<MetalSharedMemory>(*impl_->provider, *impl_->submissions, *memory_);
+   if (!impl_->shared->Initialize()) return Fail("Guest-memory copy creation failed");
++  impl_->textures = std::make_unique<MetalTextureCache>(impl_->provider->GetDevice());
+   impl_->translator = std::make_unique<Translator>(ui::GraphicsProvider::GpuVendorID::kApple,
+                                                   false, false, true, true);
+   return impl_->dxil.Initialize() && impl_->metal.Initialize();
+@@ -81,7 +92,7 @@
+ void MetalCommandProcessor::ShutdownContext() {
+   if (impl_->submissions) impl_->submissions->AwaitAllSubmissionsCompletion();
+   impl_->shared.reset(); impl_->submissions.reset();
+-  impl_->target.reset(); impl_->shaders.clear(); impl_->translator.reset();
++  impl_->target.reset(); impl_->targets.clear(); impl_->initialized_targets.clear(); impl_->textures.reset(); impl_->shaders.clear(); impl_->translator.reset();
+   impl_->provider = nullptr; impl_->pool.reset();
+ }
+ void MetalCommandProcessor::Shutdown() {
+@@ -93,11 +104,72 @@
+ }
+ void MetalCommandProcessor::InvalidateGpuMemory() {
+   if (impl_->shared) impl_->shared->InvalidateAllPages();
++  if (impl_->textures) impl_->textures->Clear();
+ }
+ void MetalCommandProcessor::IssueSwap(uint32_t, uint32_t, uint32_t) {
+   Fail("Presentation is not implemented");
+ }
+-bool MetalCommandProcessor::IssueCopy() { return Fail("Guest resolves are not implemented"); }
++bool MetalCommandProcessor::IssueCopy() {
++  if (!offscreen_ || !impl_->shared) return Fail("Offscreen resolve context is missing");
++  const auto& regs = *register_file_;
++  const auto control = regs.Get<reg::RB_COPY_CONTROL>();
++  const auto dest = regs.Get<reg::RB_COPY_DEST_INFO>();
++  const auto pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
++  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
++  const auto fetch = regs.GetVertexFetch(0);
++  const auto source_color = regs.Get<reg::RB_COLOR_INFO>();
++  const uint32_t base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
++  if (control.copy_src_select != 0 || control.color_clear_enable || control.depth_clear_enable ||
++      (control.copy_command != xenos::CopyCommand::kRaw && control.copy_command != xenos::CopyCommand::kConvert) ||
++      dest.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || dest.copy_dest_array ||
++      source_color.color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++      dest.copy_dest_slice || dest.copy_dest_exp_bias || dest.copy_dest_number != xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction ||
++      uint32_t(dest.copy_dest_endian) > 3 || surface.msaa_samples != xenos::MsaaSamples::k1X ||
++      surface.surface_pitch != impl_->width || pitch.copy_dest_pitch != impl_->width ||
++      pitch.copy_dest_height != impl_->height || (base & 4095) ||
++      fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 6 ||
++      uint64_t(fetch.address) * 4 + 24 > SharedMemory::kBufferSize)
++    return Fail("Only full-surface 1x RGBA8 color resolves without clears are implemented");
++  draw_util::ResolveInfo info;
++  if (!draw_util::GetResolveInfo(regs, *memory_, 1, 1, false, false, info))
++    return Fail("Resolve register/rectangle decoding failed");
++  if ((uint32_t(info.coordinate_info.width_div_8) << 3) != impl_->width ||
++      (info.height_div_8 << 3) != impl_->height || info.coordinate_info.edram_offset_x_div_8 ||
++      info.coordinate_info.edram_offset_y_div_8 || info.copy_dest_coordinate_info.offset_x_div_8 ||
++      info.copy_dest_coordinate_info.offset_y_div_8 || info.copy_dest_base != base ||
++      info.color_edram_info.base_tiles != info.color_original_base)
++    return Fail("Partial/offset resolves are not implemented");
++  const auto key = std::make_pair(info.color_original_base, impl_->width);
++  auto found = impl_->targets.find(key);
++  if (found == impl_->targets.end() || !impl_->initialized_targets.contains(key))
++    return Fail("Resolve source is not an initialized render target");
++  const uint32_t length = texture_util::GetTiledAddressUpperBound2D(impl_->width, impl_->height, impl_->width, 2);
++  if (uint64_t(base) + length > SharedMemory::kBufferSize ||
++      !impl_->shared->RequestRange(base, length)) return Fail("Resolve destination is unavailable");
++  impl_->target = found->second;
++  std::vector<uint8_t> rgba;
++  if (!ReadbackRGBA(rgba)) return false;
++  // GPU completion is established by ReadbackRGBA before either host copy is
++  // modified. Both the watched GPU copy and guest RAM receive the tiled result.
++  auto* gpu_copy = static_cast<uint8_t*>(impl_->shared->GetBuffer()->contents()) + base;
++  auto* guest = memory_->TranslatePhysical(base);
++  std::vector<uint8_t> tiled(gpu_copy, gpu_copy + length);
++  for (uint32_t y = 0; y < impl_->height; ++y) for (uint32_t x = 0; x < impl_->width; ++x) {
++    uint8_t pixel[4]; std::memcpy(pixel, rgba.data() + (size_t(y) * impl_->width + x) * 4, 4);
++    if (dest.copy_dest_swap) std::swap(pixel[0], pixel[2]);
++    uint32_t value; std::memcpy(&value, pixel, 4);
++    value = xenos::GpuSwap(value, xenos::Endian(uint32_t(dest.copy_dest_endian)));
++    const uint32_t offset = texture_util::GetTiledOffset2D(x, y, impl_->width, 2);
++    if (offset + 4 > length) return Fail("Resolve tile address exceeds destination");
++    std::memcpy(tiled.data() + offset, &value, 4);
++  }
++  // Commit only after every destination address has been validated; preserve
++  // tile padding from the old copy rather than zeroing unrelated guest bytes.
++  impl_->shared->RangeWrittenByGpu(base, length);
++  std::memcpy(gpu_copy, tiled.data(), length); std::memcpy(guest, tiled.data(), length);
++  ++impl_->resolves; impl_->error.clear();
++  return true;
++}
+ Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType type, uint32_t address,
+                                          const uint32_t* code, uint32_t count) {
+   if (!code || !count || count > 0xffff || uint32_t(type) > 1 ||
+@@ -119,21 +191,72 @@
+ }
+ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive, uint32_t count,
+                                       IndexBufferInfo* indices, bool) {
+-  // Explicit diagnostic contract: NDC coordinates, one RGBA8 target, no guest
+-  // texture/depth/stencil/resolve emulation. Do not silently accept game state.
++  // Diagnostic contract: canonical NDC coordinates and bounded RGBA8 resource
++  // support. Other guest formats, raster state and layouts fail explicitly.
++  if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) return IssueCopy();
+   if (!offscreen_ || !impl_->target || !active_vertex_shader_ || !active_pixel_shader_)
+     return Fail("Offscreen target and both guest shaders are required");
+-  if (primitive != xenos::PrimitiveType::kTriangleList || indices || !count || count % 3)
+-    return Fail("Only non-indexed triangle lists are implemented");
++  if (primitive != xenos::PrimitiveType::kTriangleList || !count || count % 3)
++    return Fail("Only triangle lists are implemented");
++  if (register_file_->Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena)
++    return Fail("Primitive restart is not implemented");
+   if (register_file_->Get<reg::RB_DEPTHCONTROL>().value)
+     return Fail("Guest depth/stencil state is not implemented in the offscreen subset");
+   auto& vs = *static_cast<DxbcShader*>(active_vertex_shader_);
+   auto& ps = *static_cast<DxbcShader*>(active_pixel_shader_);
+-  if (!vs.texture_bindings().empty() || !ps.texture_bindings().empty() ||
+-      vs.memexport_eM_written() || ps.memexport_eM_written() || ps.writes_depth() ||
++  if (vs.memexport_eM_written() || ps.memexport_eM_written() || ps.writes_depth() ||
+       ps.writes_color_targets() != 1)
+-    return Fail("Textured, memexport, depth-export and multiple-target draws are not implemented");
++    return Fail("Memexport, depth-export and multiple-target draws are not implemented");
+   if (!impl_->submissions->AwaitAllSubmissionsCompletion()) return Fail("Earlier submission failed");
++  auto* device = impl_->provider->GetDevice();
++  NS::SharedPtr<MTL::Buffer> converted_indices;
++  MTL::IndexType index_type = MTL::IndexTypeUInt16;
++  if (indices) {
++    const size_t stride = indices->format == xenos::IndexFormat::kInt16 ? 2 : 4;
++    const size_t bytes = size_t(count) * stride;
++    const size_t aligned_bytes = (bytes + 3) & ~size_t(3);
++    if (indices->count != count || aligned_bytes > indices->length ||
++        ((indices->endianness == xenos::Endian::k8in32 || indices->endianness == xenos::Endian::k16in32) && (indices->guest_base & 3)) ||
++        uint64_t(indices->guest_base) + aligned_bytes > SharedMemory::kBufferSize ||
++        !impl_->shared->RequestRange(indices->guest_base, uint32_t(aligned_bytes)))
++      return Fail("Invalid guest index buffer range");
++    converted_indices = NS::TransferPtr(device->newBuffer(aligned_bytes, MTL::ResourceStorageModeShared));
++    if (!converted_indices) return Fail("Index conversion allocation failed");
++    const auto* source = static_cast<const uint8_t*>(impl_->shared->GetBuffer()->contents()) + indices->guest_base;
++    for (size_t i = 0; i < aligned_bytes; i += 4) {
++      uint32_t word; std::memcpy(&word, source + i, 4); word = xenos::GpuSwap(word, indices->endianness);
++      std::memcpy(static_cast<uint8_t*>(converted_indices->contents()) + i, &word, 4);
++    }
++    index_type = stride == 2 ? MTL::IndexTypeUInt16 : MTL::IndexTypeUInt32;
++  }
++  const auto surface = register_file_->Get<reg::RB_SURFACE_INFO>();
++  const auto color_info = register_file_->Get<reg::RB_COLOR_INFO>();
++  const uint32_t pitch = surface.surface_pitch ? uint32_t(surface.surface_pitch) : impl_->width;
++  if (surface.msaa_samples != xenos::MsaaSamples::k1X || pitch != impl_->width ||
++      color_info.color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 || color_info.color_exp_bias)
++    return Fail("Only 1x RGBA8 render targets at the offscreen pitch are implemented");
++  auto key = std::make_pair(uint32_t(color_info.color_base), pitch);
++  auto target_it = impl_->targets.find(key);
++  bool clear_target = false;
++  if (target_it == impl_->targets.end()) {
++    if (impl_->targets.size() >= 16) return Fail("Offscreen render target limit reached");
++    const uint32_t tiles = ((pitch + 79) / 80) * ((impl_->height + 15) / 16);
++    if (key.first + tiles > 2048) return Fail("Wrapped EDRAM targets are not implemented");
++    for (const auto& [other, texture] : impl_->targets) {
++      if (key.first < other.first + tiles && other.first < key.first + tiles)
++        return Fail("Overlapping EDRAM render target aliases are not implemented");
++    }
++    auto descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
++    descriptor->setTextureType(MTL::TextureType2D); descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
++    descriptor->setWidth(impl_->width); descriptor->setHeight(impl_->height);
++    descriptor->setUsage(MTL::TextureUsageRenderTarget); descriptor->setStorageMode(MTL::StorageModePrivate);
++    auto texture = NS::TransferPtr(device->newTexture(descriptor.get()));
++    if (!texture) return Fail("Render target allocation failed");
++    target_it = impl_->targets.emplace(key, texture).first; clear_target = true;
++  }
++  impl_->target = target_it->second;
++  // The original diagnostic target has not been initialized before its first draw.
++  clear_target = !impl_->initialized_targets.contains(key);
+   const auto& map = vs.constant_register_map();
+   for (uint32_t word = 0; word < 3; ++word) {
+     uint32_t bits = map.vertex_fetch_bitmap[word];
+@@ -156,7 +279,6 @@
+   Translator::Modification pm(impl_->translator->GetDefaultPixelShaderModification(
+       ps.GetDynamicAddressableRegisterCount(program.ps_num_reg)));
+   vm.vertex.interpolator_mask = mask; pm.pixel.interpolator_mask = mask;
+-  auto* device = impl_->provider->GetDevice();
+   Stage stages[2];
+   for (unsigned stage = 0; stage < 2; ++stage) {
+     auto& shader = stage ? ps : vs;
+@@ -167,7 +289,10 @@
+     if (!impl_->dxil.Convert(translation->translated_binary(), dxil, &error)) return Fail(error);
+     MetalShaderConversionResult result;
+     if (!impl_->metal.Convert(shader.type(), dxil, result)) return Fail(result.error_message);
+-    auto data = dispatch_data_create(result.metallib_data.data(), result.metallib_data.size(), nullptr, ^{});
++    REXLOG_DEBUG("Metal stage {} {:016X}, modification {:016X}: {} metallib bytes", stage, shader.ucode_data_hash(), stage ? pm.value : vm.value, result.metallib_data.size());
++    // Metal may access the library data lazily during pipeline linking. Give
++    // dispatch its own copy rather than retaining the temporary vector buffer.
++    auto data = dispatch_data_create(result.metallib_data.data(), result.metallib_data.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+     NS::Error* ns_error = nullptr;
+     stages[stage].library = NS::TransferPtr(device->newLibrary(data, &ns_error));
+     dispatch_release(data);
+@@ -176,6 +301,7 @@
+         NS::String::string(result.function_name.c_str(), NS::UTF8StringEncoding)));
+     if (!stages[stage].function) return Fail("Converted entry point unavailable");
+   }
++  REXLOG_DEBUG("Metal stage libraries loaded; creating render pipeline");
+   auto pd = NS::TransferPtr(MTL::RenderPipelineDescriptor::alloc()->init());
+   pd->setVertexFunction(stages[0].function.get()); pd->setFragmentFunction(stages[1].function.get());
+   pd->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+@@ -183,21 +309,47 @@
+   auto pipeline = NS::TransferPtr(device->newRenderPipelineState(pd.get(), &pipeline_error));
+   if (!pipeline) return Fail(pipeline_error ? pipeline_error->localizedDescription()->utf8String() : "Render pipeline creation failed");
+   auto uniform = NS::TransferPtr(device->newBuffer(2 * kUniformBytes, MTL::ResourceStorageModeShared));
+-  auto resource = NS::TransferPtr(device->newBuffer(1025 * sizeof(IRDescriptorTableEntry), MTL::ResourceStorageModeShared));
++  auto resource = NS::TransferPtr(device->newBuffer(2 * 1025 * sizeof(IRDescriptorTableEntry), MTL::ResourceStorageModeShared));
++  auto samplers = NS::TransferPtr(device->newBuffer(2 * 257 * sizeof(IRDescriptorTableEntry), MTL::ResourceStorageModeShared));
+   auto cbv = NS::TransferPtr(device->newBuffer(2 * 5 * sizeof(IRDescriptorTableEntry), MTL::ResourceStorageModeShared));
+   auto top = NS::TransferPtr(device->newBuffer(2 * 256, MTL::ResourceStorageModeShared));
+-  if (!uniform || !resource || !cbv || !top) return Fail("Draw argument allocation failed");
++  if (!uniform || !resource || !samplers || !cbv || !top) return Fail("Draw argument allocation failed");
+   std::memset(uniform->contents(), 0, uniform->length());
+   std::memset(resource->contents(), 0, resource->length());
+   std::memset(top->contents(), 0, top->length());
+-  IRDescriptorTableSetBuffer(static_cast<IRDescriptorTableEntry*>(resource->contents()),
+-                            impl_->shared->GetBuffer()->gpuAddress(), SharedMemory::kBufferSize);
++  std::memset(samplers->contents(), 0, samplers->length());
++  std::vector<NS::SharedPtr<MTL::Texture>> used_textures;
++  std::vector<NS::SharedPtr<MTL::SamplerState>> used_samplers;
++  for (unsigned stage = 0; stage < 2; ++stage) {
++    auto& shader = stage ? ps : vs;
++    auto* entries = static_cast<IRDescriptorTableEntry*>(resource->contents()) + stage * 1025;
++    IRDescriptorTableSetBuffer(entries, impl_->shared->GetBuffer()->gpuAddress(), SharedMemory::kBufferSize);
++    const auto& bindings = shader.GetTextureBindingsAfterTranslation();
++    for (size_t index = 0; index < bindings.size(); ++index) {
++      const auto& binding = bindings[index];
++      auto texture = impl_->textures->Request(register_file_->GetTextureFetch(binding.fetch_constant),
++          binding.dimension, binding.is_signed, *impl_->shared, impl_->error);
++      if (!texture) return Fail(impl_->error);
++      IRDescriptorTableSetTexture(&entries[1 + index], texture.get(), 0, 0);
++      used_textures.push_back(texture);
++    }
++    const auto& sampler_bindings = shader.GetSamplerBindingsAfterTranslation();
++    auto* sampler_entries = static_cast<IRDescriptorTableEntry*>(samplers->contents()) + stage * 257;
++    for (size_t index = 0; index < sampler_bindings.size(); ++index) {
++      const auto& binding = sampler_bindings[index];
++      auto sampler = impl_->textures->Sampler(register_file_->GetTextureFetch(binding.fetch_constant), binding, impl_->error);
++      if (!sampler) return Fail(impl_->error);
++      IRDescriptorTableSetSampler(&sampler_entries[index], sampler.get(), 0);
++      used_samplers.push_back(sampler);
++    }
++  }
+   Translator::SystemConstants system{};
+   system.flags = Translator::kSysFlag_XYDividedByW | Translator::kSysFlag_ZDividedByW |
+                  Translator::kSysFlag_WNotReciprocal | Translator::kSysFlag_PrimitivePolygonal |
+                  Translator::kSysFlag_AlphaPassIfLess | Translator::kSysFlag_AlphaPassIfEqual |
+                  Translator::kSysFlag_AlphaPassIfGreater;
+   system.vertex_index_max = 0xffffff;
++  system.vertex_index_offset = register_file_->Get<reg::VGT_INDX_OFFSET>().indx_offset;
+   for (auto& value : system.ndc_scale) value = 1.0f;
+   for (auto& value : system.color_exp_bias) value = 1.0f;
+   for (uint32_t stage = 0; stage < 2; ++stage) {
+@@ -219,9 +371,9 @@
+     for (uint32_t index = 0; index < 5; ++index)
+       IRDescriptorTableSetBuffer(&entries[index], uniform->gpuAddress() + stage * kUniformBytes + index * kCBVBytes, kCBVBytes);
+     auto* pointers = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(top->contents()) + stage * 256);
+-    for (uint32_t index = 0; index < 9; ++index) pointers[index] = resource->gpuAddress();
+-    // No samplers are referenced in this supported subset.
+-    pointers[9] = resource->gpuAddress();
++    for (uint32_t index = 0; index < 9; ++index) pointers[index] = resource->gpuAddress() + stage * 1025 * sizeof(IRDescriptorTableEntry);
++    // Each shader stage has independent texture and sampler table contents.
++    pointers[9] = samplers->gpuAddress() + stage * 257 * sizeof(IRDescriptorTableEntry);
+     for (uint32_t index = 10; index < 15; ++index)
+       pointers[index] = cbv->gpuAddress() + stage * 5 * sizeof(IRDescriptorTableEntry);
+   }
+@@ -229,30 +381,39 @@
+   if (!commands) return Fail("Command buffer allocation failed");
+   auto pass = NS::TransferPtr(MTL::RenderPassDescriptor::alloc()->init());
+   auto* color = pass->colorAttachments()->object(0);
+-  color->setTexture(impl_->target.get()); color->setLoadAction(MTL::LoadActionClear);
++  color->setTexture(impl_->target.get()); color->setLoadAction(clear_target ? MTL::LoadActionClear : MTL::LoadActionLoad);
+   color->setStoreAction(MTL::StoreActionStore); color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
+   auto* encoder = commands->renderCommandEncoder(pass.get());
+   if (!encoder) return Fail("Render encoder creation failed");
+   encoder->setRenderPipelineState(pipeline.get());
+   encoder->setViewport(MTL::Viewport{0, 0, double(impl_->width), double(impl_->height), 0, 1});
+   encoder->setCullMode(MTL::CullModeNone);
+-  for (auto* buffer : {uniform.get(), resource.get(), cbv.get(), top.get(), impl_->shared->GetBuffer()})
++  for (auto* buffer : {uniform.get(), resource.get(), samplers.get(), cbv.get(), top.get(), impl_->shared->GetBuffer()})
+     encoder->useResource(buffer, MTL::ResourceUsageRead);
++  for (const auto& texture : used_textures) encoder->useResource(texture.get(), MTL::ResourceUsageRead);
++  if (converted_indices) encoder->useResource(converted_indices.get(), MTL::ResourceUsageRead);
+   encoder->setVertexBuffer(top.get(), 0, kIRArgumentBufferBindPoint);
+   encoder->setFragmentBuffer(top.get(), 256, kIRArgumentBufferBindPoint);
+   encoder->setVertexBuffer(resource.get(), 0, kIRDescriptorHeapBindPoint);
+   encoder->setFragmentBuffer(resource.get(), 0, kIRDescriptorHeapBindPoint);
+-  encoder->setVertexBuffer(resource.get(), 0, kIRSamplerHeapBindPoint);
+-  encoder->setFragmentBuffer(resource.get(), 0, kIRSamplerHeapBindPoint);
+-  IRRuntimeDrawPrimitives(encoder, MTL::PrimitiveTypeTriangle, 0, count, 1);
++  encoder->setVertexBuffer(samplers.get(), 0, kIRSamplerHeapBindPoint);
++  encoder->setFragmentBuffer(samplers.get(), 0, kIRSamplerHeapBindPoint);
++  if (converted_indices) IRRuntimeDrawIndexedPrimitives(encoder, MTL::PrimitiveTypeTriangle, count, index_type, converted_indices.get(), 0, 1, 0, 0);
++  else IRRuntimeDrawPrimitives(encoder, MTL::PrimitiveTypeTriangle, 0, count, 1);
+   encoder->endEncoding();
+   const auto submission = impl_->submissions->Submit(commands);
+   if (!submission || !impl_->submissions->AwaitSubmissionCompletion(submission)) return Fail("Guest draw GPU submission failed");
++  impl_->initialized_targets.insert(key);
+   ++impl_->draws; impl_->error.clear();
+   return true;
+ }
+ bool MetalCommandProcessor::ReadbackRGBA(std::vector<uint8_t>& rgba) {
+-  if (!impl_->target || !impl_->draws) return Fail("No rendered offscreen target");
++  const auto color_info = register_file_->Get<reg::RB_COLOR_INFO>();
++  const auto surface = register_file_->Get<reg::RB_SURFACE_INFO>();
++  const auto key = std::make_pair(uint32_t(color_info.color_base), surface.surface_pitch ? uint32_t(surface.surface_pitch) : impl_->width);
++  auto found = impl_->targets.find(key);
++  if (found == impl_->targets.end() || !impl_->initialized_targets.contains(key)) return Fail("No rendered offscreen target");
++  impl_->target = found->second;
+   const size_t row = (size_t(impl_->width) * 4 + 255) & ~size_t(255);
+   auto readback = NS::TransferPtr(impl_->provider->GetDevice()->newBuffer(row * impl_->height, MTL::ResourceStorageModeShared));
+   auto* commands = impl_->provider->GetCommandQueue()->commandBuffer();
+diff --git a/src/graphics/metal/command/draw_check.cpp b/src/graphics/metal/command/draw_check.cpp
+--- a/src/graphics/metal/command/draw_check.cpp
++++ b/src/graphics/metal/command/draw_check.cpp
+@@ -3,8 +3,11 @@
+ #include <rex/graphics/metal/command_processor.h>
+ #include <rex/graphics/pipeline/shader/shader.h>
+ #include <rex/graphics/xenos.h>
++#include <rex/graphics/pipeline/texture/util.h>
+ #include <xxhash.h>
+ #include <bit>
++#include <array>
++#include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -86,8 +89,10 @@
+     auto guest = memory.SystemHeapAlloc(uint32_t(size), uint32_t(rex::memory::page_size()), rex::memory::kSystemHeapPhysical);
+     Require(guest != 0, "Physical allocation failed"); allocations.push_back(guest); return guest;
+   };
++  constexpr uint64_t kTextureVS = 0x7156CE05C6365E51, kTexturePS = 0x6E57A6E305D5D69B;
++  Require(shaders.contains(kTextureVS) && shaders.contains(kTexturePS), "Required textured FM3 shaders are absent");
+   std::map<uint64_t, uint32_t> addresses;
+-  for (auto hash : {kVS, kPS, kConstantPS}) {
++  for (auto hash : {kVS, kPS, kConstantPS, kTextureVS, kTexturePS}) {
+     const auto& code = shaders.at(hash).code;
+     auto guest = alloc(code.size() * 4);
+     std::memcpy(memory.TranslateVirtual(guest), code.data(), code.size() * 4);
+@@ -157,6 +162,227 @@
+   std::ofstream(output / "receipt.txt") << "FM3 guest shaders VS=1E6883FCCDE1F688 PS=A4A965C189287B99,7AB6C260E913B290\n"
+       << "128x128 RGBA8, synthetic triangle/constants, SDK PM4 IM_LOAD + DRAW_INDX_2\n"
+       << "3 guest draws passed; this is not an FM3 scene replay\n";
++  // Indexed textured quads use a different captured VS: raw vertex fetch 95
++  // (XNA label vf0), leaving texture fetch 0 available in the same register file.
++  const auto baseline = rgba;
++  const auto quad_guest = alloc(5 * 5 * 4);
++  const auto index_guest = alloc(256);
++  const auto texture_guest = alloc(128 * 128 * 4);
++  const auto resolved_guest = alloc(128 * 128 * 4 + uint32_t(rex::memory::page_size()));
++  const auto rectangle_guest = alloc(24);
++  auto physical = [&](uint32_t guest) { return memory.GetPhysicalAddress(guest); };
++  const float quad[] = {1,1,.5f,1,0, -1,-1,.5f,0,1, -1,1,.5f,0,0, 1,-1,.5f,1,1};
++  for (size_t i = 0; i < 20; ++i)
++    memory.TranslateVirtual<uint32_t*>(quad_guest)[i] = std::byteswap(std::bit_cast<uint32_t>(quad[i]));
++  auto execute = [&](const std::vector<uint32_t>& packets) {
++    auto* destination = memory.TranslateVirtual<uint32_t*>(packet_guest);
++    for (size_t i = 0; i < packets.size(); ++i) destination[i] = std::byteswap(packets[i]);
++    cp.ExecutePacket(packet_physical, uint32_t(packets.size()));
++  };
++  auto write_reg = [&](uint32_t index, uint32_t value) {
++    execute({xenos::MakePacketType0(index, 1), value});
++  };
++  auto pattern = [](unsigned x, unsigned y, unsigned version) {
++    return std::array<uint8_t, 4>{uint8_t((x * 2) ^ (version ? 255 : 0)), uint8_t(y * 2), uint8_t((x ^ y) * 2), 255};
++  };
++  xenos::xe_gpu_texture_fetch_t texture_fetch{};
++  texture_fetch.type = xenos::FetchConstantType::kTexture;
++  texture_fetch.format = xenos::TextureFormat::k_8_8_8_8;
++  texture_fetch.dimension = xenos::DataDimension::k2DOrStacked;
++  texture_fetch.size_2d.width = 127; texture_fetch.size_2d.height = 127;
++  texture_fetch.pitch = 4; texture_fetch.base_address = physical(texture_guest) >> 12;
++  texture_fetch.mag_filter = xenos::TextureFilter::kPoint; texture_fetch.min_filter = xenos::TextureFilter::kPoint;
++  texture_fetch.mip_filter = xenos::TextureFilter::kBaseMap;
++  texture_fetch.clamp_x = xenos::ClampMode::kClampToEdge; texture_fetch.clamp_y = xenos::ClampMode::kClampToEdge;
++  texture_fetch.swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
++  uint32_t quad_words = 20;
++  auto indexed_draw = [&](unsigned variant, unsigned color_base, uint32_t base_vertex = 0, uint32_t dma_words = 6) {
++    std::vector<uint32_t> packets;
++    auto reg = [&](uint32_t index, uint32_t value) { packets.push_back(xenos::MakePacketType0(index, 1)); packets.push_back(value); };
++    xenos::xe_gpu_vertex_fetch_t fetch{};
++    fetch.type = xenos::FetchConstantType::kVertex; fetch.address = physical(quad_guest) >> 2;
++    fetch.size = quad_words; fetch.endian = xenos::Endian::k8in32;
++    reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 190, fetch.dword_0);
++    reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 191, fetch.dword_1);
++    const auto* tf = reinterpret_cast<const uint32_t*>(&texture_fetch);
++    for (unsigned i = 0; i < 6; ++i) reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + i, tf[i]);
++    reg::RB_COLOR_INFO color{}; color.color_base = color_base;
++    reg(XE_GPU_REG_RB_COLOR_INFO, color.value);
++    reg(XE_GPU_REG_VGT_INDX_OFFSET, base_vertex);
++    reg::RB_SURFACE_INFO surface{}; surface.surface_pitch = 128;
++    reg(XE_GPU_REG_RB_SURFACE_INFO, surface.value);
++    reg::RB_MODECONTROL mode{}; mode.edram_mode = xenos::EdramMode::kColorDepth;
++    reg(XE_GPU_REG_RB_MODECONTROL, mode.value);
++    for (auto hash : {kTextureVS, kTexturePS}) {
++      packets.push_back(xenos::MakePacketType3(xenos::PM4_IM_LOAD, 2));
++      packets.push_back(addresses.at(hash) | shaders.at(hash).type);
++      packets.push_back(uint32_t(shaders.at(hash).code.size()));
++    }
++    const bool wide = variant >= 4;
++    const auto endian = xenos::Endian(variant & 3);
++    std::vector<uint8_t> host_indices(wide ? 24 : 12);
++    const uint32_t values[] = {1,3,0,1,0,2};
++    for (size_t i = 0; i < 6; ++i) {
++      if (wide) std::memcpy(host_indices.data() + i * 4, &values[i], 4);
++      else { uint16_t value = uint16_t(values[i]); std::memcpy(host_indices.data() + i * 2, &value, 2); }
++    }
++    auto* source = memory.TranslateVirtual<uint8_t*>(index_guest) + 16;
++    for (size_t i = 0; i < host_indices.size(); i += 4) {
++      uint32_t word; std::memcpy(&word, host_indices.data() + i, 4); word = xenos::GpuSwap(word, endian);
++      std::memcpy(source + i, &word, 4);
++    }
++    reg::VGT_DRAW_INITIATOR draw_info{};
++    draw_info.prim_type = xenos::PrimitiveType::kTriangleList; draw_info.source_select = xenos::SourceSelect::kDMA;
++    draw_info.num_indices = 6; draw_info.index_size = wide ? xenos::IndexFormat::kInt32 : xenos::IndexFormat::kInt16;
++    reg::VGT_DMA_SIZE dma{}; dma.num_words = dma_words; dma.swap_mode = endian;
++    packets.push_back(xenos::MakePacketType3(xenos::PM4_DRAW_INDX_2, 3));
++    packets.push_back(draw_info.value); packets.push_back(physical(index_guest) + 16); packets.push_back(dma.value);
++    execute(packets);
++  };
++  std::vector<uint8_t> last_image;
++  for (unsigned variant = 0; variant < 8; ++variant) {
++    const bool tiled = variant >= 4;
++    const unsigned version = variant & 1;
++    texture_fetch.tiled = tiled;
++    texture_fetch.endianness = xenos::Endian::k8in32;
++    auto* data = memory.TranslateVirtual<uint8_t*>(texture_guest);
++    for (unsigned y = 0; y < 128; ++y) for (unsigned x = 0; x < 128; ++x) {
++      auto pixel = pattern(x, y, version);
++      uint32_t word; std::memcpy(&word, pixel.data(), 4); word = std::byteswap(word);
++      const auto offset = tiled ? uint32_t(texture_util::GetTiledOffset2D(x, y, 128, 2)) : (y * 128 + x) * 4;
++      std::memcpy(data + offset, &word, 4);
++    }
++    const auto expected_draws = cp.draw_count() + 1;
++    indexed_draw(variant, (variant + 1) * 64);
++    if (!cp.last_error().empty()) std::fprintf(stderr, "%s\n",cp.last_error().c_str());
++    Require(cp.draw_count() == expected_draws && cp.ReadbackRGBA(rgba), "Indexed textured guest draw failed");
++    for (unsigned y = 0; y < 128; ++y) for (unsigned x = 0; x < 128; ++x) {
++      const auto expected = pattern(x, y, version);
++      for (unsigned ch = 0; ch < 4; ++ch) {
++        if (std::abs(int(rgba[(y * 128 + x) * 4 + ch]) - int(expected[ch])) > 1) {
++          std::fprintf(stderr, "variant %u pixel %u,%u ch%u got%u expected%u\n",variant,x,y,ch,rgba[(y*128+x)*4+ch],expected[ch]);
++          throw std::runtime_error("Indexed texture pixel mismatch");
++        }
++      }
++    }
++    last_image = rgba;
++    std::printf("Indexed %u-bit endian %u, %s RGBA8 texture: all 16384 pixels matched\n",variant >= 4 ? 32 : 16, variant & 3, tiled ? "tiled" : "linear");
++  }
++  Save(output / "textured.rgba", last_image);
++  // Shift vertices by one slot and rely on the guest's base-vertex register.
++  for (size_t i = 0; i < 20; ++i)
++    memory.TranslateVirtual<uint32_t*>(quad_guest)[i + 5] = std::byteswap(std::bit_cast<uint32_t>(quad[i]));
++  quad_words = 25;
++  auto before_offset = cp.draw_count();
++  indexed_draw(7, 640, 1);
++  Require(cp.draw_count() == before_offset + 1 && cp.ReadbackRGBA(rgba) && rgba == last_image,
++          "Base-vertex offset draw mismatch");
++  for (size_t i = 0; i < 20; ++i)
++    memory.TranslateVirtual<uint32_t*>(quad_guest)[i] = std::byteswap(std::bit_cast<uint32_t>(quad[i]));
++  quad_words = 20;
++  std::puts("Guest base-vertex offset and updated vertex upload passed");
++
++  // Switching back to an older EDRAM base must preserve its stored contents.
++  write_reg(XE_GPU_REG_RB_COLOR_INFO, 0);
++  Require(cp.ReadbackRGBA(rgba) && rgba == baseline, "Render target switching lost previous contents");
++  write_reg(XE_GPU_REG_RB_COLOR_INFO, 512);
++  const float rectangle[] = {-.5f,-.5f,127.5f,-.5f,-.5f,127.5f};
++  for (unsigned i = 0; i < 6; ++i) memory.TranslateVirtual<uint32_t*>(rectangle_guest)[i] = std::byteswap(std::bit_cast<uint32_t>(rectangle[i]));
++  memory.Fill(resolved_guest, 65536 + uint32_t(rex::memory::page_size()), 0xA5);
++  xenos::xe_gpu_vertex_fetch_t rectangle_fetch{};
++  rectangle_fetch.type = xenos::FetchConstantType::kVertex; rectangle_fetch.address = physical(rectangle_guest) >> 2;
++  rectangle_fetch.size = 6; rectangle_fetch.endian = xenos::Endian::k8in32;
++  write_reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, rectangle_fetch.dword_0);
++  write_reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1, rectangle_fetch.dword_1);
++  write_reg(XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL, 0);
++  write_reg(XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR, 128 | (128 << 16));
++  write_reg(XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL, 0);
++  write_reg(XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR, 128 | (128 << 16));
++  reg::RB_COPY_DEST_INFO dest{};
++  dest.copy_dest_format = xenos::ColorFormat::k_8_8_8_8; dest.copy_dest_endian = xenos::Endian128::k8in32;
++  reg::RB_COPY_DEST_PITCH dest_pitch{}; dest_pitch.copy_dest_pitch = 128; dest_pitch.copy_dest_height = 128;
++  write_reg(XE_GPU_REG_RB_COPY_CONTROL, 0); write_reg(XE_GPU_REG_RB_COPY_DEST_INFO, dest.value);
++  write_reg(XE_GPU_REG_RB_COPY_DEST_PITCH, dest_pitch.value);
++  write_reg(XE_GPU_REG_RB_COPY_DEST_BASE, physical(resolved_guest));
++  reg::RB_MODECONTROL copy_mode{}; copy_mode.edram_mode = xenos::EdramMode::kCopy;
++  write_reg(XE_GPU_REG_RB_MODECONTROL, copy_mode.value);
++  reg::VGT_DRAW_INITIATOR copy_draw{};
++  copy_draw.prim_type = xenos::PrimitiveType::kRectangleList; copy_draw.source_select = xenos::SourceSelect::kAutoIndex; copy_draw.num_indices = 3;
++  execute({xenos::MakePacketType3(xenos::PM4_DRAW_INDX_2, 1), copy_draw.value});
++  if (!cp.last_error().empty()) std::fprintf(stderr, "%s\n", cp.last_error().c_str());
++  Require(cp.resolve_count() == 1, "Guest PM4 resolve failed");
++  const auto* resolved_data = memory.TranslatePhysical(physical(resolved_guest));
++  for (unsigned y = 0; y < 128; ++y) for (unsigned x = 0; x < 128; ++x) {
++    uint32_t word; std::memcpy(&word, resolved_data + texture_util::GetTiledOffset2D(x,y,128,2), 4);
++    word = std::byteswap(word);
++    Require(std::memcmp(&word, last_image.data() + (y*128+x)*4, 4) == 0, "Resolved guest pixel mismatch");
++  }
++  for (unsigned i = 65536; i < 65536 + rex::memory::page_size(); ++i)
++    Require(resolved_data[i] == 0xA5, "Resolve overran destination");
++  texture_fetch.base_address = physical(resolved_guest) >> 12;
++  const auto draws_before = cp.draw_count();
++  indexed_draw(7, 576);
++  Require(cp.draw_count() == draws_before + 1 && cp.ReadbackRGBA(rgba) && rgba == last_image,
++          "Sampling resolved guest texture did not reproduce source target");
++  Save(output / "resolve-roundtrip.rgba", rgba);
++  std::puts("Render target retention, tiled/endian guest resolve and sample roundtrip passed");
++  // Reject a destination crossing the end of guest RAM, preserving the result.
++  auto destination_before = std::vector<uint8_t>(resolved_data, resolved_data + 65536 + rex::memory::page_size());
++  write_reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, rectangle_fetch.dword_0);
++  write_reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1, rectangle_fetch.dword_1);
++  write_reg(XE_GPU_REG_RB_MODECONTROL, copy_mode.value);
++  write_reg(XE_GPU_REG_RB_COPY_DEST_BASE, (1u << 29) - 4096);
++  execute({xenos::MakePacketType3(xenos::PM4_DRAW_INDX_2, 1), copy_draw.value});
++  Require(cp.resolve_count() == 1 && !cp.last_error().empty(), "Out-of-range resolve accepted");
++  Require(std::memcmp(destination_before.data(), resolved_data, destination_before.size()) == 0,
++          "Rejected resolve modified valid destination");
++  // A second resolve swaps R/B and 16-bit halves. Texture swizzle and endian
++  // conversion must undo both when sampling the resolved guest memory.
++  write_reg(XE_GPU_REG_RB_COPY_DEST_BASE, physical(resolved_guest));
++  dest.copy_dest_swap = 1; dest.copy_dest_endian = xenos::Endian128::k16in32;
++  write_reg(XE_GPU_REG_RB_COPY_DEST_INFO, dest.value);
++  execute({xenos::MakePacketType3(xenos::PM4_DRAW_INDX_2, 1), copy_draw.value});
++  Require(cp.resolve_count() == 2, "Swapped-color resolve failed");
++  texture_fetch.swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A);
++  texture_fetch.endianness = xenos::Endian::k16in32;
++  auto before_swap = cp.draw_count();
++  indexed_draw(7, 704);
++  Require(cp.draw_count() == before_swap + 1 && cp.ReadbackRGBA(rgba) && rgba == last_image,
++          "Swapped-color resolve/sample mismatch");
++  Save(output / "swapped-roundtrip.rgba", rgba);
++  // A 2x2 texture magnified to 128x128 independently checks bilinear filtering.
++  texture_fetch.base_address = physical(texture_guest) >> 12;
++  texture_fetch.size_2d.width = 1; texture_fetch.size_2d.height = 1; texture_fetch.pitch = 2;
++  texture_fetch.tiled = 0; texture_fetch.swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
++  texture_fetch.endianness = xenos::Endian::k8in32;
++  texture_fetch.mag_filter = xenos::TextureFilter::kLinear; texture_fetch.min_filter = xenos::TextureFilter::kLinear;
++  for (unsigned y = 0; y < 2; ++y) for (unsigned x = 0; x < 2; ++x) {
++    std::array<uint8_t,4> value{uint8_t(x*255),uint8_t(y*255),128,255};
++    uint32_t word; std::memcpy(&word, value.data(), 4); word = std::byteswap(word);
++    std::memcpy(memory.TranslateVirtual<uint8_t*>(texture_guest) + y*256 + x*4, &word, 4);
++  }
++  auto before_filter = cp.draw_count(); indexed_draw(7, 768);
++  Require(cp.draw_count() == before_filter + 1 && cp.ReadbackRGBA(rgba), "Linear sampler draw failed");
++  for (unsigned y = 0; y < 128; ++y) for (unsigned x = 0; x < 128; ++x) {
++    float expected[] = {std::clamp((float(x)+.5f)/64-.5f,0.f,1.f)*255,
++                        std::clamp((float(y)+.5f)/64-.5f,0.f,1.f)*255,128,255};
++    for (unsigned ch = 0; ch < 4; ++ch)
++      Require(std::abs(float(rgba[(y*128+x)*4+ch])-expected[ch]) <= 1.5f, "Bilinear sampler pixel mismatch");
++  }
++  Save(output / "filtered.rgba", rgba);
++  const auto filtered = rgba;
++  // Rejected format and truncated DMA declarations must leave the target intact.
++  texture_fetch.format = xenos::TextureFormat::k_DXT1;
++  auto before_bad = cp.draw_count(); indexed_draw(7, 768);
++  Require(cp.draw_count() == before_bad && !cp.last_error().empty(), "Unsupported texture format accepted");
++  Require(cp.ReadbackRGBA(rgba) && rgba == filtered, "Rejected texture draw altered target");
++  texture_fetch.format = xenos::TextureFormat::k_8_8_8_8;
++  indexed_draw(7, 768, 0, 1);
++  Require(cp.draw_count() == before_bad && !cp.last_error().empty(), "Truncated index DMA accepted");
++  Require(cp.ReadbackRGBA(rgba) && rgba == filtered, "Rejected DMA draw altered target");
++  std::puts("Swapped resolve, bilinear filtering, unsupported texture and invalid DMA/resolve checks passed");
++
++  std::ofstream(output / "resources-receipt.txt") << "15 successful guest draws, 2 resolves: indexed/endian textures, base-vertex, retained targets, resolve/sample roundtrips, filtering and invalid request rejection passed\n";
+   graphics.Shutdown(); graphics.Shutdown();
+   for (auto guest : allocations) memory.SystemHeapFree(guest);
+   std::puts("Native Metal guest PM4 draw check passed");
+diff --git a/src/graphics/metal/command/texture_cache.h b/src/graphics/metal/command/texture_cache.h
+new file mode 100644
+index 0000000..d2d274a
+--- /dev/null
++++ b/src/graphics/metal/command/texture_cache.h
+@@ -0,0 +1,25 @@
++#pragma once
++#include <rex/graphics/metal/shared_memory.h>
++#include <rex/graphics/pipeline/shader/dxbc.h>
++#include <Foundation/NSSharedPtr.hpp>
++#include <array>
++#include <map>
++
++namespace rex::graphics::metal {
++// Initial CPU conversion path for single-mip unsigned RGBA8 guest textures.
++// Called after submitted GPU work has completed; guest data uses watched copies.
++class MetalTextureCache {
++ public:
++  explicit MetalTextureCache(MTL::Device* device) : device_(device) {}
++  NS::SharedPtr<MTL::Texture> Request(const xenos::xe_gpu_texture_fetch_t& fetch,
++      xenos::FetchOpDimension dimension, bool signed_view, MetalSharedMemory& memory,
++      std::string& error);
++  NS::SharedPtr<MTL::SamplerState> Sampler(const xenos::xe_gpu_texture_fetch_t& fetch,
++      const DxbcShader::SamplerBinding& binding, std::string& error);
++  void Clear() { textures_.clear(); cached_bytes_ = 0; }
++ private:
++  MTL::Device* device_;
++  size_t cached_bytes_ = 0;
++  std::map<std::array<uint64_t, 5>, NS::SharedPtr<MTL::Texture>> textures_;
++};
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/command/texture_cache.cpp b/src/graphics/metal/command/texture_cache.cpp
+new file mode 100644
+index 0000000..c0e9b84
+--- /dev/null
++++ b/src/graphics/metal/command/texture_cache.cpp
+@@ -0,0 +1,82 @@
++// Resource binding subset adapted from Alloy's Metal texture-cache interfaces.
++// Copyright 2026 Ben Vanik. BSD license; see SDK LICENSE.
++#include "texture_cache.h"
++#include <rex/graphics/pipeline/texture/util.h>
++#include <xxhash.h>
++#include <cstring>
++
++namespace rex::graphics::metal {
++NS::SharedPtr<MTL::Texture> MetalTextureCache::Request(
++    const xenos::xe_gpu_texture_fetch_t& fetch, xenos::FetchOpDimension dimension,
++    bool signed_view, MetalSharedMemory& memory, std::string& error) {
++  auto fail = [&](const char* text) { error = text; return NS::SharedPtr<MTL::Texture>{}; };
++  if (fetch.type != xenos::FetchConstantType::kTexture || dimension != xenos::FetchOpDimension::k2D ||
++      fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked ||
++      fetch.format != xenos::TextureFormat::k_8_8_8_8 || fetch.mip_min_level || fetch.mip_max_level || fetch.packed_mips || fetch.border_size ||
++      fetch.lod_bias || fetch.grad_exp_adjust_h || fetch.grad_exp_adjust_v || uint32_t(fetch.arbitrary_filter) ||
++      fetch.sign_x != xenos::TextureSign::kUnsigned || fetch.sign_y != xenos::TextureSign::kUnsigned ||
++      fetch.sign_z != xenos::TextureSign::kUnsigned || fetch.sign_w != xenos::TextureSign::kUnsigned || fetch.num_format)
++    return fail("Only unsigned single-mip 2D RGBA8 textures are implemented");
++  const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
++  const uint32_t pitch = fetch.pitch << 5, base = fetch.base_address << 12;
++  if (!pitch || pitch < width || pitch > 4096 || width > 4096 || height > 4096 ||
++      (!fetch.tiled && ((pitch * 4) & 255))) return fail("Unsupported texture dimensions/pitch");
++  uint64_t extent = fetch.tiled ? texture_util::GetTiledAddressUpperBound2D(width, height, pitch, 2)
++                               : uint64_t(pitch) * 4 * height;
++  if (!extent || uint64_t(base) + extent > SharedMemory::kBufferSize ||
++      !memory.RequestRange(base, uint32_t(extent))) return fail("Texture source range is unavailable");
++  const auto* source = static_cast<const uint8_t*>(memory.GetBuffer()->contents()) + base;
++  std::array<uint64_t, 5> key{};
++  std::memcpy(key.data(), &fetch, sizeof(fetch)); key[3] = signed_view;
++  key[4] = XXH3_64bits(source, size_t(extent));
++  if (auto found = textures_.find(key); found != textures_.end()) return found->second;
++  std::vector<uint8_t> pixels(size_t(width) * height * 4);
++  for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x) {
++    const size_t offset = fetch.tiled ? uint32_t(texture_util::GetTiledOffset2D(x, y, pitch, 2))
++                                     : (size_t(y) * pitch + x) * 4;
++    if (offset + 4 > extent) return fail("Tiled texture address exceeds validated extent");
++    uint32_t packed; std::memcpy(&packed, source + offset, 4);
++    packed = xenos::GpuSwap(packed, fetch.endianness);
++    uint8_t components[4]; std::memcpy(components, &packed, 4);
++    for (uint32_t channel = 0; channel < 4; ++channel) {
++      uint32_t swizzle = (fetch.swizzle >> (channel * 3)) & 7;
++      if (swizzle > 5) return fail("Reserved texture swizzle");
++      pixels[(size_t(y) * width + x) * 4 + channel] = swizzle < 4 ? components[swizzle]
++          : (swizzle == 4 ? 0 : (signed_view ? 127 : 255));
++    }
++  }
++  auto descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
++  descriptor->setTextureType(MTL::TextureType2DArray); descriptor->setArrayLength(1);
++  descriptor->setPixelFormat(signed_view ? MTL::PixelFormatRGBA8Snorm : MTL::PixelFormatRGBA8Unorm);
++  descriptor->setWidth(width); descriptor->setHeight(height);
++  descriptor->setUsage(MTL::TextureUsageShaderRead); descriptor->setStorageMode(MTL::StorageModeShared);
++  auto texture = NS::TransferPtr(device_->newTexture(descriptor.get()));
++  if (!texture) return fail("Metal texture allocation failed");
++  texture->replaceRegion(MTL::Region(0, 0, 0, width, height, 1), 0, 0, pixels.data(), width * 4, pixels.size());
++  if (textures_.size() >= 64 || cached_bytes_ + pixels.size() > 256 * 1024 * 1024) Clear();
++  cached_bytes_ += pixels.size();
++  textures_.emplace(key, texture);
++  return texture;
++}
++NS::SharedPtr<MTL::SamplerState> MetalTextureCache::Sampler(
++    const xenos::xe_gpu_texture_fetch_t& fetch, const DxbcShader::SamplerBinding& binding,
++    std::string& error) {
++  auto mag = binding.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter : binding.mag_filter;
++  auto min = binding.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter : binding.min_filter;
++  auto aniso = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst ? fetch.aniso_filter : binding.aniso_filter;
++  if (mag > xenos::TextureFilter::kLinear || min > xenos::TextureFilter::kLinear ||
++      aniso > xenos::AnisoFilter::kMax_1_1 || uint32_t(fetch.clamp_x) > 2 || uint32_t(fetch.clamp_y) > 2) {
++    error = "Unsupported sampler filtering/addressing"; return {};
++  }
++  auto descriptor = NS::TransferPtr(MTL::SamplerDescriptor::alloc()->init());
++  descriptor->setSupportArgumentBuffers(true); descriptor->setNormalizedCoordinates(true);
++  descriptor->setMagFilter(mag == xenos::TextureFilter::kLinear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest);
++  descriptor->setMinFilter(min == xenos::TextureFilter::kLinear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest);
++  descriptor->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
++  const MTL::SamplerAddressMode modes[] = {MTL::SamplerAddressModeRepeat, MTL::SamplerAddressModeMirrorRepeat, MTL::SamplerAddressModeClampToEdge};
++  descriptor->setSAddressMode(modes[uint32_t(fetch.clamp_x)]); descriptor->setTAddressMode(modes[uint32_t(fetch.clamp_y)]);
++  auto sampler = NS::TransferPtr(device_->newSamplerState(descriptor.get()));
++  if (!sampler) error = "Metal sampler allocation failed";
++  return sampler;
++}
++}  // namespace rex::graphics::metal

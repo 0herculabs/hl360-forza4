@@ -1,0 +1,18 @@
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -156,8 +156,13 @@
+     }
+ 
+     XCONTENT_AGGREGATE_DATA content_data;
+-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
+-                                         content_type, content_data))) {
++    // fm3-recomp: compare with X_ERROR_SUCCESS. XSUCCEEDED() only tests the
++    // HRESULT failure bit, so X_ERROR_FILE_NOT_FOUND (2) for a package without
++    // a .header counted as success and appended an unfilled entry (zeros, or
++    // the previous package's data): FM3 then mounted the last package with a
++    // header over and over instead of Project Forza Plus 3's DLC.
++    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
++                              content_data) == X_ERROR_SUCCESS) {
+       result.emplace_back(std::move(content_data));
+     } else {
+       content_data.device_id = device_id;

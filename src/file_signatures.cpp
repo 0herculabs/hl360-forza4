@@ -1,8 +1,9 @@
-﻿// FM4 USA Rev 1: protected-file table at 0x82EA0000, 66 entries.
+// FM4 USA Rev 1: protected-file table at 0x82EA0000, 66 entries.
 // Rebuild only for a separate Project Forza Plus installation.
 // Big-endian block size/count, offset/size index, NUL names and SHA-256 per 32 KiB.
 #include "file_signatures.h"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,6 +12,9 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#elif defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#endif
 
 #include <cstring>
 #include <algorithm>
@@ -41,8 +45,14 @@ void StoreBe32(uint8_t* p, uint32_t v) {
 }
 
 bool Sha256(const uint8_t* data, size_t size, uint8_t out[kHashSize]) {
+#if defined(_WIN32)
   return BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, const_cast<uint8_t*>(data),
                                    ULONG(size), out, kHashSize));
+#elif defined(__APPLE__)
+  return CC_SHA256(data, static_cast<CC_LONG>(size), out) != nullptr;
+#else
+#error FM4 protected file hashing requires Windows or macOS
+#endif
 }
 
 struct Entry {

@@ -1,0 +1,1383 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..1bb06d5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -31,6 +31,8 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
+     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+ endif()
+ 
++option(REXGLUE_BUILD_METAL_SHADER_TOOLS "Build experimental native Metal shader conversion tools (macOS only)" OFF)
++
+ # Graphics backend selection
+ # D3D12: Windows only, ON by default.
+ # Vulkan: Cross-platform, ON by default on Linux, OFF by default on Windows.
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..2102fd1 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -54,14 +54,14 @@ set(REXGPU_XENOS_VULKAN_SOURCES
+     vulkan/texture_cache.cpp
+ )
+ 
+-# D3D12 backend
+-if(REXGLUE_USE_D3D12)
++# Portable DXBC translation shared by D3D12 and native Metal.
++if(REXGLUE_USE_D3D12 OR REXGLUE_BUILD_METAL_SHADER_TOOLS)
+     # DXBC third-party dependency
+     set(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES
+         ${REXGLUE_ROOT}/thirdparty/dxbc/DXBCChecksum.cpp
+     )
+ 
+-    # DXBC shader translation (required for D3D12)
++    # DXBC shader translation (no Direct3D API dependency)
+     set(REXGPU_XENOS_DXBC_SOURCES
+         pipeline/shader/dxbc.cpp
+         pipeline/shader/dxbc_translator.cpp
+@@ -71,6 +71,10 @@ if(REXGLUE_USE_D3D12)
+         pipeline/shader/dxbc_translator_om.cpp
+     )
+ 
++endif()
++
++# D3D12 backend
++if(REXGLUE_USE_D3D12)
+     # D3D12 GPU backend
+     set(REXGPU_XENOS_D3D12_SOURCES
+         d3d12/graphics_system.cpp
+@@ -158,3 +162,8 @@ if(REXGLUE_USE_D3D12)
+         dxguid
+     )
+ endif()
++
++# Isolated first stage of the native Metal port; does not register a backend.
++if(REXGLUE_BUILD_METAL_SHADER_TOOLS)
++    add_subdirectory(metal)
++endif()
+diff --git a/include/rex/graphics/metal/dxbc_to_dxil_converter.h b/include/rex/graphics/metal/dxbc_to_dxil_converter.h
+new file mode 100644
+index 0000000..0b516d2
+--- /dev/null
++++ b/include/rex/graphics/metal/dxbc_to_dxil_converter.h
+@@ -0,0 +1,61 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++/**
++ * DXBC to DXIL converter wrapper for Metal backend.
++ *
++ * Converts DXBC to DXIL using the in-process dxilconv library (no CLI spawn).
++ */
++
++#ifndef DXBC_TO_DXIL_CONVERTER_H_
++#define DXBC_TO_DXIL_CONVERTER_H_
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++struct IDxbcConverter;
++
++namespace rex::graphics::metal {
++
++class DxbcToDxilConverter {
++ public:
++  DxbcToDxilConverter();
++  ~DxbcToDxilConverter();
++
++  // Initialize the converter (ensure dxilconv is available).
++  bool Initialize();
++
++  // Convert DXBC bytecode to DXIL bytecode
++  // Returns true on success, false on failure
++  bool Convert(const std::vector<uint8_t>& dxbc_data,
++               std::vector<uint8_t>& dxil_data_out,
++               std::string* error_message = nullptr);
++
++  // Check if the converter is available
++  bool IsAvailable() const { return is_available_; }
++
++  // Get the dxilconv library path (if resolved).
++  const std::string& GetDxbc2DxilPath() const { return dxilconv_path_; }
++
++ private:
++  bool is_available_ = false;
++  std::string dxilconv_path_;
++  std::wstring extra_options_;
++
++  // Lazily created per-thread converter instance.
++  IDxbcConverter* GetThreadConverter(std::string* error_message);
++
++  // Write vector to file (for debug dumps).
++  bool WriteFile(const std::string& path, const std::vector<uint8_t>& data);
++};
++
++}  // namespace rex::graphics::metal
++
++#endif  // DXBC_TO_DXIL_CONVERTER_H_
+diff --git a/include/rex/graphics/metal/metal_shader_converter.h b/include/rex/graphics/metal/metal_shader_converter.h
+new file mode 100644
+index 0000000..3afc15a
+--- /dev/null
++++ b/include/rex/graphics/metal/metal_shader_converter.h
+@@ -0,0 +1,134 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_GPU_METAL_METAL_SHADER_CONVERTER_H_
++#define XENIA_GPU_METAL_METAL_SHADER_CONVERTER_H_
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++struct IRVersionedInputLayoutDescriptor;
++
++#include <rex/graphics/xenos.h>
++
++namespace rex::graphics::metal {
++
++// Shader stage for Metal conversion
++enum class MetalShaderStage {
++  kVertex,
++  kFragment,
++  kGeometry,
++  kCompute,
++  kHull,
++  kDomain
++};
++
++// Result of shader conversion
++struct MetalShaderConversionResult {
++  bool success = false;
++  std::vector<uint8_t> metallib_data;
++  std::string error_message;
++  std::string function_name;  // Main function name in the metallib
++  bool has_mesh_stage = false;
++  bool has_geometry_stage = false;
++};
++
++struct MetalShaderReflectionInput {
++  std::string name;
++  uint8_t attribute_index = 0;
++};
++
++struct MetalShaderFunctionConstant {
++  std::string name;
++  uint32_t type = 0;
++};
++
++struct MetalShaderReflectionInfo {
++  uint32_t vertex_output_size_in_bytes = 0;
++  uint32_t vertex_input_count = 0;
++  std::vector<MetalShaderReflectionInput> vertex_inputs;
++  uint32_t gs_max_input_primitives_per_mesh_threadgroup = 0;
++  std::vector<MetalShaderFunctionConstant> function_constants;
++  bool has_hull_info = false;
++  uint32_t hs_max_patches_per_object_threadgroup = 0;
++  uint32_t hs_max_object_threads_per_patch = 0;
++  uint32_t hs_patch_constants_size = 0;
++  uint32_t hs_input_control_point_count = 0;
++  uint32_t hs_output_control_point_count = 0;
++  uint32_t hs_output_control_point_size = 0;
++  uint32_t hs_tessellator_domain = 0;
++  uint32_t hs_tessellator_partitioning = 0;
++  uint32_t hs_tessellator_output_primitive = 0;
++  bool hs_tessellation_type_half = false;
++  float hs_max_tessellation_factor = 0.0f;
++  bool has_domain_info = false;
++  uint32_t ds_max_input_prims_per_mesh_threadgroup = 0;
++  uint32_t ds_input_control_point_count = 0;
++  uint32_t ds_input_control_point_size = 0;
++  uint32_t ds_patch_constants_size = 0;
++  uint32_t ds_tessellator_domain = 0;
++  bool ds_tessellation_type_half = false;
++};
++
++// Converts DXIL shaders to Metal IR using Apple's Metal Shader Converter
++// Uses the correct Xbox 360 root signatures from xbox360_rootsig_helper.h
++class MetalShaderConverter {
++ public:
++  MetalShaderConverter();
++  ~MetalShaderConverter();
++
++  // Initialize the converter (loads MSC library)
++  bool Initialize();
++
++  // Check if the converter is available
++  bool IsAvailable() const { return is_available_; }
++
++  // Convert DXIL to Metal IR
++  // shader_type: Xenia shader type (vertex or pixel)
++  // dxil_data: DXIL bytecode from dxbc2dxil
++  // result: Output conversion result with metallib data
++  bool Convert(xenos::ShaderType shader_type,
++               const std::vector<uint8_t>& dxil_data,
++               MetalShaderConversionResult& result);
++
++  // Convert with explicit stage specification
++  bool ConvertWithStage(MetalShaderStage stage,
++                        const std::vector<uint8_t>& dxil_data,
++                        MetalShaderConversionResult& result);
++
++  bool ConvertWithStageEx(MetalShaderStage stage,
++                          const std::vector<uint8_t>& dxil_data,
++                          MetalShaderConversionResult& result,
++                          MetalShaderReflectionInfo* reflection,
++                          const IRVersionedInputLayoutDescriptor* input_layout,
++                          std::vector<uint8_t>* stage_in_metallib,
++                          bool enable_geometry_emulation, int input_topology);
++
++  void SetMinimumTarget(uint32_t gpu_family, uint32_t os,
++                        const std::string& version);
++
++ private:
++  bool is_available_ = false;
++  bool has_minimum_target_ = false;
++  uint32_t minimum_gpu_family_ = 0;
++  uint32_t minimum_os_ = 0;
++  std::string minimum_os_version_;
++
++  // Create Xbox 360 root signature for the given shader visibility
++  void* CreateXbox360RootSignature(MetalShaderStage stage,
++                                   bool force_all_visibility);
++
++  // Destroy a root signature
++  void DestroyRootSignature(void* root_sig);
++};
++
++}  // namespace rex::graphics::metal
++
++#endif  // XENIA_GPU_METAL_METAL_SHADER_CONVERTER_H_
+diff --git a/src/graphics/metal/CMakeLists.txt b/src/graphics/metal/CMakeLists.txt
+new file mode 100644
+index 0000000..4e38f24
+--- /dev/null
++++ b/src/graphics/metal/CMakeLists.txt
+@@ -0,0 +1,35 @@
++# Experimental conversion boundary. Vulkan remains the selectable macOS backend.
++if(NOT APPLE)
++    message(FATAL_ERROR "Native Metal shader tools require macOS")
++endif()
++set(REXGLUE_METAL_DEPS_ROOT "" CACHE PATH "Staged DXC and Metal Shader Converter headers/libraries")
++foreach(required dxc/include/DxbcConverter.h msc/include/metal_irconverter.h
++                 lib/libdxilconv.dylib lib/libLLVMDxcSupport.a lib/libmetalirconverter.dylib)
++    if(NOT EXISTS "${REXGLUE_METAL_DEPS_ROOT}/${required}")
++        message(FATAL_ERROR "Missing Metal dependency: ${REXGLUE_METAL_DEPS_ROOT}/${required}")
++    endif()
++endforeach()
++add_library(rexmetal-shader STATIC
++    dxbc_to_dxil_converter.cpp metal_shader_converter.cpp
++    ../flags.cpp ../registers.cpp ../util/draw.cpp ../pipeline/shader/shader.cpp ../format/ucode.cpp
++    ../pipeline/shader/translator.cpp ../pipeline/shader/translator_disasm.cpp)
++foreach(source IN LISTS REXGPU_XENOS_DXBC_SOURCES)
++    target_sources(rexmetal-shader PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../${source}")
++endforeach()
++target_sources(rexmetal-shader PRIVATE ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES})
++target_include_directories(rexmetal-shader PRIVATE
++    "${REXGLUE_ROOT}"
++    "${REXGLUE_METAL_DEPS_ROOT}/dxc/include"
++    "${REXGLUE_METAL_DEPS_ROOT}/msc/include")
++# DXC's COM declarations require Clang's Microsoft extensions, not Windows APIs.
++set_source_files_properties(dxbc_to_dxil_converter.cpp PROPERTIES
++    COMPILE_OPTIONS "-fms-extensions")
++target_link_libraries(rexmetal-shader PUBLIC rexruntime PRIVATE
++    xxHash::xxhash
++    "${REXGLUE_METAL_DEPS_ROOT}/lib/libdxilconv.dylib"
++    "${REXGLUE_METAL_DEPS_ROOT}/lib/libLLVMDxcSupport.a"
++    "${REXGLUE_METAL_DEPS_ROOT}/lib/libmetalirconverter.dylib")
++add_executable(rex-metal-shader-check shader_check.cpp library_check.mm)
++set_source_files_properties(library_check.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++target_link_libraries(rex-metal-shader-check PRIVATE "-framework Metal" "-framework Foundation")
++target_link_libraries(rex-metal-shader-check PRIVATE rexmetal-shader xxHash::xxhash)
+diff --git a/src/graphics/metal/dxbc_to_dxil_converter.cpp b/src/graphics/metal/dxbc_to_dxil_converter.cpp
+new file mode 100644
+index 0000000..18c6322
+--- /dev/null
++++ b/src/graphics/metal/dxbc_to_dxil_converter.cpp
+@@ -0,0 +1,229 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2025 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++/**
++ * DXBC to DXIL converter implementation
++ * Uses the in-process dxilconv library on macOS.
++ */
++
++#include <rex/graphics/metal/dxbc_to_dxil_converter.h>
++
++#include <unistd.h>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <string>
++
++#include "DxbcConverter.h"
++#include <rex/logging.h>
++
++namespace rex::graphics::metal {
++
++namespace {
++constexpr wchar_t kDefaultExtraOptions[] = L"-skip-container-parts";
++
++const CLSID kClsidDxbcConverter = {
++    0x4900391e,
++    0xb752,
++    0x4edd,
++    {0xa8, 0x85, 0x6f, 0xb7, 0x6e, 0x25, 0xad, 0xdb}};
++std::wstring WidenAscii(const std::string& value) {
++  std::wstring out;
++  out.reserve(value.size());
++  for (char c : value) {
++    out.push_back(static_cast<wchar_t>(c));
++  }
++  return out;
++}
++
++std::string HResultHex(HRESULT hr) {
++  char buffer[11];
++  std::snprintf(buffer, sizeof(buffer), "%08X", static_cast<unsigned>(hr));
++  return std::string(buffer);
++}
++
++struct ThreadConverter {
++  IDxbcConverter* converter = nullptr;
++  ~ThreadConverter() {
++    if (converter) {
++      converter->Release();
++    }
++  }
++};
++}  // namespace
++
++DxbcToDxilConverter::DxbcToDxilConverter() = default;
++
++DxbcToDxilConverter::~DxbcToDxilConverter() = default;
++
++bool DxbcToDxilConverter::Initialize() {
++  const char* extra_options = std::getenv("REX_METAL_DXBC2DXIL_FLAGS");
++  if (extra_options) {
++    extra_options_ = WidenAscii(extra_options);
++  } else {
++    extra_options_ = kDefaultExtraOptions;
++  }
++
++  IDxbcConverter* test_converter = nullptr;
++  HRESULT hr = DxcCreateInstance(kClsidDxbcConverter, __uuidof(IDxbcConverter),
++                                 reinterpret_cast<void**>(&test_converter));
++  if (hr != S_OK || !test_converter) {
++    REXLOG_ERROR("DxbcToDxilConverter: Failed to create IDxbcConverter (hr=0x{:08X})",
++           static_cast<unsigned>(hr));
++    is_available_ = false;
++    return false;
++  }
++  test_converter->Release();
++
++  dxilconv_path_ = "linked";
++  is_available_ = true;
++  if (extra_options && *extra_options) {
++    REXLOG_INFO("DxbcToDxilConverter: Using extra options: {}", extra_options);
++  } else if (extra_options && !*extra_options) {
++    REXLOG_INFO("DxbcToDxilConverter: Extra options disabled via env");
++  } else {
++    REXLOG_INFO(
++        "DxbcToDxilConverter: Using default extra options: "
++        "-skip-container-parts");
++  }
++  return true;
++}
++
++bool DxbcToDxilConverter::Convert(const std::vector<uint8_t>& dxbc_data,
++                                  std::vector<uint8_t>& dxil_data_out,
++                                  std::string* error_message) {
++  if (!is_available_) {
++    if (error_message) {
++      *error_message =
++          "DxbcToDxilConverter not initialized or dxilconv unavailable";
++    }
++    return false;
++  }
++
++  // Validate DXBC header
++  if (dxbc_data.size() < 4 || dxbc_data[0] != 'D' || dxbc_data[1] != 'X' ||
++      dxbc_data[2] != 'B' || dxbc_data[3] != 'C') {
++    if (error_message) {
++      *error_message = "Invalid DXBC data - missing DXBC magic header";
++    }
++    return false;
++  }
++
++  // Check for debug output directories from environment
++  const char* dxbc_dir = std::getenv("REX_METAL_DXBC_OUTPUT_DIR");
++  const char* dxil_dir = std::getenv("REX_METAL_DXIL_OUTPUT_DIR");
++
++  // Generate unique shader ID based on data hash
++  uint64_t hash = 0;
++  const size_t hash_bytes = std::min(dxbc_data.size(), size_t(64));
++  for (size_t i = 0; i < hash_bytes; ++i) {
++    hash = hash * 31 + dxbc_data[i];
++  }
++  std::string shader_id = std::to_string(hash) + "_" + std::to_string(getpid());
++
++  // Save DXBC to debug directory if requested.
++  if (dxbc_dir) {
++    std::string debug_input =
++        std::string(dxbc_dir) + "/shader_" + shader_id + ".dxbc";
++    WriteFile(debug_input, dxbc_data);
++  }
++
++  IDxbcConverter* converter = GetThreadConverter(error_message);
++  if (!converter) {
++    return false;
++  }
++
++  void* dxil_ptr = nullptr;
++  UINT32 dxil_size = 0;
++  wchar_t* diag = nullptr;
++
++  HRESULT hr = converter->Convert(
++      dxbc_data.data(), static_cast<UINT32>(dxbc_data.size()),
++      extra_options_.empty() ? nullptr : extra_options_.c_str(), &dxil_ptr,
++      &dxil_size, &diag);
++
++  if (hr != S_OK || dxil_ptr == nullptr || dxil_size == 0) {
++    if (error_message) {
++      if (diag) {
++        std::string diag_utf8;
++        for (const wchar_t* p = diag; *p; ++p) {
++          diag_utf8.push_back(static_cast<char>(*p));
++        }
++        *error_message = "dxbc2dxil failed: " + diag_utf8;
++      } else {
++        *error_message = "dxbc2dxil failed with HRESULT 0x" + HResultHex(hr);
++      }
++    }
++    CoTaskMemFree(diag);
++    CoTaskMemFree(dxil_ptr);
++    return false;
++  }
++
++  dxil_data_out.assign(reinterpret_cast<const uint8_t*>(dxil_ptr),
++                       reinterpret_cast<const uint8_t*>(dxil_ptr) + dxil_size);
++
++  CoTaskMemFree(diag);
++  CoTaskMemFree(dxil_ptr);
++
++  // Copy to debug directory if specified.
++  if (dxil_dir) {
++    std::string debug_output =
++        std::string(dxil_dir) + "/shader_" + shader_id + ".dxil";
++    WriteFile(debug_output, dxil_data_out);
++  }
++
++  // Validate DXIL header (DXBC magic for container, or DXIL for raw).
++  if (dxil_data_out.size() < 4) {
++    if (error_message) {
++      *error_message = "Output DXIL blob too small";
++    }
++    return false;
++  }
++
++  REXLOG_DEBUG(
++      "DxbcToDxilConverter: Successfully converted {} bytes DXBC to {} bytes "
++      "DXIL",
++      dxbc_data.size(), dxil_data_out.size());
++
++  return true;
++}
++
++IDxbcConverter* DxbcToDxilConverter::GetThreadConverter(
++    std::string* error_message) {
++  static thread_local ThreadConverter thread_state;
++  if (thread_state.converter) {
++    return thread_state.converter;
++  }
++
++  HRESULT hr =
++      DxcCreateInstance(kClsidDxbcConverter, __uuidof(IDxbcConverter),
++                        reinterpret_cast<void**>(&thread_state.converter));
++  if (hr != S_OK || !thread_state.converter) {
++    if (error_message) {
++      *error_message =
++          "Failed to create IDxbcConverter (HRESULT 0x" + HResultHex(hr) + ")";
++    }
++    return nullptr;
++  }
++  return thread_state.converter;
++}
++
++bool DxbcToDxilConverter::WriteFile(const std::string& path,
++                                    const std::vector<uint8_t>& data) {
++  std::ofstream file(path, std::ios::binary);
++  if (!file) {
++    return false;
++  }
++
++  file.write(reinterpret_cast<const char*>(data.data()), data.size());
++  return file.good();
++}
++
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/library_check.mm b/src/graphics/metal/library_check.mm
+new file mode 100644
+index 0000000..aee786c
+--- /dev/null
++++ b/src/graphics/metal/library_check.mm
+@@ -0,0 +1,44 @@
++// Verify generated libraries through the native Metal API without a window.
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <string>
++#include <vector>
++
++static id<MTLDevice> GetCheckDevice() {
++  static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++  return device;
++}
++
++std::string MetalCheckDeviceName() {
++  @autoreleasepool {
++    id<MTLDevice> device = GetCheckDevice();
++    return device ? device.name.UTF8String : "";
++  }
++}
++
++bool CheckMetalLibrary(const std::vector<uint8_t>& bytes,
++                       const std::string& entry_point, std::string& error) {
++  @autoreleasepool {
++    id<MTLDevice> device = GetCheckDevice();
++    if (!device) {
++      error = "No Metal device available";
++      return false;
++    }
++    dispatch_data_t data = dispatch_data_create(bytes.data(), bytes.size(),
++        nullptr, ^{});
++    NSError* ns_error = nil;
++    id<MTLLibrary> library = [device newLibraryWithData:data error:&ns_error];
++    if (!library) {
++      error = ns_error ? ns_error.localizedDescription.UTF8String
++                       : "Metal failed to load library";
++      return false;
++    }
++    NSString* name = [NSString stringWithUTF8String:entry_point.c_str()];
++    id<MTLFunction> function = [library newFunctionWithName:name];
++    if (!function) {
++      error = "Metal entry point unavailable: " + entry_point;
++      return false;
++    }
++    return true;
++  }
++}
+diff --git a/src/graphics/metal/metal_shader_converter.cpp b/src/graphics/metal/metal_shader_converter.cpp
+new file mode 100644
+index 0000000..29a7782
+--- /dev/null
++++ b/src/graphics/metal/metal_shader_converter.cpp
+@@ -0,0 +1,675 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include <rex/graphics/metal/metal_shader_converter.h>
++
++#include "metal_irconverter.h"
++
++#include <rex/logging.h>
++
++namespace rex::graphics::metal {
++
++constexpr uint32_t kFunctionConstantRegisterSpace = 2147420894u;
++
++MetalShaderConverter::MetalShaderConverter() = default;
++
++MetalShaderConverter::~MetalShaderConverter() = default;
++
++void MetalShaderConverter::SetMinimumTarget(uint32_t gpu_family, uint32_t os,
++                                            const std::string& version) {
++  has_minimum_target_ = true;
++  minimum_gpu_family_ = gpu_family;
++  minimum_os_ = os;
++  minimum_os_version_ = version;
++}
++
++bool MetalShaderConverter::Initialize() {
++  // Metal Shader Converter is a library that should be available
++  // at /usr/local/lib/libmetalirconverter.dylib
++  // The headers are at /usr/local/include/metal_irconverter/
++  // or in third_party/metal-shader-converter/include/
++
++  // Test if we can create basic MSC objects
++  IRCompiler* test_compiler = IRCompilerCreate();
++  if (!test_compiler) {
++    REXLOG_ERROR(
++        "MetalShaderConverter: Failed to create IR compiler - MSC not "
++        "available");
++    is_available_ = false;
++    return false;
++  }
++  IRCompilerDestroy(test_compiler);
++
++  REXLOG_INFO("MetalShaderConverter: Initialized successfully");
++  is_available_ = true;
++  return true;
++}
++
++// Create Xbox 360 root signature matching xbox360_rootsig_helper.h
++void* MetalShaderConverter::CreateXbox360RootSignature(
++    MetalShaderStage stage, bool force_all_visibility) {
++  auto stage_name = [](MetalShaderStage value) -> const char* {
++    switch (value) {
++      case MetalShaderStage::kVertex:
++        return "vertex";
++      case MetalShaderStage::kFragment:
++        return "fragment";
++      case MetalShaderStage::kGeometry:
++        return "geometry";
++      case MetalShaderStage::kCompute:
++        return "compute";
++      case MetalShaderStage::kHull:
++        return "hull";
++      case MetalShaderStage::kDomain:
++        return "domain";
++      default:
++        return "unknown";
++    }
++  };
++  IRShaderVisibility visibility = IRShaderVisibilityAll;
++  if (!force_all_visibility) {
++    switch (stage) {
++      case MetalShaderStage::kVertex:
++        visibility = IRShaderVisibilityVertex;
++        break;
++      case MetalShaderStage::kFragment:
++        visibility = IRShaderVisibilityPixel;
++        break;
++      case MetalShaderStage::kHull:
++        visibility = IRShaderVisibilityHull;
++        break;
++      case MetalShaderStage::kDomain:
++        visibility = IRShaderVisibilityDomain;
++        break;
++      case MetalShaderStage::kCompute:
++      case MetalShaderStage::kGeometry:
++      default:
++        visibility = IRShaderVisibilityAll;
++        break;
++    }
++  }
++
++  // Create descriptor ranges for Xbox 360 shader resources
++  // This matches the layout in xbox360_rootsig_helper.h
++  IRDescriptorRange1 ranges[20] = {};
++  int rangeIdx = 0;
++
++  // SRVs in spaces 0-3
++  // Use 1025 descriptors (1024 + 1 padding) to match heap allocation
++  for (int space = 0; space < 4; space++) {
++    ranges[rangeIdx].RangeType = IRDescriptorRangeTypeSRV;
++    ranges[rangeIdx].NumDescriptors =
++        1025;  // Match kResourceHeapSlots (1024 + 1)
++    ranges[rangeIdx].BaseShaderRegister = 0;
++    ranges[rangeIdx].RegisterSpace = space;
++    ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
++    ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
++    rangeIdx++;
++  }
++
++  // SRV in space 10 for hull shaders
++  ranges[rangeIdx].RangeType = IRDescriptorRangeTypeSRV;
++  ranges[rangeIdx].NumDescriptors =
++      1025;  // Match kResourceHeapSlots (1024 + 1)
++  ranges[rangeIdx].BaseShaderRegister = 0;
++  ranges[rangeIdx].RegisterSpace = 10;
++  ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
++  ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
++  rangeIdx++;
++
++  // UAVs in spaces 0-3
++  // Use 1025 descriptors (1024 + 1 padding) to match heap allocation
++  for (int space = 0; space < 4; space++) {
++    ranges[rangeIdx].RangeType = IRDescriptorRangeTypeUAV;
++    ranges[rangeIdx].NumDescriptors =
++        1025;  // Match kResourceHeapSlots (1024 + 1)
++    ranges[rangeIdx].BaseShaderRegister = 0;
++    ranges[rangeIdx].RegisterSpace = space;
++    ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
++    ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
++    rangeIdx++;
++  }
++
++  // Samplers in space 0
++  // Use 257 descriptors (256 + 1 padding) to match heap allocation
++  ranges[rangeIdx].RangeType = IRDescriptorRangeTypeSampler;
++  ranges[rangeIdx].NumDescriptors = 257;  // Match kSamplerHeapSlots (256 + 1)
++  ranges[rangeIdx].BaseShaderRegister = 0;
++  ranges[rangeIdx].RegisterSpace = 0;
++  ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
++  ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
++  rangeIdx++;
++
++  // CBVs in spaces 0-3
++  // Xenia uses 5 CBVs (b0-b4) in space 0:
++  //   b0 = system constants
++  //   b1 = float constants
++  //   b2 = bool/loop constants
++  //   b3 = fetch constants
++  //   b4 = descriptor indices (bindless)
++  // We limit to 5 descriptors to match our heap allocation
++  for (int space = 0; space < 4; space++) {
++    ranges[rangeIdx].RangeType = IRDescriptorRangeTypeCBV;
++    ranges[rangeIdx].NumDescriptors =
++        (space == 0) ? 5 : 1;  // Only space 0 has multiple CBVs
++    ranges[rangeIdx].BaseShaderRegister = 0;
++    ranges[rangeIdx].RegisterSpace = space;
++    ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
++    ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
++    rangeIdx++;
++  }
++
++  // Function-constant CBV space for MSC.
++  ranges[rangeIdx].RangeType = IRDescriptorRangeTypeCBV;
++  ranges[rangeIdx].NumDescriptors = 1;
++  ranges[rangeIdx].BaseShaderRegister = 0;
++  ranges[rangeIdx].RegisterSpace = kFunctionConstantRegisterSpace;
++  ranges[rangeIdx].Flags = IRDescriptorRangeFlagNone;
++  ranges[rangeIdx].OffsetInDescriptorsFromTableStart = 0;
++  rangeIdx++;
++
++  // Create descriptor tables and parameters
++  IRRootDescriptorTable1 tables[20] = {};
++  IRRootParameter1 params[20] = {};
++
++  for (int i = 0; i < rangeIdx; i++) {
++    tables[i].NumDescriptorRanges = 1;
++    tables[i].pDescriptorRanges = &ranges[i];
++    params[i].ParameterType = IRRootParameterTypeDescriptorTable;
++    params[i].DescriptorTable = tables[i];
++    params[i].ShaderVisibility = visibility;
++  }
++
++  // Create root signature descriptor
++  IRRootSignatureDescriptor1 desc = {};
++  desc.NumParameters = rangeIdx;
++  desc.pParameters = params;
++  desc.NumStaticSamplers = 0;
++  desc.pStaticSamplers = nullptr;
++  desc.Flags = IRRootSignatureFlagNone;
++
++  IRVersionedRootSignatureDescriptor versionedDesc = {};
++  versionedDesc.version = IRRootSignatureVersion_1_1;
++  versionedDesc.desc_1_1 = desc;
++
++  static bool logged_root_sig = false;
++  if (!logged_root_sig) {
++    logged_root_sig = true;
++    const char* json =
++        IRVersionedRootSignatureDescriptorCopyJSONString(&versionedDesc);
++    if (json) {
++      REXLOG_INFO(
++          "MetalShaderConverter: root signature (stage={}, visibility={}, "
++          "force_all_visibility={}): {}",
++          stage_name(stage), static_cast<int>(visibility), force_all_visibility,
++          json);
++      IRVersionedRootSignatureDescriptorReleaseString(json);
++    }
++  }
++
++  // Create the root signature
++  IRError* error = nullptr;
++  IRRootSignature* rootSig =
++      IRRootSignatureCreateFromDescriptor(&versionedDesc, &error);
++
++  if (error) {
++    const char* errMsg = (const char*)IRErrorGetPayload(error);
++    REXLOG_ERROR("MetalShaderConverter: Failed to create root signature: {}",
++           errMsg ? errMsg : "unknown error");
++    IRErrorDestroy(error);
++    return nullptr;
++  }
++
++  return rootSig;
++}
++
++void MetalShaderConverter::DestroyRootSignature(void* root_sig) {
++  if (root_sig) {
++    IRRootSignatureDestroy(static_cast<IRRootSignature*>(root_sig));
++  }
++}
++
++bool MetalShaderConverter::Convert(xenos::ShaderType shader_type,
++                                   const std::vector<uint8_t>& dxil_data,
++                                   MetalShaderConversionResult& result) {
++  MetalShaderStage stage;
++  switch (shader_type) {
++    case xenos::ShaderType::kVertex:
++      stage = MetalShaderStage::kVertex;
++      break;
++    case xenos::ShaderType::kPixel:
++      stage = MetalShaderStage::kFragment;
++      break;
++    default:
++      result.success = false;
++      result.error_message = "Unsupported shader type";
++      return false;
++  }
++
++  return ConvertWithStage(stage, dxil_data, result);
++}
++
++bool MetalShaderConverter::ConvertWithStage(
++    MetalShaderStage stage, const std::vector<uint8_t>& dxil_data,
++    MetalShaderConversionResult& result) {
++  return ConvertWithStageEx(stage, dxil_data, result, nullptr, nullptr, nullptr,
++                            false, IRInputTopologyUndefined);
++}
++
++bool MetalShaderConverter::ConvertWithStageEx(
++    MetalShaderStage stage, const std::vector<uint8_t>& dxil_data,
++    MetalShaderConversionResult& result, MetalShaderReflectionInfo* reflection,
++    const IRVersionedInputLayoutDescriptor* input_layout,
++    std::vector<uint8_t>* stage_in_metallib, bool enable_geometry_emulation,
++    int input_topology) {
++  if (!is_available_) {
++    result.success = false;
++    result.error_message = "MetalShaderConverter not initialized";
++    return false;
++  }
++
++  if (dxil_data.empty()) {
++    result.success = false;
++    result.error_message = "Empty DXIL data";
++    return false;
++  }
++
++  // Create DXIL object from input data
++  IRObject* dxilObject = IRObjectCreateFromDXIL(
++      dxil_data.data(), dxil_data.size(), IRBytecodeOwnershipNone);
++
++  if (!dxilObject) {
++    result.success = false;
++    result.error_message = "Failed to create DXIL object";
++    return false;
++  }
++
++  // Create compiler
++  IRCompiler* compiler = IRCompilerCreate();
++  if (!compiler) {
++    IRObjectDestroy(dxilObject);
++    result.success = false;
++    result.error_message = "Failed to create IR compiler";
++    return false;
++  }
++
++  // Set compatibility flag to force texture array types
++  // This is required because:
++  // 1. Xenia's DXBC translator generates code expecting texture2d_array
++  // 2. MSC 3.0+ defaults to non-array texture types
++  // 3. Our Metal textures are created as MTLTextureType2DArray
++  IRCompilerSetCompatibilityFlags(
++      compiler,
++      static_cast<IRCompatibilityFlags>(IRCompatibilityFlagForceTextureArray |
++                                        IRCompatibilityFlagBoundsCheck));
++
++  if (input_topology != IRInputTopologyUndefined) {
++    IRCompilerSetInputTopology(compiler,
++                               static_cast<IRInputTopology>(input_topology));
++  }
++  if (enable_geometry_emulation) {
++    IRCompilerEnableGeometryAndTessellationEmulation(compiler, true);
++  }
++  // Ignore embedded root signatures in DXIL; we provide our own.
++  IRCompilerIgnoreRootSignature(compiler, true);
++  // Enable function-constant register space for MSC specialization.
++  IRCompilerSetFunctionConstantResourceSpace(compiler,
++                                             kFunctionConstantRegisterSpace);
++  if (has_minimum_target_) {
++    IRCompilerSetMinimumGPUFamily(
++        compiler, static_cast<IRGPUFamily>(minimum_gpu_family_));
++    IRCompilerSetMinimumDeploymentTarget(
++        compiler, static_cast<IROperatingSystem>(minimum_os_),
++        minimum_os_version_.c_str());
++  }
++
++  // Create and set Xbox 360 root signature
++  IRRootSignature* rootSig =
++      static_cast<IRRootSignature*>(CreateXbox360RootSignature(stage, true));
++  if (!rootSig) {
++    IRCompilerDestroy(compiler);
++    IRObjectDestroy(dxilObject);
++    result.success = false;
++    result.error_message = "Failed to create root signature";
++    return false;
++  }
++  IRCompilerSetGlobalRootSignature(compiler, rootSig);
++
++  // Compile DXIL to Metal
++  IRError* error = nullptr;
++  IRObject* metalObject =
++      IRCompilerAllocCompileAndLink(compiler, nullptr, dxilObject, &error);
++
++  if (error) {
++    const char* errMsg = (const char*)IRErrorGetPayload(error);
++    result.success = false;
++    result.error_message = std::string("MSC compilation failed: ") +
++                           (errMsg ? errMsg : "unknown error");
++    REXLOG_ERROR("MetalShaderConverter: {}", result.error_message);
++    IRErrorDestroy(error);
++    IRRootSignatureDestroy(rootSig);
++    IRCompilerDestroy(compiler);
++    IRObjectDestroy(dxilObject);
++    return false;
++  }
++
++  if (!metalObject) {
++    result.success = false;
++    result.error_message = "MSC returned null object without error";
++    IRRootSignatureDestroy(rootSig);
++    IRCompilerDestroy(compiler);
++    IRObjectDestroy(dxilObject);
++    return false;
++  }
++
++  auto extract_metallib = [&](IRShaderStage ir_stage,
++                              std::vector<uint8_t>& out_bytes,
++                              size_t* out_size) -> bool {
++    IRMetalLibBinary* metallib = IRMetalLibBinaryCreate();
++    if (!metallib) {
++      if (out_size) {
++        *out_size = 0;
++      }
++      return false;
++    }
++    bool ok = IRObjectGetMetalLibBinary(metalObject, ir_stage, metallib);
++    size_t metallib_size = IRMetalLibGetBytecodeSize(metallib);
++    if (!ok || metallib_size == 0) {
++      IRMetalLibBinaryDestroy(metallib);
++      if (out_size) {
++        *out_size = 0;
++      }
++      return false;
++    }
++    out_bytes.resize(metallib_size);
++    IRMetalLibGetBytecode(metallib, out_bytes.data());
++    IRMetalLibBinaryDestroy(metallib);
++    if (out_size) {
++      *out_size = metallib_size;
++    }
++    return true;
++  };
++
++  IRShaderStage ir_stage = IRShaderStageInvalid;
++  switch (stage) {
++    case MetalShaderStage::kVertex:
++      ir_stage = IRShaderStageVertex;
++      break;
++    case MetalShaderStage::kFragment:
++      ir_stage = IRShaderStageFragment;
++      break;
++    case MetalShaderStage::kCompute:
++      ir_stage = IRShaderStageCompute;
++      break;
++    case MetalShaderStage::kHull:
++      ir_stage = IRShaderStageHull;
++      break;
++    case MetalShaderStage::kDomain:
++      ir_stage = IRShaderStageDomain;
++      break;
++    case MetalShaderStage::kGeometry:
++      // We'll determine mesh/geometry below.
++      break;
++    default:
++      ir_stage = IRShaderStageInvalid;
++      break;
++  }
++
++  result.has_mesh_stage = false;
++  result.has_geometry_stage = false;
++  size_t stage_size = 0;
++  if (stage == MetalShaderStage::kGeometry) {
++    std::vector<uint8_t> mesh_bytes;
++    std::vector<uint8_t> geom_bytes;
++    result.has_mesh_stage =
++        extract_metallib(IRShaderStageMesh, mesh_bytes, nullptr);
++    result.has_geometry_stage =
++        extract_metallib(IRShaderStageGeometry, geom_bytes, nullptr);
++    if (result.has_mesh_stage) {
++      result.metallib_data = std::move(mesh_bytes);
++      ir_stage = IRShaderStageMesh;
++    } else if (result.has_geometry_stage) {
++      result.metallib_data = std::move(geom_bytes);
++      ir_stage = IRShaderStageGeometry;
++    }
++  } else if (ir_stage != IRShaderStageInvalid) {
++    extract_metallib(ir_stage, result.metallib_data, &stage_size);
++  }
++
++  if (result.metallib_data.empty()) {
++    auto stage_name = [](MetalShaderStage value) -> const char* {
++      switch (value) {
++        case MetalShaderStage::kVertex:
++          return "vertex";
++        case MetalShaderStage::kFragment:
++          return "fragment";
++        case MetalShaderStage::kGeometry:
++          return "geometry";
++        case MetalShaderStage::kCompute:
++          return "compute";
++        case MetalShaderStage::kHull:
++          return "hull";
++        case MetalShaderStage::kDomain:
++          return "domain";
++        default:
++          return "unknown";
++      }
++    };
++    result.success = false;
++    result.error_message = "Generated MetalLib has zero size";
++    REXLOG_ERROR(
++        "MetalShaderConverter: empty metallib (stage={}, ir_stage={}, "
++        "geom_emulation={}, input_topology={}, mesh_ok={}, geom_ok={}, "
++        "stage_size={})",
++        stage_name(stage), int(ir_stage), enable_geometry_emulation,
++        input_topology, result.has_mesh_stage, result.has_geometry_stage,
++        stage_size);
++    IRObjectDestroy(metalObject);
++    IRRootSignatureDestroy(rootSig);
++    IRCompilerDestroy(compiler);
++    IRObjectDestroy(dxilObject);
++    return false;
++  }
++
++  if (reflection) {
++    reflection->vertex_inputs.clear();
++    reflection->function_constants.clear();
++    reflection->vertex_output_size_in_bytes = 0;
++    reflection->vertex_input_count = 0;
++    reflection->gs_max_input_primitives_per_mesh_threadgroup = 0;
++    reflection->has_hull_info = false;
++    reflection->hs_max_patches_per_object_threadgroup = 0;
++    reflection->hs_max_object_threads_per_patch = 0;
++    reflection->hs_patch_constants_size = 0;
++    reflection->hs_input_control_point_count = 0;
++    reflection->hs_output_control_point_count = 0;
++    reflection->hs_output_control_point_size = 0;
++    reflection->hs_tessellator_domain = 0;
++    reflection->hs_tessellator_partitioning = 0;
++    reflection->hs_tessellator_output_primitive = 0;
++    reflection->hs_tessellation_type_half = false;
++    reflection->hs_max_tessellation_factor = 0.0f;
++    reflection->has_domain_info = false;
++    reflection->ds_max_input_prims_per_mesh_threadgroup = 0;
++    reflection->ds_input_control_point_count = 0;
++    reflection->ds_input_control_point_size = 0;
++    reflection->ds_patch_constants_size = 0;
++    reflection->ds_tessellator_domain = 0;
++    reflection->ds_tessellation_type_half = false;
++  }
++
++  IRShaderReflection* shader_reflection = IRShaderReflectionCreate();
++  if (shader_reflection && ir_stage != IRShaderStageInvalid) {
++    if (IRObjectGetReflection(metalObject, ir_stage, shader_reflection)) {
++      const char* entry_name =
++          IRShaderReflectionGetEntryPointFunctionName(shader_reflection);
++      if (entry_name) {
++        result.function_name = entry_name;
++      }
++      if (reflection) {
++        if (ir_stage == IRShaderStageVertex) {
++          IRVersionedVSInfo vs_info = {};
++          vs_info.version = IRReflectionVersion_1_0;
++          if (IRShaderReflectionCopyVertexInfo(
++                  shader_reflection, IRReflectionVersion_1_0, &vs_info)) {
++            reflection->vertex_output_size_in_bytes =
++                vs_info.info_1_0.vertex_output_size_in_bytes;
++            reflection->vertex_input_count =
++                static_cast<uint32_t>(vs_info.info_1_0.num_vertex_inputs);
++            reflection->vertex_inputs.reserve(
++                vs_info.info_1_0.num_vertex_inputs);
++            for (size_t i = 0; i < vs_info.info_1_0.num_vertex_inputs; ++i) {
++              const auto& input = vs_info.info_1_0.vertex_inputs[i];
++              MetalShaderReflectionInput out;
++              out.name = input.name ? input.name : "";
++              out.attribute_index = input.attributeIndex;
++              reflection->vertex_inputs.push_back(std::move(out));
++            }
++            IRShaderReflectionReleaseVertexInfo(&vs_info);
++          }
++        } else if (ir_stage == IRShaderStageGeometry ||
++                   ir_stage == IRShaderStageMesh) {
++          IRVersionedGSInfo gs_info = {};
++          gs_info.version = IRReflectionVersion_1_0;
++          if (IRShaderReflectionCopyGeometryInfo(
++                  shader_reflection, IRReflectionVersion_1_0, &gs_info)) {
++            reflection->gs_max_input_primitives_per_mesh_threadgroup =
++                gs_info.info_1_0.max_input_primitives_per_mesh_threadgroup;
++            IRShaderReflectionReleaseGeometryInfo(&gs_info);
++          }
++        }
++
++        if (IRShaderReflectionNeedsFunctionConstants(shader_reflection)) {
++          size_t constant_count =
++              IRShaderReflectionGetFunctionConstantCount(shader_reflection);
++          if (constant_count) {
++            std::vector<IRFunctionConstant> constants(constant_count);
++            IRShaderReflectionCopyFunctionConstants(shader_reflection,
++                                                    constants.data());
++            reflection->function_constants.reserve(constant_count);
++            for (const auto& constant : constants) {
++              MetalShaderFunctionConstant out;
++              out.name = constant.name ? constant.name : "";
++              out.type = static_cast<uint32_t>(constant.type);
++              reflection->function_constants.push_back(std::move(out));
++            }
++            IRShaderReflectionReleaseFunctionConstants(constants.data(),
++                                                       constant_count);
++          }
++        }
++
++        if (ir_stage == IRShaderStageHull) {
++          IRVersionedHSInfo hs_info = {};
++          hs_info.version = IRReflectionVersion_1_0;
++          if (IRShaderReflectionCopyHullInfo(
++                  shader_reflection, IRReflectionVersion_1_0, &hs_info)) {
++            reflection->has_hull_info = true;
++            reflection->hs_max_patches_per_object_threadgroup =
++                hs_info.info_1_0.max_patches_per_object_threadgroup;
++            reflection->hs_max_object_threads_per_patch =
++                hs_info.info_1_0.max_object_threads_per_patch;
++            reflection->hs_patch_constants_size =
++                hs_info.info_1_0.patch_constants_size;
++            reflection->hs_input_control_point_count =
++                hs_info.info_1_0.input_control_point_count;
++            reflection->hs_output_control_point_count =
++                hs_info.info_1_0.output_control_point_count;
++            reflection->hs_output_control_point_size =
++                hs_info.info_1_0.output_control_point_size;
++            reflection->hs_tessellator_domain =
++                static_cast<uint32_t>(hs_info.info_1_0.tessellator_domain);
++            reflection->hs_tessellator_partitioning = static_cast<uint32_t>(
++                hs_info.info_1_0.tessellator_partitioning);
++            reflection->hs_tessellator_output_primitive = static_cast<uint32_t>(
++                hs_info.info_1_0.tessellator_output_primitive);
++            reflection->hs_tessellation_type_half =
++                hs_info.info_1_0.tessellation_type_half;
++            reflection->hs_max_tessellation_factor =
++                hs_info.info_1_0.max_tessellation_factor;
++            IRShaderReflectionReleaseHullInfo(&hs_info);
++          }
++        } else if (ir_stage == IRShaderStageDomain) {
++          IRVersionedDSInfo ds_info = {};
++          ds_info.version = IRReflectionVersion_1_0;
++          if (IRShaderReflectionCopyDomainInfo(
++                  shader_reflection, IRReflectionVersion_1_0, &ds_info)) {
++            reflection->has_domain_info = true;
++            reflection->ds_max_input_prims_per_mesh_threadgroup =
++                ds_info.info_1_0.max_input_prims_per_mesh_threadgroup;
++            reflection->ds_input_control_point_count =
++                ds_info.info_1_0.input_control_point_count;
++            reflection->ds_input_control_point_size =
++                ds_info.info_1_0.input_control_point_size;
++            reflection->ds_patch_constants_size =
++                ds_info.info_1_0.patch_constants_size;
++            reflection->ds_tessellator_domain =
++                static_cast<uint32_t>(ds_info.info_1_0.tessellator_domain);
++            reflection->ds_tessellation_type_half =
++                ds_info.info_1_0.tessellation_type_half;
++            IRShaderReflectionReleaseDomainInfo(&ds_info);
++          }
++        }
++      }
++    }
++  }
++
++  if (result.function_name.empty()) {
++    switch (stage) {
++      case MetalShaderStage::kVertex:
++        result.function_name = "vertexMain";
++        break;
++      case MetalShaderStage::kFragment:
++        result.function_name = "fragmentMain";
++        break;
++      case MetalShaderStage::kCompute:
++        result.function_name = "computeMain";
++        break;
++      case MetalShaderStage::kGeometry:
++      default:
++        result.function_name = "main";
++        break;
++    }
++  }
++
++  if (stage == MetalShaderStage::kVertex && stage_in_metallib && input_layout &&
++      shader_reflection) {
++    IRMetalLibBinary* stage_in_lib = IRMetalLibBinaryCreate();
++    if (stage_in_lib) {
++      if (IRMetalLibSynthesizeStageInFunction(compiler, shader_reflection,
++                                              input_layout, stage_in_lib)) {
++        size_t stage_in_size = IRMetalLibGetBytecodeSize(stage_in_lib);
++        if (stage_in_size) {
++          stage_in_metallib->resize(stage_in_size);
++          IRMetalLibGetBytecode(stage_in_lib, stage_in_metallib->data());
++        }
++      }
++      IRMetalLibBinaryDestroy(stage_in_lib);
++    }
++  }
++
++  if (shader_reflection) {
++    IRShaderReflectionDestroy(shader_reflection);
++  }
++
++  REXLOG_DEBUG(
++      "MetalShaderConverter: Successfully converted {} bytes DXIL to {} bytes "
++      "MetalLib",
++      dxil_data.size(), result.metallib_data.size());
++
++  // Cleanup
++  IRObjectDestroy(metalObject);
++  IRRootSignatureDestroy(rootSig);
++  IRCompilerDestroy(compiler);
++  IRObjectDestroy(dxilObject);
++
++  result.success = true;
++  return true;
++}
++
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/shader_check.cpp b/src/graphics/metal/shader_check.cpp
+new file mode 100644
+index 0000000..d70457a
+--- /dev/null
++++ b/src/graphics/metal/shader_check.cpp
+@@ -0,0 +1,108 @@
++// Offline native Metal conversion check for Xenia shareable guest shader caches.
++// This does not initialize guest memory, run the game, or modify the input cache.
++#include <rex/graphics/metal/dxbc_to_dxil_converter.h>
++#include <rex/graphics/metal/metal_shader_converter.h>
++#include <rex/graphics/pipeline/shader/dxbc.h>
++#include <rex/graphics/pipeline/shader/dxbc_translator.h>
++#include <rex/string/buffer.h>
++#include <xxhash.h>
++
++#include <bit>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <vector>
++
++std::string MetalCheckDeviceName();
++bool CheckMetalLibrary(const std::vector<uint8_t>& bytes,
++                       const std::string& entry_point, std::string& error);
++
++int main(int argc, char** argv) {
++  if (argc != 3) {
++    std::fprintf(stderr, "Usage: rex-metal-shader-check INPUT.xsh NEW_OUTPUT_DIRECTORY\n");
++    return 1;
++  }
++  std::ifstream input(argv[1], std::ios::binary);
++  auto read = [&](auto* data, size_t count) {
++    return bool(input.read(reinterpret_cast<char*>(data), sizeof(*data) * count));
++  };
++  uint32_t header[2];
++  if (!read(header, 2) || header[0] != 0x48534558 ||
++      std::byteswap(header[1]) != 0x20201219) {
++    std::fprintf(stderr, "Invalid or unsupported shareable shader cache\n");
++    return 2;
++  }
++  const auto device_name = MetalCheckDeviceName();
++  if (device_name.empty()) {
++    std::fprintf(stderr, "No Metal device available; GPU access may require running outside the sandbox\n");
++    return 8;
++  }
++  std::printf("Metal device: %s\n", device_name.c_str());
++  namespace metal = rex::graphics::metal;
++  metal::DxbcToDxilConverter dxil_converter;
++  metal::MetalShaderConverter metal_converter;
++  if (!dxil_converter.Initialize() || !metal_converter.Initialize()) return 3;
++  // Alloy's bindful, non-ROV DXBC path at 1x scale. These are standalone
++  // translation defaults, not the draw-dependent variants of a game replay.
++  rex::graphics::DxbcShaderTranslator translator(
++      rex::ui::GraphicsProvider::GpuVendorID::kApple, false, false, true, true);
++  std::filesystem::path output(argv[2]);
++  if (!std::filesystem::create_directory(output)) {
++    std::fprintf(stderr, "Output must be a new directory\n");
++    return 4;
++  }
++  std::ofstream report(output / "shaders.csv");
++  report << "hash,stage,dxbc_bytes,dxil_bytes,metallib_bytes,result\n";
++  rex::string::StringBuffer disassembly;
++  unsigned passed = 0, failed = 0;
++  while (input.peek() != std::char_traits<char>::eof()) {
++    uint64_t hash;
++    uint32_t info;
++    if (!read(&hash, 1) || !read(&info, 1)) return 5;
++    uint32_t count = info & 0x7fffffff;
++    auto type = rex::graphics::xenos::ShaderType(info >> 31);
++    if (!count || count > 0xffff) return 5;
++    std::vector<uint32_t> code(count);
++    if (!read(code.data(), count) || XXH3_64bits(code.data(), count * 4) != hash) return 5;
++    rex::graphics::DxbcShader shader(type, hash, code.data(), count);
++    shader.AnalyzeUcode(disassembly);
++    const bool pixel = type == rex::graphics::xenos::ShaderType::kPixel;
++    const auto registers = shader.GetDynamicAddressableRegisterCount(63);
++    auto modification = pixel ? translator.GetDefaultPixelShaderModification(registers)
++                              : translator.GetDefaultVertexShaderModification(registers);
++    auto* translation = shader.GetOrCreateTranslation(modification);
++    char name[32];
++    std::snprintf(name, sizeof(name), "%016llX.%s", (unsigned long long)hash, pixel ? "ps" : "vs");
++    std::vector<uint8_t> dxil;
++    metal::MetalShaderConversionResult result;
++    std::string error;
++    bool ok = translator.TranslateAnalyzedShader(*translation);
++    const auto& dxbc = translation->translated_binary();
++    if (!ok) error = "guest-to-DXBC translation failed";
++    if (ok) ok = dxil_converter.Convert(dxbc, dxil, &error);
++    if (ok) {
++      ok = metal_converter.Convert(type, dxil, result);
++      error = result.error_message;
++    }
++    auto write = [&](const char* extension, const std::vector<uint8_t>& bytes) {
++      std::ofstream file(output / (std::string(name) + extension), std::ios::binary);
++      file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++      return bool(file);
++    };
++    if (!write(".dxbc", dxbc) || !write(".dxil", dxil) ||
++        (ok && !write(".metallib", result.metallib_data))) return 6;
++    if (ok) ok = CheckMetalLibrary(result.metallib_data, result.function_name, error);
++    report << name << ',' << (pixel ? "ps" : "vs") << ',' << dxbc.size() << ','
++           << dxil.size() << ',' << result.metallib_data.size() << ','
++           << (ok ? "pass" : "fail") << '\n';
++    if (ok) ++passed;
++    else {
++      ++failed;
++      std::fprintf(stderr, "%s: %s\n", name, error.c_str());
++      std::ofstream(output / (std::string(name) + ".error.txt")) << error;
++    }
++  }
++  if (!report) return 6;
++  std::printf("Native Metal shader conversion: %u passed, %u failed\n", passed, failed);
++  return failed || !passed ? 7 : 0;
++}

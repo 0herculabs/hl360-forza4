@@ -1,3 +1,4 @@
+#include "safe_path.h"
 // fm4tool - helper utilities for the FM4 recompilation project.
 //
 //   fm4tool iso <image.iso> <out_dir>
@@ -56,7 +57,12 @@ static int ExtractDevice(rex::filesystem::Device& device, const fs::path& out_di
     for (auto& child : entry->children()) {
       queue.push(child.get());
     }
-    auto dest = out_dir / rex::to_path(entry->path());
+    const auto relative = launcher::NormalizeGuestRelativePath(entry->path());
+    if (!relative) {
+      std::fprintf(stderr, "unsafe device path: %s\n", entry->path().c_str());
+      return 1;
+    }
+    auto dest = out_dir / fs::u8path(*relative);
     if (entry->attributes() & rex::filesystem::kFileAttributeDirectory) {
       fs::create_directories(dest);
       continue;
