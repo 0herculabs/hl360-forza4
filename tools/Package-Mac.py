@@ -104,15 +104,23 @@ def main():
     binaries = [p for p, directory in fixture_entries(package)
                 if not directory and (p.suffix == '.dylib' or p.name in ('fm4', 'fm4-launcher', 'fm4tool'))]
     names = {p.name for p in binaries}
+    aliases = {}
+    for binary in binaries:
+        if binary.suffix == '.dylib':
+            for line in run('otool', '-D', binary).splitlines():
+                identity = line.strip()
+                if identity.startswith(('@', '/')) and not identity.endswith(':'):
+                    aliases[Path(identity).name] = binary.name
     audit = {}
     for path in binaries:
         audit[str(path.relative_to(package))] = audit_binary(path, args.minimum_macos)
         for dependency in re.findall(r'^\s+(.*?) \(compatibility', run('otool', '-L', path), re.M):
             if dependency.startswith(('/usr/lib/', '/System/Library/')):
                 continue
-            if Path(dependency).name not in names:
+            bundled_name = aliases.get(Path(dependency).name, Path(dependency).name)
+            if bundled_name not in names:
                 raise ValueError(f'{path.name}: unbundled dependency {dependency}')
-            replacement = '@rpath/' + Path(dependency).name
+            replacement = '@rpath/' + bundled_name
             if dependency != replacement:
                 run('install_name_tool', '-change', dependency, replacement, path)
         commands = run('otool', '-l', path)
