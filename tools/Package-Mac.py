@@ -116,7 +116,7 @@ def main():
             if dependency != replacement:
                 run('install_name_tool', '-change', dependency, replacement, path)
         commands = run('otool', '-l', path)
-        for rpath in re.findall(r'cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset', commands):
+        for rpath in dict.fromkeys(re.findall(r'cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset', commands)):
             run('install_name_tool', '-delete_rpath', rpath, path)
         for rpath in ('@loader_path', '@loader_path/vulkan/lib'):
             run('install_name_tool', '-add_rpath', rpath, path)
