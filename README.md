@@ -260,3 +260,10 @@ If you would like to support development or follow updates:
 Built on [ReXGlue](https://github.com/rexglue/rexglue-sdk), [Xenia](https://github.com/xenia-project/xenia) and [XenonRecomp](https://github.com/hedge-dev/XenonRecomp). The launcher and project setup build on the earlier [Forza Motorsport 3 port](https://github.com/0herculabs/hl360-forza3). Project Forza Plus 4 belongs to its respective creators and is supplied separately.
 
 This is an independent community project, not affiliated with or endorsed by Microsoft or Turn 10 Studios. Forza Motorsport and the game assets belong to their respective owners.
+
+## Experimental macOS / Metal
+
+Apple Silicon build instructions, native Metal staging, the optional 30 FPS
+mode and controller vibration settings are documented in [macOS support](docs/MACOS.md).
+See [Metal and performance](docs/MACOS_METAL.md) for graphics fixes, diagnostics
+and validation limits. Windows continues to use Direct3D 12 by default.

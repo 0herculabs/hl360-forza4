@@ -1,0 +1,15 @@
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -221,7 +221,11 @@
+     }
+ 
+     if (license_mask_ptr && XSUCCEEDED(result)) {
+-      *license_mask_ptr = content_license;
++      // fm3-recomp: grant the license_mask cvar on top of the header's, as
++      // Xenia did. Packages without a header (or with mask 0) otherwise get no
++      // licenses, and FM3 runs Media/LicenseMasks/<bit>.sql per granted bit:
++      // that is what marks a DLC pack's cars as installed.
++      *license_mask_ptr = content_license | REXCVAR_GET(license_mask);
+     }
+ 
+     if (disposition_ptr) {

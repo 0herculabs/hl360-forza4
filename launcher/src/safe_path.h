@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <optional>
+#include <algorithm>
 
 namespace launcher {
 
@@ -19,6 +21,13 @@ inline bool IsSafeRelativePath(const std::string& path) {
     start = end + 1;
   }
   return false;
+}
+
+// Guest devices use backslashes on every host; validate after normalization.
+inline std::optional<std::string> NormalizeGuestRelativePath(std::string path) {
+  std::replace(path.begin(), path.end(), '\\', '/');
+  if (!path.empty() && !IsSafeRelativePath(path)) return std::nullopt;
+  return path;
 }
 
 }  // namespace launcher

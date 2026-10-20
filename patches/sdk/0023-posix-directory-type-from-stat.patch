@@ -1,0 +1,22 @@
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -284,12 +284,16 @@
+ 
+     info.name = ent->d_name;
+     struct stat st;
+-    stat((path / info.name).c_str(), &st);
++    if (stat((path / info.name).c_str(), &st) != 0) {
++      continue;
++    }
+     info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
+     info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
+     info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
+     info.path = path;
+-    if (ent->d_type == DT_DIR) {
++    // Directory-entry type hints can be incorrect on external filesystems.
++    // We already stat the entry for metadata; use that authoritative type too.
++    if (S_ISDIR(st.st_mode)) {
+       info.type = FileInfo::Type::kDirectory;
+       info.total_size = 0;
+     } else {

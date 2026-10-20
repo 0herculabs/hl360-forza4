@@ -1,0 +1,13 @@
+diff --git a/tests/unit/codegen/output_stamp_test.cpp b/tests/unit/codegen/output_stamp_test.cpp
+--- a/tests/unit/codegen/output_stamp_test.cpp
++++ b/tests/unit/codegen/output_stamp_test.cpp
+@@ -224,6 +224,6 @@
+   std::ifstream in(depfile, std::ios::binary);
+   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+ 
+-  CHECK(content.find("has\ space.toml") != std::string::npos);
+-  CHECK(content.find("hash\#.toml") != std::string::npos);
+-}
++  CHECK(content.find(R"(has\ space.toml)") != std::string::npos);
++  CHECK(content.find(R"(hash\#.toml)") != std::string::npos);
++}

@@ -1,0 +1,41 @@
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1601,11 +1601,11 @@
+     // On hardware this clears the internal state of the scan converter (which
+     // is different to the register)
+     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
+-    REXGPU_INFO("Begin viz query ID {:02X}", id);
++    REXGPU_NOISY_DEBUG("Begin viz query ID {:02X}", id);
+   } else {
+     // end the viz query
+     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
+-    REXGPU_INFO("End viz query ID {:02X}", id);
++    REXGPU_NOISY_DEBUG("End viz query ID {:02X}", id);
+     // The scan converter writes the internal result back to the register here.
+     // We just fake it and say it was visible in case it is read back.
+     if (id < 32) {
+diff --git a/src/kernel/xam/xam_misc.cpp b/src/kernel/xam/xam_misc.cpp
+--- a/src/kernel/xam/xam_misc.cpp
++++ b/src/kernel/xam/xam_misc.cpp
+@@ -767,7 +767,19 @@
+ REX_EXPORT_STUB(__imp__XamWriteBiometricData);
+ REX_EXPORT_STUB(__imp__XamWriteGamerTileEx);
+ REX_EXPORT_STUB(__imp__XamWriteTile);
+-REX_EXPORT_STUB(__imp__XamXStudioRequest);
++// FM4 calls this capture/debug-service stub every frame. Preserve the stub's
++// register behavior and export, but diagnose its absence only once.
++extern "C" REX_FUNC(__imp__XamXStudioRequest) {
++  (void)ctx;
++  (void)base;
++  static const bool reported = [] {
++    REXKRNL_WARN("__imp__XamXStudioRequest STUB (further calls suppressed)");
++    return true;
++  }();
++  (void)reported;
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XamXStudioRequest(
++    "__imp__XamXStudioRequest", &__imp__XamXStudioRequest);
+ REX_EXPORT_STUB(__imp__XamXgiBlobTrackerSetMockInfo);
+ REX_EXPORT_STUB(__imp__XamXlfsInitializeUploadQueue);
+ REX_EXPORT_STUB(__imp__XamXlfsInitializeUploadQueueWithTestHooks);

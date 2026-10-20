@@ -5,6 +5,7 @@
 #include "crash_handler.h"
 #include "file_signatures.h"
 #include "wheel_input.h"
+#include "frame_stats.h"
 
 #include <charconv>
 
@@ -24,9 +25,15 @@ REXCVAR_DEFINE_STRING(profile_name, "", "FM4/Profile",
 REXCVAR_DEFINE_STRING(profile_xuid, "", "FM4/Profile",
                       "Offline XUID of the signed-in profile, 16 hex digits");
 
-REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "FM4/Graphics",
-                      "Graphics backend for the xenos GPU plugin: any, d3d12, vulkan")
-    .allowed({"any", "d3d12", "vulkan"})
+#if defined(__APPLE__)
+#define FM4_DEFAULT_GPU_BACKEND "vulkan"
+#else
+#define FM4_DEFAULT_GPU_BACKEND "d3d12"
+#endif
+
+REXCVAR_DEFINE_STRING(gpu_backend, FM4_DEFAULT_GPU_BACKEND, "FM4/Graphics",
+                      "Graphics backend for the xenos GPU plugin: any, d3d12, vulkan, metal")
+    .allowed({"any", "d3d12", "vulkan", "metal"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(crash_test, false, "FM4/Debug",
@@ -103,6 +110,7 @@ void Fm4App::OnPostLoadXexImage() {
 }
 
 void Fm4App::OnPostSetup() {
+  SetGuestFrameStats([] { return GetFm4FrameStats(); });
   fm4::wheel::SetFocus(window() && window()->HasFocus());
   MountCachePartition(runtime(), user_data_root());
 

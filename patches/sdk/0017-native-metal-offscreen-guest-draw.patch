@@ -1,0 +1,593 @@
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -29,6 +29,11 @@
+     pipeline/shader/translator.cpp
+     pipeline/shader/translator_disasm.cpp
+ )
++
++# Offscreen Metal guest-command integration.
++if(REXGLUE_BUILD_METAL_SHADER_TOOLS)
++    add_subdirectory(metal/command)
++endif()
+ 
+ # SPIR-V shader translation
+ set(REXGPU_XENOS_SPIRV_SOURCES
+diff --git a/include/rex/graphics/metal/command_processor.h b/include/rex/graphics/metal/command_processor.h
+new file mode 100644
+index 0000000..9dd9767
+--- /dev/null
++++ b/include/rex/graphics/metal/command_processor.h
+@@ -0,0 +1,37 @@
++#pragma once
++#include <rex/graphics/command_processor.h>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace rex::graphics::metal {
++// Experimental offscreen subset of Alloy's native Metal command processor.
++// Uses the SDK's PM4 decoder. Not registered as a selectable game backend.
++class MetalCommandProcessor final : public CommandProcessor {
++ public:
++  MetalCommandProcessor(GraphicsSystem* graphics, system::KernelState* kernel);
++  ~MetalCommandProcessor() override;
++  // Synchronous, owner-thread path without a guest CPU/kernel worker.
++  bool InitializeOffscreen(uint32_t width, uint32_t height);
++  void Shutdown() override;
++  bool ReadbackRGBA(std::vector<uint8_t>& rgba);
++  uint64_t draw_count() const;
++  const std::string& last_error() const;
++  void InvalidateGpuMemory() override;
++  void IssueSwap(uint32_t, uint32_t, uint32_t) override;
++
++ protected:
++  bool SetupContext() override;
++  void ShutdownContext() override;
++  void PrepareForWait() override;
++  Shader* LoadShader(xenos::ShaderType, uint32_t, const uint32_t*, uint32_t) override;
++  bool IssueDraw(xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override;
++  bool IssueCopy() override;
++
++ private:
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++  bool offscreen_ = false;
++  bool Fail(std::string error);
++};
++}  // namespace rex::graphics::metal
+diff --git a/include/rex/graphics/metal/graphics_system.h b/include/rex/graphics/metal/graphics_system.h
+new file mode 100644
+index 0000000..f844cf6
+--- /dev/null
++++ b/include/rex/graphics/metal/graphics_system.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <rex/graphics/graphics_system.h>
++
++namespace rex::graphics::metal {
++class MetalGraphicsSystem final : public GraphicsSystem {
++ public:
++  ~MetalGraphicsSystem() override;
++  std::string name() const override { return "Metal (experimental offscreen)"; }
++  // Controlled diagnostic entry; no kernel, vblank timer or MMIO registration.
++  bool InitializeOffscreen(memory::Memory& memory, uint32_t width, uint32_t height);
++  void Shutdown() override;
++ protected:
++  void CreateProvider(bool with_presentation) override;
++  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
++};
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/command/CMakeLists.txt b/src/graphics/metal/command/CMakeLists.txt
+new file mode 100644
+index 0000000..dcdfe61
+--- /dev/null
++++ b/src/graphics/metal/command/CMakeLists.txt
+@@ -0,0 +1,9 @@
++# Offscreen guest PM4 draw subset. Does not alter the runtime plugin factory.
++add_library(rexmetal-command STATIC
++    command_processor.cpp graphics_system.cpp ir_runtime.cpp
++    ../../graphics_system.cpp ../../command_processor.cpp
++    ../../register_file.cpp ../../packet_disassembler.cpp)
++target_include_directories(rexmetal-command PRIVATE "${REXGLUE_METAL_DEPS_ROOT}/msc/include")
++target_link_libraries(rexmetal-command PUBLIC rexmetal-memory rexmetal-shader PRIVATE xxHash::xxhash)
++add_executable(rex-metal-draw-check draw_check.cpp)
++target_link_libraries(rex-metal-draw-check PRIVATE rexmetal-command xxHash::xxhash)
+diff --git a/src/graphics/metal/command/command_processor.cpp b/src/graphics/metal/command/command_processor.cpp
+new file mode 100644
+index 0000000..39ca8e1
+--- /dev/null
++++ b/src/graphics/metal/command/command_processor.cpp
+@@ -0,0 +1,272 @@
++// Incremental offscreen adaptation of Xenia-Alloy's Metal command processor.
++// Copyright 2026 Ben Vanik. BSD license; see SDK LICENSE.
++#include <rex/graphics/metal/command_processor.h>
++#include <rex/graphics/metal/shared_memory.h>
++#include <rex/graphics/metal/dxbc_to_dxil_converter.h>
++#include <rex/graphics/metal/metal_shader_converter.h>
++#include <rex/graphics/graphics_system.h>
++#include <rex/graphics/pipeline/shader/dxbc.h>
++#include <rex/string/buffer.h>
++#include <rex/logging.h>
++#include <Foundation/NSSharedPtr.hpp>
++#define IR_RUNTIME_METALCPP
++#include <metal_irconverter_runtime.h>
++#include <xxhash.h>
++#include <dispatch/dispatch.h>
++#include <array>
++#include <bit>
++#include <cstring>
++#include <map>
++
++namespace rex::graphics::metal {
++namespace {
++using Translator = DxbcShaderTranslator;
++constexpr size_t kCBVBytes = 4096, kUniformBytes = 5 * kCBVBytes;
++struct Stage {
++  NS::SharedPtr<MTL::Library> library;
++  NS::SharedPtr<MTL::Function> function;
++};
++}
++struct MetalCommandProcessor::Impl {
++  ui::metal::MetalProvider* provider = nullptr;
++  std::unique_ptr<ui::metal::MetalSubmissionTracker> submissions;
++  std::unique_ptr<MetalSharedMemory> shared;
++  std::unique_ptr<Translator> translator;
++  DxbcToDxilConverter dxil;
++  MetalShaderConverter metal;
++  std::map<std::pair<uint32_t, uint64_t>, std::unique_ptr<DxbcShader>> shaders;
++  NS::SharedPtr<MTL::Texture> target;
++  NS::SharedPtr<NS::AutoreleasePool> pool;
++  uint32_t width = 0, height = 0;
++  uint64_t draws = 0;
++  std::string error;
++};
++MetalCommandProcessor::MetalCommandProcessor(GraphicsSystem* graphics, system::KernelState* kernel)
++    : CommandProcessor(graphics, kernel), impl_(std::make_unique<Impl>()) {}
++MetalCommandProcessor::~MetalCommandProcessor() { ShutdownContext(); }
++bool MetalCommandProcessor::Fail(std::string error) {
++  impl_->error = std::move(error);
++  REXLOG_ERROR("Metal offscreen: {}", impl_->error);
++  return false;
++}
++const std::string& MetalCommandProcessor::last_error() const { return impl_->error; }
++uint64_t MetalCommandProcessor::draw_count() const { return impl_->draws; }
++bool MetalCommandProcessor::InitializeOffscreen(uint32_t width, uint32_t height) {
++  if (offscreen_ || !width || !height || width > 4096 || height > 4096) return false;
++  offscreen_ = true;
++  impl_->draws = 0; impl_->error.clear();
++  if (!SetupContext()) return false;
++  auto descriptor = NS::TransferPtr(MTL::TextureDescriptor::alloc()->init());
++  descriptor->setTextureType(MTL::TextureType2D);
++  descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
++  descriptor->setWidth(width); descriptor->setHeight(height);
++  descriptor->setStorageMode(MTL::StorageModePrivate);
++  descriptor->setUsage(MTL::TextureUsageRenderTarget);
++  impl_->target = NS::TransferPtr(impl_->provider->GetDevice()->newTexture(descriptor.get()));
++  impl_->width = width; impl_->height = height;
++  return impl_->target ? true : Fail("Offscreen target allocation failed");
++}
++bool MetalCommandProcessor::SetupContext() {
++  impl_->pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++  impl_->provider = dynamic_cast<ui::metal::MetalProvider*>(graphics_system_->provider());
++  if (!impl_->provider || !memory_) return Fail("Missing Metal provider/guest memory");
++  impl_->submissions = ui::metal::MetalSubmissionTracker::Create(impl_->provider->GetCommandQueue());
++  if (!impl_->submissions) return Fail("Submission tracker creation failed");
++  impl_->shared = std::make_unique<MetalSharedMemory>(*impl_->provider, *impl_->submissions, *memory_);
++  if (!impl_->shared->Initialize()) return Fail("Guest-memory copy creation failed");
++  impl_->translator = std::make_unique<Translator>(ui::GraphicsProvider::GpuVendorID::kApple,
++                                                  false, false, true, true);
++  return impl_->dxil.Initialize() && impl_->metal.Initialize();
++}
++void MetalCommandProcessor::ShutdownContext() {
++  if (impl_->submissions) impl_->submissions->AwaitAllSubmissionsCompletion();
++  impl_->shared.reset(); impl_->submissions.reset();
++  impl_->target.reset(); impl_->shaders.clear(); impl_->translator.reset();
++  impl_->provider = nullptr; impl_->pool.reset();
++}
++void MetalCommandProcessor::Shutdown() {
++  if (offscreen_) { ShutdownContext(); offscreen_ = false; }
++  else if (worker_thread_) CommandProcessor::Shutdown();
++}
++void MetalCommandProcessor::PrepareForWait() {
++  if (impl_->submissions) impl_->submissions->AwaitAllSubmissionsCompletion();
++}
++void MetalCommandProcessor::InvalidateGpuMemory() {
++  if (impl_->shared) impl_->shared->InvalidateAllPages();
++}
++void MetalCommandProcessor::IssueSwap(uint32_t, uint32_t, uint32_t) {
++  Fail("Presentation is not implemented");
++}
++bool MetalCommandProcessor::IssueCopy() { return Fail("Guest resolves are not implemented"); }
++Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType type, uint32_t address,
++                                         const uint32_t* code, uint32_t count) {
++  if (!code || !count || count > 0xffff || uint32_t(type) > 1 ||
++      (address & 3) || uint64_t(address) + uint64_t(count) * 4 > SharedMemory::kBufferSize) {
++    Fail("Invalid guest shader"); return nullptr;
++  }
++  uint64_t hash = XXH3_64bits(code, size_t(count) * 4);
++  auto key = std::make_pair(uint32_t(type), hash);
++  auto& shader = impl_->shaders[key];
++  if (!shader) {
++    shader = std::make_unique<DxbcShader>(type, hash, code, count);
++    string::StringBuffer disassembly;
++    shader->AnalyzeUcode(disassembly);
++    REXLOG_DEBUG("Metal guest shader {} {:016X}: vertex fetch map {:08X} {:08X} {:08X}",
++                 uint32_t(type), hash, shader->constant_register_map().vertex_fetch_bitmap[0],
++                 shader->constant_register_map().vertex_fetch_bitmap[1], shader->constant_register_map().vertex_fetch_bitmap[2]);
++  }
++  return shader.get();
++}
++bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive, uint32_t count,
++                                      IndexBufferInfo* indices, bool) {
++  // Explicit diagnostic contract: NDC coordinates, one RGBA8 target, no guest
++  // texture/depth/stencil/resolve emulation. Do not silently accept game state.
++  if (!offscreen_ || !impl_->target || !active_vertex_shader_ || !active_pixel_shader_)
++    return Fail("Offscreen target and both guest shaders are required");
++  if (primitive != xenos::PrimitiveType::kTriangleList || indices || !count || count % 3)
++    return Fail("Only non-indexed triangle lists are implemented");
++  if (register_file_->Get<reg::RB_DEPTHCONTROL>().value)
++    return Fail("Guest depth/stencil state is not implemented in the offscreen subset");
++  auto& vs = *static_cast<DxbcShader*>(active_vertex_shader_);
++  auto& ps = *static_cast<DxbcShader*>(active_pixel_shader_);
++  if (!vs.texture_bindings().empty() || !ps.texture_bindings().empty() ||
++      vs.memexport_eM_written() || ps.memexport_eM_written() || ps.writes_depth() ||
++      ps.writes_color_targets() != 1)
++    return Fail("Textured, memexport, depth-export and multiple-target draws are not implemented");
++  if (!impl_->submissions->AwaitAllSubmissionsCompletion()) return Fail("Earlier submission failed");
++  const auto& map = vs.constant_register_map();
++  for (uint32_t word = 0; word < 3; ++word) {
++    uint32_t bits = map.vertex_fetch_bitmap[word];
++    while (bits) {
++      const auto index = std::countr_zero(bits) + word * 32; bits &= bits - 1;
++      auto fetch = register_file_->GetVertexFetch(index);
++      if (fetch.type != xenos::FetchConstantType::kVertex || !fetch.size ||
++          uint64_t(fetch.address) * 4 + uint64_t(fetch.size) * 4 > SharedMemory::kBufferSize ||
++          !impl_->shared->RequestRange(fetch.address << 2, fetch.size << 2)) {
++        REXLOG_ERROR("Metal vertex fetch {}: {:08X} {:08X}, type={}, address={:08X}, dwords={}",
++                     index, fetch.dword_0, fetch.dword_1, uint32_t(fetch.type), fetch.address << 2, uint32_t(fetch.size));
++        return Fail("Invalid/unavailable vertex fetch range");
++      }
++    }
++  }
++  const auto program = register_file_->Get<reg::SQ_PROGRAM_CNTL>();
++  const uint32_t mask = vs.writes_interpolators();
++  Translator::Modification vm(impl_->translator->GetDefaultVertexShaderModification(
++      vs.GetDynamicAddressableRegisterCount(program.vs_num_reg)));
++  Translator::Modification pm(impl_->translator->GetDefaultPixelShaderModification(
++      ps.GetDynamicAddressableRegisterCount(program.ps_num_reg)));
++  vm.vertex.interpolator_mask = mask; pm.pixel.interpolator_mask = mask;
++  auto* device = impl_->provider->GetDevice();
++  Stage stages[2];
++  for (unsigned stage = 0; stage < 2; ++stage) {
++    auto& shader = stage ? ps : vs;
++    auto* translation = shader.GetOrCreateTranslation(stage ? pm.value : vm.value);
++    if (!impl_->translator->TranslateAnalyzedShader(*translation)) return Fail("DXBC translation failed");
++    std::vector<uint8_t> dxil;
++    std::string error;
++    if (!impl_->dxil.Convert(translation->translated_binary(), dxil, &error)) return Fail(error);
++    MetalShaderConversionResult result;
++    if (!impl_->metal.Convert(shader.type(), dxil, result)) return Fail(result.error_message);
++    auto data = dispatch_data_create(result.metallib_data.data(), result.metallib_data.size(), nullptr, ^{});
++    NS::Error* ns_error = nullptr;
++    stages[stage].library = NS::TransferPtr(device->newLibrary(data, &ns_error));
++    dispatch_release(data);
++    if (!stages[stage].library) return Fail(ns_error ? ns_error->localizedDescription()->utf8String() : "Metal library load failed");
++    stages[stage].function = NS::TransferPtr(stages[stage].library->newFunction(
++        NS::String::string(result.function_name.c_str(), NS::UTF8StringEncoding)));
++    if (!stages[stage].function) return Fail("Converted entry point unavailable");
++  }
++  auto pd = NS::TransferPtr(MTL::RenderPipelineDescriptor::alloc()->init());
++  pd->setVertexFunction(stages[0].function.get()); pd->setFragmentFunction(stages[1].function.get());
++  pd->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
++  NS::Error* pipeline_error = nullptr;
++  auto pipeline = NS::TransferPtr(device->newRenderPipelineState(pd.get(), &pipeline_error));
++  if (!pipeline) return Fail(pipeline_error ? pipeline_error->localizedDescription()->utf8String() : "Render pipeline creation failed");
++  auto uniform = NS::TransferPtr(device->newBuffer(2 * kUniformBytes, MTL::ResourceStorageModeShared));
++  auto resource = NS::TransferPtr(device->newBuffer(1025 * sizeof(IRDescriptorTableEntry), MTL::ResourceStorageModeShared));
++  auto cbv = NS::TransferPtr(device->newBuffer(2 * 5 * sizeof(IRDescriptorTableEntry), MTL::ResourceStorageModeShared));
++  auto top = NS::TransferPtr(device->newBuffer(2 * 256, MTL::ResourceStorageModeShared));
++  if (!uniform || !resource || !cbv || !top) return Fail("Draw argument allocation failed");
++  std::memset(uniform->contents(), 0, uniform->length());
++  std::memset(resource->contents(), 0, resource->length());
++  std::memset(top->contents(), 0, top->length());
++  IRDescriptorTableSetBuffer(static_cast<IRDescriptorTableEntry*>(resource->contents()),
++                            impl_->shared->GetBuffer()->gpuAddress(), SharedMemory::kBufferSize);
++  Translator::SystemConstants system{};
++  system.flags = Translator::kSysFlag_XYDividedByW | Translator::kSysFlag_ZDividedByW |
++                 Translator::kSysFlag_WNotReciprocal | Translator::kSysFlag_PrimitivePolygonal |
++                 Translator::kSysFlag_AlphaPassIfLess | Translator::kSysFlag_AlphaPassIfEqual |
++                 Translator::kSysFlag_AlphaPassIfGreater;
++  system.vertex_index_max = 0xffffff;
++  for (auto& value : system.ndc_scale) value = 1.0f;
++  for (auto& value : system.color_exp_bias) value = 1.0f;
++  for (uint32_t stage = 0; stage < 2; ++stage) {
++    auto* uniforms = static_cast<uint8_t*>(uniform->contents()) + stage * kUniformBytes;
++    std::memcpy(uniforms, &system, sizeof(system));
++    std::memcpy(uniforms + 2 * kCBVBytes, &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 160);
++    std::memcpy(uniforms + 3 * kCBVBytes, &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 768);
++    const auto& constants = (stage ? ps : vs).constant_register_map();
++    auto* output = uniforms + kCBVBytes;
++    for (uint32_t word = 0; word < 4; ++word) {
++      uint64_t bits = constants.float_bitmap[word];
++      while (bits) {
++        uint32_t index = std::countr_zero(bits) + word * 64; bits &= bits - 1;
++        uint32_t base = stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X;
++        std::memcpy(output, &register_file_->values[base + 4 * index], 16); output += 16;
++      }
++    }
++    auto* entries = static_cast<IRDescriptorTableEntry*>(cbv->contents()) + stage * 5;
++    for (uint32_t index = 0; index < 5; ++index)
++      IRDescriptorTableSetBuffer(&entries[index], uniform->gpuAddress() + stage * kUniformBytes + index * kCBVBytes, kCBVBytes);
++    auto* pointers = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(top->contents()) + stage * 256);
++    for (uint32_t index = 0; index < 9; ++index) pointers[index] = resource->gpuAddress();
++    // No samplers are referenced in this supported subset.
++    pointers[9] = resource->gpuAddress();
++    for (uint32_t index = 10; index < 15; ++index)
++      pointers[index] = cbv->gpuAddress() + stage * 5 * sizeof(IRDescriptorTableEntry);
++  }
++  auto* commands = impl_->provider->GetCommandQueue()->commandBuffer();
++  if (!commands) return Fail("Command buffer allocation failed");
++  auto pass = NS::TransferPtr(MTL::RenderPassDescriptor::alloc()->init());
++  auto* color = pass->colorAttachments()->object(0);
++  color->setTexture(impl_->target.get()); color->setLoadAction(MTL::LoadActionClear);
++  color->setStoreAction(MTL::StoreActionStore); color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
++  auto* encoder = commands->renderCommandEncoder(pass.get());
++  if (!encoder) return Fail("Render encoder creation failed");
++  encoder->setRenderPipelineState(pipeline.get());
++  encoder->setViewport(MTL::Viewport{0, 0, double(impl_->width), double(impl_->height), 0, 1});
++  encoder->setCullMode(MTL::CullModeNone);
++  for (auto* buffer : {uniform.get(), resource.get(), cbv.get(), top.get(), impl_->shared->GetBuffer()})
++    encoder->useResource(buffer, MTL::ResourceUsageRead);
++  encoder->setVertexBuffer(top.get(), 0, kIRArgumentBufferBindPoint);
++  encoder->setFragmentBuffer(top.get(), 256, kIRArgumentBufferBindPoint);
++  encoder->setVertexBuffer(resource.get(), 0, kIRDescriptorHeapBindPoint);
++  encoder->setFragmentBuffer(resource.get(), 0, kIRDescriptorHeapBindPoint);
++  encoder->setVertexBuffer(resource.get(), 0, kIRSamplerHeapBindPoint);
++  encoder->setFragmentBuffer(resource.get(), 0, kIRSamplerHeapBindPoint);
++  IRRuntimeDrawPrimitives(encoder, MTL::PrimitiveTypeTriangle, 0, count, 1);
++  encoder->endEncoding();
++  const auto submission = impl_->submissions->Submit(commands);
++  if (!submission || !impl_->submissions->AwaitSubmissionCompletion(submission)) return Fail("Guest draw GPU submission failed");
++  ++impl_->draws; impl_->error.clear();
++  return true;
++}
++bool MetalCommandProcessor::ReadbackRGBA(std::vector<uint8_t>& rgba) {
++  if (!impl_->target || !impl_->draws) return Fail("No rendered offscreen target");
++  const size_t row = (size_t(impl_->width) * 4 + 255) & ~size_t(255);
++  auto readback = NS::TransferPtr(impl_->provider->GetDevice()->newBuffer(row * impl_->height, MTL::ResourceStorageModeShared));
++  auto* commands = impl_->provider->GetCommandQueue()->commandBuffer();
++  if (!readback || !commands) return Fail("Readback allocation failed");
++  auto* blit = commands->blitCommandEncoder();
++  if (!blit) return Fail("Readback encoder allocation failed");
++  blit->copyFromTexture(impl_->target.get(), 0, 0, MTL::Origin(0, 0, 0),
++                        MTL::Size(impl_->width, impl_->height, 1), readback.get(), 0, row, row * impl_->height);
++  blit->endEncoding();
++  const auto submission = impl_->submissions->Submit(commands);
++  if (!submission || !impl_->submissions->AwaitSubmissionCompletion(submission)) return Fail("Readback GPU submission failed");
++  rgba.resize(size_t(impl_->width) * impl_->height * 4);
++  for (size_t y = 0; y < impl_->height; ++y)
++    std::memcpy(rgba.data() + y * impl_->width * 4, static_cast<const uint8_t*>(readback->contents()) + y * row, impl_->width * 4);
++  return true;
++}
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/command/draw_check.cpp b/src/graphics/metal/command/draw_check.cpp
+new file mode 100644
+index 0000000..a527280
+--- /dev/null
++++ b/src/graphics/metal/command/draw_check.cpp
+@@ -0,0 +1,169 @@
++// Real FM3 guest shaders, controlled vertex/constants fixture, SDK PM4 decoding.
++#include <rex/graphics/metal/graphics_system.h>
++#include <rex/graphics/metal/command_processor.h>
++#include <rex/graphics/pipeline/shader/shader.h>
++#include <rex/graphics/xenos.h>
++#include <xxhash.h>
++#include <bit>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <stdexcept>
++#include <vector>
++
++namespace {
++using namespace rex::graphics;
++void Require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
++struct CachedShader { uint32_t type; std::vector<uint32_t> code; };
++std::map<uint64_t, CachedShader> Load(const char* filename) {
++  std::ifstream input(filename, std::ios::binary);
++  auto read = [&](auto* data, size_t n) { return bool(input.read(reinterpret_cast<char*>(data), sizeof(*data) * n)); };
++  uint32_t header[2];
++  Require(read(header, 2) && header[0] == 0x48534558 && std::byteswap(header[1]) == 0x20201219, "Invalid shader cache");
++  std::map<uint64_t, CachedShader> shaders;
++  while (input.peek() != std::char_traits<char>::eof()) {
++    uint64_t hash = 0; uint32_t info = 0;
++    Require(read(&hash, 1) && read(&info, 1), "Truncated shader record");
++    CachedShader shader{info >> 31, {}};
++    uint32_t count = info & 0x7fffffff;
++    Require(count && count <= 0xffff, "Invalid shader length");
++    shader.code.resize(count);
++    Require(read(shader.code.data(), count), "Truncated shader data");
++    Require(XXH3_64bits(shader.code.data(), count * 4) == hash, "Shader hash mismatch");
++    shaders.emplace(hash, std::move(shader));
++  }
++  return shaders;
++}
++void Validate(const std::vector<uint8_t>& rgba, bool constant) {
++  size_t checked = 0, background = 0;
++  for (size_t y = 0; y < 128; ++y) for (size_t x = 0; x < 128; ++x) {
++    float gx = 2.0f * (float(x) + 0.5f) / 128 - 1;
++    float gy = 1 - 2.0f * (float(y) + 0.5f) / 128;
++    float c = (gy + 0.75f) / 1.5f;
++    float b = (gx + 0.75f) / 1.5f - c * 0.5f;
++    float a = 1 - b - c;
++    const auto* pixel = rgba.data() + (y * 128 + x) * 4;
++    if (a > 0.02f && b > 0.02f && c > 0.02f) {
++      const float expected[4] = {constant ? 0.15f : a, constant ? 0.15f : b,
++                                 constant ? 0.15f : c, constant ? 0.4f : 1};
++      for (int ch = 0; ch < 4; ++ch) {
++        if (std::abs(float(pixel[ch]) - expected[ch] * 255) > 3) {
++          std::fprintf(stderr, "pixel (%zu,%zu) channel %d: %u, expected %.1f\n",x,y,ch,pixel[ch],expected[ch]*255);
++          throw std::runtime_error("Guest shader pixel mismatch");
++        }
++      }
++      ++checked;
++    } else if (a < -0.02f || b < -0.02f || c < -0.02f) {
++      Require(pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 && pixel[3] == 255, "Outside-triangle pixel mismatch");
++      ++background;
++    }
++  }
++  Require(checked > 3500 && background > 10000, "Insufficient pixel coverage");
++  std::printf("%s: %zu interior and %zu exterior pixels matched\n", constant ? "Packed constants + guest re-upload" : "Interpolated guest colors",checked,background);
++}
++void Save(const std::filesystem::path& output, const std::vector<uint8_t>& rgba) {
++  std::ofstream file(output, std::ios::binary);
++  file.write(reinterpret_cast<const char*>(rgba.data()), rgba.size());
++  Require(bool(file), "Output write failed");
++}
++void Run(const char* cache, const char* output_dir) {
++  auto shaders = Load(cache);
++  constexpr uint64_t kVS = 0x1E6883FCCDE1F688, kPS = 0xA4A965C189287B99, kConstantPS = 0x7AB6C260E913B290;
++  Require(shaders.contains(kVS) && shaders.contains(kPS) && shaders.contains(kConstantPS), "Required FM3 guest shaders are absent");
++  Require(shaders.at(kVS).type == 0 && shaders.at(kPS).type == 1 && shaders.at(kConstantPS).type == 1, "Shader stage mismatch");
++  std::filesystem::path output(output_dir);
++  Require(std::filesystem::create_directory(output), "Output must be a new directory");
++  rex::memory::Memory memory;
++  Require(memory.Initialize(), "Guest memory initialization failed");
++  metal::MetalGraphicsSystem graphics;
++  Require(graphics.InitializeOffscreen(memory, 128, 128), "Offscreen graphics setup failed");
++  auto& cp = *static_cast<metal::MetalCommandProcessor*>(graphics.command_processor());
++  std::vector<uint32_t> allocations;
++  auto alloc = [&](size_t size) {
++    auto guest = memory.SystemHeapAlloc(uint32_t(size), uint32_t(rex::memory::page_size()), rex::memory::kSystemHeapPhysical);
++    Require(guest != 0, "Physical allocation failed"); allocations.push_back(guest); return guest;
++  };
++  std::map<uint64_t, uint32_t> addresses;
++  for (auto hash : {kVS, kPS, kConstantPS}) {
++    const auto& code = shaders.at(hash).code;
++    auto guest = alloc(code.size() * 4);
++    std::memcpy(memory.TranslateVirtual(guest), code.data(), code.size() * 4);
++    addresses[hash] = memory.GetPhysicalAddress(guest);
++  }
++  auto vertex_guest = alloc(3 * 7 * 4);
++  const auto vertex_physical = memory.GetPhysicalAddress(vertex_guest);
++  auto packet_guest = alloc(4096);
++  const auto packet_physical = memory.GetPhysicalAddress(packet_guest);
++  auto vertices = [&](float alpha) {
++    float data[21] = {-.75f,-.75f,.5f, 1,0,0,alpha, .75f,-.75f,.5f, 0,1,0,alpha,
++                      0,.75f,.5f, 0,0,1,alpha};
++    auto* destination = memory.TranslateVirtual<uint32_t*>(vertex_guest);
++    for (size_t i = 0; i < 21; ++i) destination[i] = std::byteswap(std::bit_cast<uint32_t>(data[i]));
++  };
++  vertices(1);
++  auto draw = [&](uint64_t pixel_shader, xenos::PrimitiveType primitive = xenos::PrimitiveType::kTriangleList) {
++    std::vector<uint32_t> packets;
++    auto reg = [&](uint32_t index, uint32_t value) {
++      packets.push_back(xenos::MakePacketType0(index, 1)); packets.push_back(value);
++    };
++    // XNA disassembly displays vf95 for raw hardware fetch slot 0.
++    xenos::xe_gpu_vertex_fetch_t fetch{};
++    fetch.type = xenos::FetchConstantType::kVertex; fetch.address = vertex_physical >> 2;
++    fetch.size = 21; fetch.endian = xenos::Endian::k8in32;
++    reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, fetch.dword_0);
++    reg(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1, fetch.dword_1);
++    reg::SQ_PROGRAM_CNTL program{}; program.vs_num_reg = 1; program.ps_num_reg = 1;
++    reg(XE_GPU_REG_SQ_PROGRAM_CNTL, program.value);
++    for (auto hash : {kVS, pixel_shader}) {
++      const auto& shader = shaders.at(hash);
++      packets.push_back(xenos::MakePacketType3(xenos::PM4_IM_LOAD, 2));
++      packets.push_back(addresses.at(hash) | shader.type); packets.push_back(uint32_t(shader.code.size()));
++    }
++    // Noncontiguous pixel constants exercise DXBC's packed constant map.
++    reg(XE_GPU_REG_SHADER_CONSTANT_256_X, std::bit_cast<uint32_t>(.4f));
++    reg(XE_GPU_REG_SHADER_CONSTANT_256_X + 222 * 4, std::bit_cast<uint32_t>(.1f));
++    reg(XE_GPU_REG_SHADER_CONSTANT_256_X + 249 * 4 + 1, std::bit_cast<uint32_t>(.5f));
++    reg::VGT_DRAW_INITIATOR initiator{};
++    initiator.prim_type = primitive;
++    initiator.source_select = xenos::SourceSelect::kAutoIndex; initiator.num_indices = 3;
++    packets.push_back(xenos::MakePacketType3(xenos::PM4_DRAW_INDX_2, 1)); packets.push_back(initiator.value);
++    auto* destination = memory.TranslateVirtual<uint32_t*>(packet_guest);
++    for (size_t i = 0; i < packets.size(); ++i) destination[i] = std::byteswap(packets[i]);
++    cp.ExecutePacket(packet_physical, uint32_t(packets.size()));
++  };
++  draw(kPS);
++  if (!cp.last_error().empty()) std::fprintf(stderr, "%s\n", cp.last_error().c_str());
++  Require(cp.draw_count() == 1, "First guest PM4 draw failed");
++  std::vector<uint8_t> rgba;
++  Require(cp.ReadbackRGBA(rgba), "First readback failed");
++  Save(output / "interpolated.rgba", rgba); Validate(rgba, false);
++  vertices(.5f); // Actual watched guest write; old host copy would produce 0.3 RGB.
++  draw(kConstantPS);
++  Require(cp.draw_count() == 2, "Second guest PM4 draw failed");
++  Require(cp.ReadbackRGBA(rgba), "Second readback failed");
++  Save(output / "constants.rgba", rgba); Validate(rgba, true);
++  // Explicit invalidation hook and repeated draw exercise the same guest state.
++  cp.InvalidateGpuMemory(); draw(kConstantPS);
++  Require(cp.draw_count() == 3 && cp.ReadbackRGBA(rgba), "Draw after invalidation failed");
++  Validate(rgba, true);
++  draw(kConstantPS, xenos::PrimitiveType::kLineList);
++  Require(cp.draw_count() == 3 && !cp.last_error().empty(), "Unsupported primitive was silently accepted");
++  Require(cp.ReadbackRGBA(rgba), "Readback after rejected draw failed");
++  Validate(rgba, true);
++  std::puts("Unsupported primitive rejected without altering the rendered target");
++  std::ofstream(output / "receipt.txt") << "FM3 guest shaders VS=1E6883FCCDE1F688 PS=A4A965C189287B99,7AB6C260E913B290\n"
++      << "128x128 RGBA8, synthetic triangle/constants, SDK PM4 IM_LOAD + DRAW_INDX_2\n"
++      << "3 guest draws passed; this is not an FM3 scene replay\n";
++  graphics.Shutdown(); graphics.Shutdown();
++  for (auto guest : allocations) memory.SystemHeapFree(guest);
++  std::puts("Native Metal guest PM4 draw check passed");
++}
++}
++int main(int argc, char** argv) {
++  if (argc != 3) { std::fprintf(stderr,"Usage: rex-metal-draw-check INPUT.xsh NEW_OUTPUT_DIRECTORY\n"); return 1; }
++  try { Run(argv[1], argv[2]); return 0; }
++  catch (const std::exception& error) { std::fprintf(stderr, "Guest draw check failed: %s\n",error.what()); return 2; }
++}
+diff --git a/src/graphics/metal/command/graphics_system.cpp b/src/graphics/metal/command/graphics_system.cpp
+new file mode 100644
+index 0000000..af4c3b9
+--- /dev/null
++++ b/src/graphics/metal/command/graphics_system.cpp
+@@ -0,0 +1,27 @@
++// Native Metal provider/setup adaptation for ReXGlue's split GPU setup API.
++#include <rex/graphics/metal/graphics_system.h>
++#include <rex/graphics/metal/command_processor.h>
++#include <rex/ui/metal/provider.h>
++
++namespace rex::graphics::metal {
++MetalGraphicsSystem::~MetalGraphicsSystem() { Shutdown(); }
++void MetalGraphicsSystem::CreateProvider(bool with_presentation) {
++  provider_ = ui::metal::MetalProvider::Create(with_presentation);
++}
++std::unique_ptr<CommandProcessor> MetalGraphicsSystem::CreateCommandProcessor() {
++  return std::make_unique<MetalCommandProcessor>(this, kernel_state_);
++}
++bool MetalGraphicsSystem::InitializeOffscreen(memory::Memory& memory, uint32_t width, uint32_t height) {
++  if (command_processor_ || !memory.physical_membase()) return false;
++  memory_ = &memory;
++  CreateProvider(false);
++  if (!provider_) return false;
++  command_processor_ = CreateCommandProcessor();
++  if (!static_cast<MetalCommandProcessor*>(command_processor_.get())->InitializeOffscreen(width, height)) {
++    Shutdown();
++    return false;
++  }
++  return true;
++}
++void MetalGraphicsSystem::Shutdown() { GraphicsSystem::Shutdown(); }
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/command/ir_runtime.cpp b/src/graphics/metal/command/ir_runtime.cpp
+new file mode 100644
+index 0000000..3260e1c
+--- /dev/null
++++ b/src/graphics/metal/command/ir_runtime.cpp
+@@ -0,0 +1,6 @@
++// Adapted from Xenia-Alloy's metal_ir_runtime.cc.
++// Copyright 2026 Ben Vanik. BSD license; see SDK LICENSE.
++#include <Metal/Metal.hpp>
++#define IR_RUNTIME_METALCPP
++#define IR_PRIVATE_IMPLEMENTATION
++#include <metal_irconverter_runtime.h>

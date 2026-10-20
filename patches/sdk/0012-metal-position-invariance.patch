@@ -1,0 +1,39 @@
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -1750,6 +1750,11 @@
+   builder_->addMemberName(type_struct_per_vertex, kOutputPerVertexMemberPosition, "gl_Position");
+   builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
+                                 spv::DecorationBuiltIn, spv::BuiltInPosition);
++  // SPIRV-Cross checks the BuiltIn member decorations, not the block variable,
++  // when enabling Metal position invariance. Preserve identical rasterization
++  // across depth and color passes as intended by the block decoration below.
++  builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
++                                spv::DecorationInvariant);
+   if (output_per_vertex_member_clip_distance_ != UINT32_MAX) {
+     builder_->addMemberName(type_struct_per_vertex, output_per_vertex_member_clip_distance_,
+                             "gl_ClipDistance");
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -33,7 +33,7 @@
+     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
+     // prototyping stage (easier to do small granular updates with an
+     // incremental counter).
+-    static constexpr uint32_t kVersion = 12;
++    static constexpr uint32_t kVersion = 13;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -201,7 +201,7 @@
+     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
+ 
+     // Including all the padding, for a stable hash.
+-    static constexpr uint32_t kVersion = 0x20260228;
++    static constexpr uint32_t kVersion = 0x20261016;
+     PipelineDescription() {
+       Reset();
+     }

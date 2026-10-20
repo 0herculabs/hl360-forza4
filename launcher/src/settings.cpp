@@ -1,5 +1,7 @@
 ﻿#include "settings.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <random>
@@ -83,6 +85,7 @@ void Settings::ResetDisplay() {
   anisotropic_override = defaults.anisotropic_override;
   swap_post_effect = defaults.swap_post_effect;
   present_effect = defaults.present_effect;
+  fm4_frame_limit = defaults.fm4_frame_limit;
 }
 
 bool Settings::Load(const std::filesystem::path& file) {
@@ -110,12 +113,24 @@ bool Settings::Load(const std::filesystem::path& file) {
 
   ReadInt(t, "resolution_scale", resolution_scale);
   ReadInt(t, "anisotropic_override", anisotropic_override);
-  // Vulkan renders FM4 incorrectly: always D3D12 (drops stale values).
-  gpu_backend = "d3d12";
+  gpu_backend = Settings{}.gpu_backend;
+#if defined(__APPLE__)
+  Read(t, "gpu_backend", gpu_backend);
+  if (gpu_backend != "metal" && gpu_backend != "vulkan") gpu_backend = "vulkan";
+#endif
+  ReadInt(t, "fm4_frame_limit", fm4_frame_limit);
+  if (fm4_frame_limit != 30 && fm4_frame_limit != 60) fm4_frame_limit = 0;
+  // Migrate the old independent controls to mutually exclusive frame-rate modes.
+  if (fm4_frame_limit == 30) experimental_120fps = false;
+  else if (experimental_120fps) fm4_frame_limit = 0;
+  Read(t, "controller_vibration", controller_vibration);
   Read(t, "swap_post_effect", swap_post_effect);
   Read(t, "present_effect", present_effect);
 
   Read(t, "input_backend", input_backend);
+#if defined(__APPLE__)
+  input_backend = "sdl";
+#endif
   Read(t, "wheel_enabled", wheel.enabled);
   Read(t, "wheel_device", wheel.device);
   Read(t, "wheel_ffb", wheel.ffb); Read(t, "wheel_ffb_invert", wheel.ffb_invert);
@@ -161,6 +176,8 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("present_letterbox", present_letterbox);
 
   t.insert("gpu_backend", gpu_backend);
+  t.insert("fm4_frame_limit", fm4_frame_limit);
+  t.insert("controller_vibration", controller_vibration);
   t.insert("resolution_scale", resolution_scale);
   t.insert("anisotropic_override", anisotropic_override);
   t.insert("swap_post_effect", swap_post_effect);
@@ -256,6 +273,28 @@ bool IsValidGamertag(const std::string& name) {
     prev = c;
   }
   return true;
+}
+
+std::vector<Profile> DiscoverSavedProfiles(const std::filesystem::path& user_root) {
+  std::vector<Profile> profiles;
+  std::error_code ec;
+  std::filesystem::directory_iterator it(user_root, ec), end;
+  for (; !ec && it != end; it.increment(ec)) {
+    auto xuid = it->path().filename().u8string();
+    if (xuid.size() != 16 || xuid == "0000000000000000" ||
+        !std::all_of(xuid.begin(), xuid.end(), [](unsigned char c) { return std::isxdigit(c); }))
+      continue;
+    const auto save = it->path() / "4D530910/00000001/ForzaProfile";
+    std::error_code save_error;
+    if (!std::filesystem::is_regular_file(save / "ForzaProfile", save_error) ||
+        !std::filesystem::is_regular_file(save / "PlayerDatabase", save_error)) continue;
+    std::transform(xuid.begin(), xuid.end(), xuid.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    profiles.push_back({xuid == "B13EBABEBABEBABE" ? "User" : "Player " + xuid.substr(12), xuid});
+  }
+  std::sort(profiles.begin(), profiles.end(),
+            [](const Profile& a, const Profile& b) { return a.xuid < b.xuid; });
+  return profiles;
 }
 
 std::string GenerateXuid() {

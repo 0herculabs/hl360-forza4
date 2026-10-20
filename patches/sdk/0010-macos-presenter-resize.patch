@@ -1,0 +1,32 @@
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -764,6 +764,11 @@
+   // awaiting completion of the usage of the swapchain and the surface on the
+   // GPU.
+   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
++#if REX_PLATFORM_MAC
++    // MoltenVK can present black after an old-swapchain handoff on resize.
++    // Recreate the Metal-backed surface after waiting for its GPU users.
++    paint_context_.DestroySwapchainAndVulkanSurface();
++#else
+     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+     bool surface_unusable;
+     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+@@ -778,6 +783,7 @@
+       // Couldn't create the swapchain for the existing surface - start over.
+       paint_context_.DestroySwapchainAndVulkanSurface();
+     }
++#endif
+   }
+ 
+   // If failed to create the swapchain for the previous surface, recreate the
+@@ -1840,6 +1846,8 @@
+                 swapchain_effect, paint_context_.swapchain_render_pass);
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
++            } else {
++              swapchain_effect_pipeline.swapchain_format = paint_context_.swapchain_render_pass_format;
+             }
+           }
+         }

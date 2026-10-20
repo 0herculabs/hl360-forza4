@@ -1,4 +1,12 @@
-﻿// fm4-launcher - profiles, settings and game install for the recompiled
+#if defined(_WIN32)
+#define FM4_GAME_EXECUTABLE "fm4.exe"
+#define FM4_TOOL_EXECUTABLE "fm4tool.exe"
+#else
+#define FM4_GAME_EXECUTABLE "fm4"
+#define FM4_TOOL_EXECUTABLE "fm4tool"
+#endif
+
+// fm4-launcher - profiles, settings and game install for the recompiled
 // Forza Motorsport 4. Sits next to fm4.exe; writes fm4.user.toml (read by the
 // game after its own fm4.toml) and launches the game.
 //
@@ -39,6 +47,7 @@
 #include "installer.h"
 #include "graphics_fixes.h"
 #include "settings.h"
+#include "package_path.h"
 
 namespace fs = std::filesystem;
 using namespace launcher;
@@ -326,6 +335,9 @@ struct App {
     if (!settings.Load(user_config)) {
       if (state.spanish) settings.user_language = 5;
       settings.Load(port_config);
+      // Preserve saves and installed content from direct game launches.
+      if (settings.user_data_root.empty() && fs::is_directory(exe_dir / "user"))
+        settings.user_data_root = (exe_dir / "user").u8string();
       // Development builds discover the extracted discs in this workspace.
       for (auto root = exe_dir.parent_path(); !root.empty(); root = root.parent_path()) {
         if (fs::exists(root / "fm4_manifest.toml") && fs::exists(root / "game/disc1/default.xex")) {
@@ -338,6 +350,12 @@ struct App {
       if (!state.legacy_game_dir.empty()) settings.game_data_root = state.legacy_game_dir;
       if (!state.legacy_user_dir.empty()) settings.user_data_root = state.legacy_user_dir;
     }
+#if defined(__APPLE__)
+    if (settings.gpu_backend == "metal" && !fs::exists(exe_dir / "metal-backend.json"))
+      settings.gpu_backend = "vulkan";
+#endif
+    if (state.profiles.empty() && settings.profile_xuid.empty())
+      state.profiles = DiscoverSavedProfiles(UserDir());
     if (state.profiles.empty()) {
       state.profiles.push_back({IsValidGamertag(settings.profile_name) ? settings.profile_name : "Player",
                                 settings.profile_xuid.size() == 16 ? settings.profile_xuid : GenerateXuid()});
@@ -547,7 +565,9 @@ struct App {
                     L("). The log and crash report are in the logs folder.",
                       "). El registro y el informe de fallo están en la carpeta logs.");
       } else {
+#if !defined(__APPLE__)
         DeleteSessionLogs();
+#endif
       }
     }
   }
@@ -860,8 +880,13 @@ void TabInstructions(App& app) {
   BeginCard("##quickstart",L("Getting started", "Primeros pasos"),
       L("Install your discs, choose a profile and play. Project Forza Plus 4 and wheel support are optional.",
         "Instala tus discos, elige un perfil y juega. Project Forza Plus 4 y el volante son opcionales."));
+#if defined(__APPLE__)
+  ImGui::TextWrapped("%s", L("Keep the launcher bundle, game, tools and libraries together in a writable folder. This experimental build requires Apple Silicon and a matching Metal or MoltenVK runtime.",
+      "Mantén el lanzador, juego, herramientas y bibliotecas en una carpeta con permisos de escritura. Esta versión experimental requiere Apple Silicon y Metal o MoltenVK."));
+#else
   ImGui::TextWrapped("%s",L("Keep the launcher, executables and DLLs together. A short folder such as C:\\Games\\FM4 helps avoid long paths. Requires a Direct3D 12 GPU and the Visual C++ 2015-2022 x64 runtime.",
       "Mantén el launcher, los ejecutables y las DLL juntos. Una carpeta corta como C:\\Games\\FM4 evita problemas de rutas largas. Requiere una GPU Direct3D 12 y Visual C++ 2015-2022 x64."));
+#endif
   EndCard();
   BeginCard("##compatibleisos",L("1. Compatible disc images", "1. Imágenes de disco compatibles"));
   ImGui::TextWrapped("%s",L("Forza Motorsport 4 - USA, Rev 1 (multilanguage). Extract the .iso from its ZIP before selecting it. The MD5 values below identify the ISO contents, not the ZIP archive.",
@@ -1056,6 +1081,15 @@ void TabGraphics(App& app) {
 
   BeginCard("##display", L("Display", "Pantalla"));
   if (BeginRows("##d")) {
+#if defined(__APPLE__)
+    Row(L("Renderer", "Renderizador"));
+    if (fs::exists(app.exe_dir / "metal-backend.json")) {
+      changed |= Segmented<std::string>("renderer", s.gpu_backend,
+                                        {{"vulkan", "Vulkan"}, {"metal", "Metal"}});
+    } else {
+      ImGui::TextUnformatted("Vulkan");
+    }
+#endif
     Row(L("Mode", "Modo"));
     int mode = s.fullscreen ? 1 : 0;
     if (Segmented<int>("mode", mode, {{1, L("Fullscreen", "Pantalla completa")}, {0, L("Window", "Ventana")}})) {
@@ -1091,14 +1125,25 @@ void TabGraphics(App& app) {
     Row(L("Keep 16:9", "Mantener 16:9"));
     changed |= Toggle("##letterbox", &s.present_letterbox);
     Row(L("Frame rate", "Fotogramas por segundo"));
-    changed |= Segmented<bool>("##framerate",s.experimental_120fps,
-        {{false,"60 FPS / 60 Hz"},{true,"120 FPS / 120 Hz"}});
+    int frame_rate = s.fm4_frame_limit == 30 ? 30 : (s.experimental_120fps ? 120 : 60);
+    if (Segmented<int>("##framerate", frame_rate,
+        {{30, "30 FPS"}, {60, "60 FPS / 60 Hz"}, {120, "120 FPS / 120 Hz"}})) {
+      s.fm4_frame_limit = frame_rate == 30 ? 30 : 0;
+      s.experimental_120fps = frame_rate == 120;
+      changed = true;
+    }
     EndRows();
+  }
+  if (s.fm4_frame_limit == 30) {
+    TextColored(kWarn, L("30 FPS mode - restart the game to apply.",
+        "Modo de 30 FPS - reinicia el juego para aplicarlo."));
+    ImGui::TextWrapped("%s", L("Limits presentation to 30 FPS while retaining 60 Hz guest timing and normal game speed.",
+        "Limita la presentación a 30 FPS y mantiene el refresco virtual a 60 Hz y la velocidad normal del juego."));
   }
   if(s.experimental_120fps) {
     TextColored(kWarn,L("Experimental 120 FPS mode - restart the game to apply.", "Modo experimental de 120 FPS - reinicia el juego para aplicarlo."));
-    ImGui::TextWrapped("%s",L("Sets the guest refresh target to 120 Hz. Set Windows to 120 Hz or higher. Actual FPS depend on performance; physics, animations and audio at 120 Hz still require validation. Return to 60 FPS if timing changes.",
-        "Configura el refresco virtual a 120 Hz. Ajusta Windows a 120 Hz o más. Los FPS reales dependen del rendimiento; física, animaciones y audio a 120 Hz están pendientes de validar. Vuelve a 60 FPS si cambia la velocidad del juego."));
+    ImGui::TextWrapped("%s",L("Sets the guest refresh target to 120 Hz. Set your display to 120 Hz or higher. Actual FPS depend on performance; physics, animations and audio at 120 Hz still require validation. Return to 60 FPS if timing changes.",
+        "Configura el refresco virtual a 120 Hz. Ajusta la pantalla a 120 Hz o más. Los FPS reales dependen del rendimiento; física, animaciones y audio a 120 Hz están pendientes de validar. Vuelve a 60 FPS si cambia la velocidad del juego."));
   }
   EndCard();
 
@@ -1379,8 +1424,14 @@ void TabControls(App& app) {
 
   BeginCard("##pad", L("Controller", "Mando"));
   if (BeginRows("##p")) {
+    Row(L("Controller vibration", "Vibración del mando"));
+    changed |= Toggle("##vibration", &s.controller_vibration);
     Row(L("Input system", "Sistema de entrada"));
+#if defined(__APPLE__)
+    ImGui::TextUnformatted("SDL");
+#else
     changed |= Segmented<std::string>("backend", s.input_backend, {{"sdl", "SDL"}, {"xinput", "XInput"}});
+#endif
     EndRows();
   }
   EndCard();
@@ -1627,7 +1678,12 @@ void TabInstall(App& app) {
   BeginCard("##forzaplus", L("Step 3 - Project Forza Plus 4 (optional)", "Paso 3 - Project Forza Plus 4 (opcional)"),
       L("Separate installation and saves. Requires extra disk space for a copy of Disc 1 and installed content. Native data adaptation; gameplay compatibility is still being tested.",
         "Instalacion y partidas separadas. Requiere espacio adicional para copiar el Disco 1 y el contenido instalado. Adaptacion de datos al port; compatibilidad en pruebas."));
+#if defined(__APPLE__)
+  TextDim(L("Forza Plus installation requires Windows PowerShell.", "La instalación de Forza Plus requiere Windows PowerShell."));
+  ImGui::BeginDisabled(true);
+#else
   ImGui::BeginDisabled(app.TaskRunning() || app.game);
+#endif
   const auto base_game = app.BaseGameDir(), base_user = app.BaseUserDir();
   const bool ready = fs::exists(base_game / ".fm4-plus/.fm4-plus-ready") && fs::exists(base_user / ".fm4-plus/.fm4-plus-ready");
   ImGui::BeginDisabled(ready);
@@ -1863,7 +1919,7 @@ int RunHeadless(int argc, char** argv) {
     }
   }
   std::ofstream log(log_path.empty() ? "launcher-headless.log" : log_path);
-  const fs::path exe_dir = fs::u8path(SDL_GetBasePath());
+  const fs::path exe_dir = PackageDirectory(fs::u8path(SDL_GetBasePath()));
   const auto manifest = LoadManifest(exe_dir / "game_files.sha256");
   if (manifest.empty() || dir.empty()) {
     log << "error: missing game_files.sha256 or --game-dir\n";
@@ -1900,7 +1956,7 @@ int RunHeadless(int argc, char** argv) {
         ok = false;
       } else {
         ok = InstallContentDisc(fs::u8path(iso), fs::u8path(dir), fs::u8path(user_dir),
-                                exe_dir / "fm4tool.exe", progress);
+                                exe_dir / FM4_TOOL_EXECUTABLE, progress);
         log << "content: " << (ok ? "ok" : "FAILED") << " - " << progress.Status() << std::endl;
         log << "packages: " << CountContentPackages(fs::u8path(user_dir)) << "/" << kContentPackages << std::endl;
       }
@@ -1946,7 +2002,7 @@ int RunHeadless(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  fm4::InstallCrashHandler(fs::u8path(SDL_GetBasePath()) / "logs");
+  fm4::InstallCrashHandler(PackageDirectory(fs::u8path(SDL_GetBasePath())) / "logs");
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--import-iso" || a == "--verify" || a == "--race-shadows") {
@@ -1958,13 +2014,13 @@ int main(int argc, char** argv) {
     return 1;
   }
   App app;
-  app.exe_dir = fs::u8path(SDL_GetBasePath());
+  app.exe_dir = PackageDirectory(fs::u8path(SDL_GetBasePath()));
   app.user_config = app.exe_dir / "fm4.user.toml";
   app.port_config = app.exe_dir / "fm4.toml";
   app.launcher_config = app.exe_dir / "launcher.toml";
   app.manifest_path = app.exe_dir / "game_files.sha256";
-  app.game_exe = app.exe_dir / "fm4.exe";
-  app.tool_exe = app.exe_dir / "fm4tool.exe";
+  app.game_exe = app.exe_dir / FM4_GAME_EXECUTABLE;
+  app.tool_exe = app.exe_dir / FM4_TOOL_EXECUTABLE;
   app.cover_path = app.exe_dir / "cover.jpg";
   app.Load();
   app.manifest = LoadManifest(app.manifest_path);
@@ -2007,6 +2063,11 @@ int main(int argc, char** argv) {
   const char* bold = "C:\\Windows\\Fonts\\seguisb.ttf";
   // Segoe UI lacks arrows and a few symbols (â†º â† â†‘); merge Segoe UI Symbol in.
   const char* symbols = "C:\\Windows\\Fonts\\seguisym.ttf";
+#if defined(__APPLE__)
+  regular = "/System/Library/Fonts/Supplemental/Arial.ttf";
+  bold = "/System/Library/Fonts/Supplemental/Arial Bold.ttf";
+  symbols = "/System/Library/Fonts/Apple Symbols.ttf";
+#endif
   ImFontConfig merge;
   merge.MergeMode = true;
   if (fs::exists(regular)) {

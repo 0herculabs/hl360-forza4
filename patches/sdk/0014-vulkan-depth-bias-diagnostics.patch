@@ -1,0 +1,57 @@
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -16,6 +16,7 @@
+ #include <cstring>
+ #include <iterator>
+ #include <mutex>
++#include <set>
+ #include <string>
+ #include <string_view>
+ #include <tuple>
+@@ -48,6 +49,10 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_BOOL(vulkan_log_depth_bias, false, "GPU/Vulkan",
++                    "Log up to 512 unique depth-bias shader/state combinations for diagnosis")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -5755,6 +5760,35 @@
+     // background is more likely.
+     depth_bias_slope_factor *= xenos::kPolygonOffsetScaleSubpixelUnit *
+                                float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
++    if (REXCVAR_GET(vulkan_log_depth_bias)) {
++      // Include zero bias to identify passes that may redraw biased geometry.
++      // Keep this bounded and opt-in: these are state variants, not draw counts.
++      static thread_local std::set<std::array<uint64_t, 5>> logged;
++      const auto* vs = active_vertex_shader();
++      const auto* ps = active_pixel_shader();
++      uint32_t constant_bits, slope_bits;
++      std::memcpy(&constant_bits, &depth_bias_constant_factor, sizeof(constant_bits));
++      std::memcpy(&slope_bits, &depth_bias_slope_factor, sizeof(slope_bits));
++      const uint32_t depth_format = uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format);
++      const std::array<uint64_t, 5> key = {
++          vs ? vs->ucode_data_hash() : 0, ps ? ps->ucode_data_hash() : 0,
++          uint64_t(constant_bits) | (uint64_t(slope_bits) << 32),
++          normalized_depth_control.value,
++          uint64_t(depth_format) | (uint64_t(primitive_polygonal) << 32)};
++      if (logged.size() < 512 && logged.insert(key).second) {
++        REXGPU_INFO(
++            "depth_bias_state: frame={} vs={:016X} ps={:016X} format={} "
++            "compare={} write={} stencil={} polygonal={} constant={:.9g} slope={:.9g}",
++            frame_current_, key[0], key[1], depth_format,
++            uint32_t(normalized_depth_control.zfunc),
++            uint32_t(normalized_depth_control.z_write_enable),
++            uint32_t(normalized_depth_control.stencil_enable), primitive_polygonal,
++            depth_bias_constant_factor, depth_bias_slope_factor);
++        if (logged.size() == 512) {
++          REXGPU_INFO("depth_bias_state: diagnostic limit reached (512 unique states)");
++        }
++      }
++    }
+     // std::memcmp instead of != so in case of NaN, every draw won't be
+     // invalidating it.
+     dynamic_depth_bias_update_needed_ |=

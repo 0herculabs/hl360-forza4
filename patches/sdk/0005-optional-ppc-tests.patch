@@ -1,0 +1,11 @@
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -5,3 +5,6 @@ add_subdirectory(unit)
+ 
+ # PPC instruction tests (requires PPC toolchain)
+-add_subdirectory(ppc)
++option(REXGLUE_BUILD_PPC_TESTS "Build tests requiring a host-compatible PPC assembler" ON)
++if(REXGLUE_BUILD_PPC_TESTS)
++    add_subdirectory(ppc)
++endif()
