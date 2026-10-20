@@ -8,7 +8,8 @@ into FM4. FM3 gameplay results are not FM4 validation results.
 ## Build
 
 Use a native ARM64 terminal, Xcode command-line tools with C++23 support,
-Python 3, CMake 3.25+ and Ninja. Create a dedicated SDK checkout; the builder
+Python 3, CMake 3.25+ and Ninja. Build helpers explicitly target macOS 14.0
+instead of inheriting the build host’s OS version. Create a dedicated SDK checkout; the builder
 checks its revision and applies the ordered patch stack without resetting it.
 
 ```sh
@@ -30,7 +31,8 @@ python3 tools/Build-Metal.py --alloy-source /path/to/xenia-alloy --game-backend
 ```
 
 Metal requires the locally built converter dependencies from Xenia Alloy, as
-in the FM3 port. They are not downloaded or redistributed by this project.
+in the FM3 port. They are not downloaded by the build helpers. Release packages include the
+runtime libraries and their notices.
 Keep dependency licenses and notices. The Metal staging command copies matching
 runtime/plugin libraries into `out/macos/game-build-metal` and creates
 `FM4 Launcher.app`. Keep that bundle beside the game, tools, configuration and
@@ -77,3 +79,36 @@ on macOS. The normal Disc 1/Disc 2 extraction tools use SDL child processes and
 native executable names.
 
 See [Metal validation](MACOS_METAL.md) and [performance investigation](MACOS_PERFORMANCE.md) for test modes, the first-race analysis and launch choices.
+
+## Release packaging
+
+Use `tools/Package-Mac.py --build-dir out/macos/game-build-metal --version VERSION`
+to create an allowlisted ZIP and SHA256 checksum. It excludes game dumps, DLC,
+profiles, caches and personal settings, removes development paths from the base
+config, checks every Mach-O deployment target and library dependency, and
+re-signs the Finder launcher. Dependencies must also be rebuilt for the chosen
+minimum macOS version; changing bundle metadata alone is insufficient.
+
+The Metal renderer targets macOS 14 Sonoma or later on Apple Silicon. Apple’s
+[shader converter requirements](https://developer.apple.com/metal/shader-converter/)
+set macOS 14 as the baseline for its full generated-library feature set. An
+explicit deployment target does not replace runtime testing on older macOS.
+
+If the Alloy DXIL converter binary targets a newer OS, rebuild it in a separate
+workspace directory before staging. For the pinned local Alloy sources:
+
+```sh
+cmake -S /path/to/xenia-alloy/third_party/DirectXShaderCompiler-mac \
+  -B out/macos/dxilconv-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_STANDARD=17 \
+  -DD3D12_INCLUDE_DIR=/path/to/xenia-alloy/third_party/DirectX-Headers/include/directx \
+  -DDXGI_INCLUDE_DIR=/path/to/xenia-alloy/third_party/DirectX-Headers/include/directx \
+  -DHLSL_BUILD_DXILCONV=ON -DHLSL_INCLUDE_TESTS=OFF \
+  -DLLVM_TARGETS_TO_BUILD=None -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DLLVM_ENABLE_BINDINGS=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+  -DLLVM_ENABLE_EH=ON -DLLVM_ENABLE_RTTI=ON
+cmake --build out/macos/dxilconv-build --target dxilconv LLVMDxcSupport --parallel 4
+python3 tools/Build-Metal.py --alloy-source /path/to/xenia-alloy \
+  --dxil-build out/macos/dxilconv-build --game-backend
+```

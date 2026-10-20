@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import struct
@@ -37,19 +38,12 @@ def merge_tree(source, destination):
             copy_fixture_file(entry, output)
 
 
-def stage_game(sdk, deps, jobs, profile_fixture=None, profile_xuid=None, cache_fixture=None, stage_dir=None):
+def stage_game(sdk, deps, jobs, profile_fixture=None, profile_xuid=None, cache_fixture=None, stage_dir=None, deployment_target="14.0"):
     build = OUT / "game-build"
     if not (build / "CMakeCache.txt").is_file():
         raise ValueError("Build the baseline game once before staging Metal")
-    baseline = OUT / "vulkan-baseline-before-metal"
     names = ("fm4", "fm4-launcher", "fm4tool", "fm4.toml", "game_files.sha256", "cover.jpg")
-    if not baseline.exists():
-        baseline.mkdir()
-        for source in [*(build / name for name in names), *build.glob("*.dylib")]:
-            if source.is_file():
-                shutil.copy2(source, baseline / source.name)
-        (baseline / "files.json").write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in baseline.iterdir() if p.is_file()}, indent=2) + "\n")
+    run(["cmake", "-S", ROOT, "-B", build, f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"])
     run(["cmake", "--build", build, "--target", "fm4", "fm4-launcher", "fm4-launcher-tests",
          "--parallel", jobs])
     run([build / "fm4-launcher-tests"])
@@ -138,6 +132,8 @@ def main():
     parser.add_argument("--profile-fixture", type=Path, help="Profile fixture copied by the staged launch command into each isolated run")
     parser.add_argument("--profile-xuid", help="Imported profile XUID for the staged launch command")
     parser.add_argument("--cache-fixture", type=Path, help="Read-only cache fixture copied into each isolated game run")
+    parser.add_argument("--dxil-build", type=Path, help="DXIL converter build for the chosen minimum macOS version")
+    parser.add_argument("--deployment-target", default="14.0", help="Minimum macOS version (default: 14.0)")
     parser.add_argument("--jobs", type=int, default=4)
     args = parser.parse_args()
     if platform.system() != "Darwin" or platform.machine() != "arm64":
@@ -171,8 +167,20 @@ def main():
             if source.is_file() and (source.suffix in (".cpp", ".hpp", ".h") or source.name == "LICENSE"):
                 shutil.copy2(source, deps / "spirv-cross" / source.name)
     for target, source in files.items():
+        if args.dxil_build and target.startswith("lib/") and "dxilconv-build/" in source:
+            source_path = args.dxil_build / "lib" / Path(source).name
+        else:
+            source_path = alloy / source
         (deps / target).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(alloy / source, deps / target)
+        shutil.copy2(source_path, deps / target)
+    # A lower executable target cannot make a newer converter load on older macOS.
+    for name in ("libdxilconv.dylib", "libmetalirconverter.dylib"):
+        versions = re.findall(r"\bminos\s+([\d.]+)", subprocess.check_output(
+            ["xcrun", "vtool", "-show-build", str(deps / "lib" / name)], text=True))
+        minimum = tuple(map(int, args.deployment_target.split(".")))
+        if not versions or any(tuple(map(int, v.split("."))) > minimum for v in versions):
+            parser.error(f"{name} targets {versions}; rebuild it for macOS {args.deployment_target} "
+                         "and use --dxil-build for a matching DXIL converter build")
     # Retain upstream notices with the local, untracked dependency copies.
     for source in ("LICENSE", "third_party/DirectXShaderCompiler-mac/LICENSE.TXT",
                    "third_party/metal-shader-converter/README.md"):
@@ -194,6 +202,7 @@ def main():
     full_backend = args.game_backend or args.runtime_cache or args.window_check
     run(["cmake", "-S", sdk, "-B", args.sdk_build,
          "-DREXGLUE_BUILD_METAL_SHADER_TOOLS=ON", f"-DREXGLUE_METAL_DEPS_ROOT={deps}",
+         f"-DCMAKE_OSX_DEPLOYMENT_TARGET={args.deployment_target}",
          *(["-DREXGLUE_USE_METAL=ON"] if full_backend else [])])
     run(["cmake", "--build", args.sdk_build, "--target", "rex-metal-shader-check",
          "rex-metal-submission-check", "rex-metal-memory-check", "rex-metal-draw-check",
@@ -205,7 +214,7 @@ def main():
     if args.window_check:
         run(["python3", ROOT / "tools/Check-Metal.py", "--plugin", sdk / "out/mac-arm64/librexgpu-xenos.dylib", "--window"])
     if args.game_backend:
-        stage_game(sdk, deps, args.jobs, args.profile_fixture, args.profile_xuid, args.cache_fixture, args.stage_dir)
+        stage_game(sdk, deps, args.jobs, args.profile_fixture, args.profile_xuid, args.cache_fixture, args.stage_dir, args.deployment_target)
     if args.native_check:
         for name in ("rex-metal-submission-check", "rex-metal-memory-check"):
             run([sdk / "out/mac-arm64" / name])

@@ -45,7 +45,7 @@ vibration checks also remain separate acceptance work.
 On Apple M3, ARM64 macOS 27.0.1 and Apple Clang 21:
 
 - The SDK suite passed: 209 tests passed and four existing BitStream tests skipped.
-- The tools-only build passed all 10 CTest checks (including 12 Python tooling tests).
+- The tools-only build passed all 10 CTest checks (including 14 Python tooling tests).
 - The game and both recompiled guest DLLs built; all 12 game CTest checks passed.
 - Disc 1 passed the full file manifest; all four Disc 2 content packs installed.
 - MoltenVK passed GPU fill, completion-fence and CPU readback checks.
@@ -55,5 +55,6 @@ On Apple M3, ARM64 macOS 27.0.1 and Apple Clang 21:
 Manual FM4 testing through the launcher confirmed rendering and racing on Metal,
 normal game speed in 30 FPS mode, and smoother racing after the logging changes.
 The launcher profile-path mismatch was corrected to preserve direct-launch saves.
+The sun-glare workaround was confirmed on an affected FM4 track.
 Stable frame rates across all tracks and physical controller/wheel behavior
 remain unverified.

@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--sdk-install", type=Path, default=OUT / "sdk-install")
     parser.add_argument("--window-smoke", action="store_true", help="Exercise presentation and resize in the smoke stage")
     parser.add_argument("--build-dir", type=Path, help="Override the tools/game build directory")
+    parser.add_argument("--deployment-target", default="14.0", help="Minimum macOS version (default: 14.0)")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
     args = parser.parse_args()
     if args.window_smoke and args.stage != "smoke":
@@ -75,10 +76,11 @@ int main() {
 }
 ''')
         run([cxx, "-std=c++23", "-arch", "arm64", "-isysroot", sysroot,
-             probe, "-o", OUT / "preflight"])
+             f"-mmacosx-version-min={args.deployment_target}", probe, "-o", OUT / "preflight"])
         run([OUT / "preflight"])
         common = ["-G", "Ninja", f"-DCMAKE_C_COMPILER={cc}", f"-DCMAKE_CXX_COMPILER={cxx}",
                   "-DCMAKE_OSX_ARCHITECTURES=arm64", f"-DCMAKE_OSX_SYSROOT={sysroot}",
+                  f"-DCMAKE_OSX_DEPLOYMENT_TARGET={args.deployment_target}",
                   "-DCMAKE_BUILD_TYPE=Release"]
         source, install = args.sdk_source.resolve(), args.sdk_install.resolve()
         if args.stage == "sdk":
