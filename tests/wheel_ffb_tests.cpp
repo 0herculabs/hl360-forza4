@@ -22,6 +22,9 @@ void OperateEffect(int id,bool start) {operations.emplace_back(id,start);}
 void ResetEffects() {++resets;}
 void SetDriving(bool value) {driving=value;}
 }
+namespace fm4::telemetry {
+void NoteDriving(bool) {}
+}
 #define STUB(name) \
 extern "C" void name(PPCContext&,uint8_t*); \
 extern "C" void __imp__##name(PPCContext&,uint8_t*) {++forwarded;}

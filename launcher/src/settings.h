@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-#include "../../src/wheel.h"
+#include "../../src/wheel_mapping.h"
 
 namespace launcher {
 
@@ -53,7 +53,7 @@ struct Settings {
 
   // Input
   std::string input_backend = "sdl";  // sdl | xinput
-  fm4::wheel::Config wheel;
+  fm4::wheel::Settings wheel;  // wheel_* and telemetry_* keys
   bool mnk_mode = true;
   bool mnk_mouse = false;
   double mnk_sensitivity = 1.0;
