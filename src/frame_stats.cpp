@@ -13,6 +13,8 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 
+#include "wide_view.h"
+
 REXCVAR_DEFINE_BOOL(frame_stats, false, "FM4/Debug", "Log frame pacing statistics every 5 seconds");
 
 extern "C" void __imp__sub_8237F598(PPCContext& __restrict ctx, uint8_t* base);
@@ -31,6 +33,7 @@ struct Stats {
 
 // Overrides the weak alias the generated code calls.
 extern "C" void sub_8237F598(PPCContext& __restrict ctx, uint8_t* base) {
+  fm4::wide_view::OnFrame();
   if (!REXCVAR_GET(frame_stats)) {
     __imp__sub_8237F598(ctx, base);
     return;

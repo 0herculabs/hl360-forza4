@@ -23,6 +23,10 @@ int main() {
     Check(buttons[3].axis==3 && buttons[3].device=="0eb7:0004" && buttons[3].xbuttons==0x2000,"Lever axis as B");
     Check(buttons[4].gear==1 && buttons[5].gear==-1,"Shifter gates");
     Check(buttons[6].left_trigger,"LT target");
+    auto camera=ParseButtonBindings("CAM_FOV_IN=4,cam_seat_reset=h0.left");
+    Check(camera.size()==2 && camera[0].camera==int(CameraAction::kFovIn) && !camera[0].xbuttons &&
+          camera[1].camera==int(CameraAction::kSeatReset) && camera[1].hat_mask==8 && buttons[0].camera<0,"Camera actions");
+    Check(std::string(CameraActionName(CameraAction::kSeatForward))=="CAM_SEAT_FORWARD","Camera action names");
     Check(ButtonsFromNames("B")==0x2000 && ButtonsFromNames("A+LB")==0x1100 && ButtonsFromNames("")==0,"Clutch button names");
 
     // Device matching.
@@ -37,6 +41,16 @@ int main() {
     Check(SteeringFromAxis(0,false,100,0)==0 && SteeringFromAxis(32767,false,100,0)==32767,"Steering ends");
     Check(SteeringFromAxis(-32768,false,100,0)==-32767 && SteeringFromAxis(32767,true,100,0)==-32767,"Steering invert");
     Check(SteeringFromAxis(16384,false,200,0)==32767,"Steering sensitivity reaches lock at half rotation");
+    {
+      Settings rotation;
+      Check(SteeringScale(rotation)==100,"Rotation off keeps the sensitivity");
+      rotation.wheel_rotation=900; rotation.game_rotation=360;
+      Check(SteeringScale(rotation)==250,"900 degree wheel on a 360 degree game wheel");
+      // Half of 360 degrees on a 900 degree wheel: 180 / 450 of half travel reaches full lock.
+      Check(SteeringFromAxis(int16_t(32767*180/450),false,SteeringScale(rotation),0)>=32760,"Full lock at the game's rotation");
+      rotation.steering_scale=50;
+      Check(SteeringScale(rotation)==125,"Sensitivity still applies with the rotation");
+    }
     Check(SteeringFromAxis(1000,false,100,5)==0,"Steering deadzone");
     Check(PedalFromAxis(-32768,AxisDirection::kNormal,0,0)==0 && PedalFromAxis(32767,AxisDirection::kNormal,0,0)==255,"Pedal ends");
     Check(PedalFromAxis(32767,AxisDirection::kInverted,0,0)==0,"Inverted pedal rest");
@@ -53,6 +67,17 @@ int main() {
     Check(std::abs(EffectConstantLevel(constant,tuning)-8191)<=1,"Strength scales force");
     tuning.invert=true;
     Check(EffectConstantLevel(constant,tuning)<0,"Invert reverses force");
+    {
+      // The game's force opposes the steering's sign; SDL's runs the other way.
+      Settings normal;
+      Check(TuningFrom(normal).invert && EffectConstantLevel(constant,TuningFrom(normal))<0,"Game force negated for SDL");
+      normal.ffb_invert=true;
+      Check(!TuningFrom(normal).invert,"Reverse force direction undoes it");
+      normal.ffb_strength=100;
+      const int16_t at100=TestForceLevel(normal);
+      normal.ffb_strength=200;
+      Check(at100==16383 && TestForceLevel(normal)==32767,"Test force follows Strength");
+    }
     tuning={}; tuning.strength=100; tuning.min_force=10;
     constant.magnitude=1;
     Check(EffectConstantLevel(constant,tuning)>=3276,"Minimum force lifts small forces");
@@ -77,12 +102,15 @@ int main() {
     launcher::Settings out;
     out.wheel.enabled=true; out.wheel.device="0eb7:0004"; out.wheel.throttle="SimJack|+axis0";
     out.wheel.buttons="RB=4,LB=5,B=SimJack|-axis3"; out.wheel.ffb_strength=40; out.wheel.telemetry_udp=true;
-    out.wheel.deadzone_top={{5,0,2}};
+    out.wheel.deadzone_top={{5,0,2}}; out.wheel.wheel_rotation=1080; out.wheel.game_rotation=540;
+    out.display_wide_view=false;
+    out.display_hud_edges=true;
     Check(out.Save(dir/"user.toml"),"Settings save");
     launcher::Settings in;
     Check(in.Load(dir/"user.toml"),"Settings load");
     Check(in.wheel.device==out.wheel.device && in.wheel.throttle==out.wheel.throttle && in.wheel.buttons==out.wheel.buttons &&
-          in.wheel.ffb_strength==40 && in.wheel.telemetry_udp && in.wheel.deadzone_top[0]==5 && in.wheel.deadzone_top[2]==2,
+          in.wheel.ffb_strength==40 && in.wheel.telemetry_udp && in.wheel.deadzone_top[0]==5 && in.wheel.deadzone_top[2]==2 &&
+          in.wheel.wheel_rotation==1080 && in.wheel.game_rotation==540 && !in.display_wide_view && in.display_hud_edges,
           "Settings round trip");
     {
       std::ofstream old(dir/"old.toml");

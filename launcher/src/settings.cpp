@@ -38,6 +38,18 @@ const KeyBind kDefaultBinds[] = {
     {"rstick_left", "Look left", "Mirar a la izquierda", "Camera", "Cámara", "Left", {}},
     {"rstick_right", "Look right", "Mirar a la derecha", "Camera", "Cámara", "Right", {}},
     {"rstick_press", "Right stick click", "Pulsar stick derecho", "Camera", "Cámara", "K", {}},
+    // The game's camera adjustments (src/camera_view.cpp), with or without the keyboard pad.
+    {"camera_fov_in", "Field of view: narrower", "Campo de visión: más estrecho", "Field of view", "Campo de visión",
+     "Plus,NumpadPlus", {}, true},
+    {"camera_fov_out", "Field of view: wider", "Campo de visión: más amplio", "Field of view", "Campo de visión",
+     "Minus,NumpadMinus", {}, true},
+    {"camera_fov_reset", "Field of view: default", "Campo de visión: original", "Field of view", "Campo de visión",
+     "0,Numpad0", {}, true},
+    {"camera_seat_up", "Seat up", "Asiento arriba", "Seat position", "Posición del asiento", "PageUp", {}, true},
+    {"camera_seat_down", "Seat down", "Asiento abajo", "Seat position", "Posición del asiento", "PageDown", {}, true},
+    {"camera_seat_forward", "Seat forward", "Asiento adelante", "Seat position", "Posición del asiento", "Home", {}, true},
+    {"camera_seat_back", "Seat back", "Asiento atrás", "Seat position", "Posición del asiento", "End", {}, true},
+    {"camera_seat_reset", "Seat: default", "Asiento: original", "Seat position", "Posición del asiento", "Insert", {}, true},
 };
 
 template <typename T>
@@ -73,6 +85,8 @@ void ReadWheel(const toml::table& t, fm4::wheel::Settings& w) {
   Read(t, "wheel_steering_invert", w.steering_invert);
   ReadInt(t, "wheel_steering_scale", w.steering_scale);
   ReadInt(t, "wheel_steering_deadzone", w.steering_deadzone);
+  ReadInt(t, "wheel_rotation", w.wheel_rotation);
+  ReadInt(t, "wheel_game_rotation", w.game_rotation);
   Read(t, "wheel_throttle", w.throttle);
   Read(t, "wheel_brake", w.brake);
   Read(t, "wheel_clutch", w.clutch);
@@ -152,6 +166,8 @@ void WriteWheel(toml::table& t, const fm4::wheel::Settings& w) {
   t.insert("wheel_steering_invert", w.steering_invert);
   t.insert("wheel_steering_scale", std::clamp(w.steering_scale, 10, 1000));
   t.insert("wheel_steering_deadzone", std::clamp(w.steering_deadzone, 0, 50));
+  t.insert("wheel_rotation", std::clamp(w.wheel_rotation, 90, 3600));
+  t.insert("wheel_game_rotation", w.game_rotation > 0 ? std::clamp(w.game_rotation, 90, 3600) : 0);
   t.insert("wheel_throttle", w.throttle);
   t.insert("wheel_brake", w.brake);
   t.insert("wheel_clutch", w.clutch);
@@ -185,11 +201,15 @@ void WriteWheel(toml::table& t, const fm4::wheel::Settings& w) {
 
 }  // namespace
 
-Settings::Settings() { ResetBinds(); }
-
-void Settings::ResetBinds() {
+Settings::Settings() {
   binds.assign(std::begin(kDefaultBinds), std::end(kDefaultBinds));
   for (auto& b : binds) b.keys = b.default_keys;
+}
+
+void Settings::ResetBinds(bool camera) {
+  for (auto& b : binds) {
+    if (b.camera == camera) b.keys = b.default_keys;
+  }
 }
 
 void Settings::ResetDisplay() {
@@ -199,6 +219,8 @@ void Settings::ResetDisplay() {
   window_width = defaults.window_width;
   window_height = defaults.window_height;
   present_letterbox = defaults.present_letterbox;
+  display_wide_view = defaults.display_wide_view;
+  display_hud_edges = defaults.display_hud_edges;
   experimental_120fps = defaults.experimental_120fps;
   resolution_scale = defaults.resolution_scale;
   anisotropic_override = defaults.anisotropic_override;
@@ -225,6 +247,8 @@ bool Settings::Load(const std::filesystem::path& file) {
   ReadInt(t, "window_height", window_height);
   if (window_width <= 0 || window_height <= 0) window_width = 1600, window_height = 900;
   Read(t, "present_letterbox", present_letterbox);
+  Read(t, "display_wide_view", display_wide_view);
+  Read(t, "display_hud_edges", display_hud_edges);
   double refresh_rate=60.0;
   Read(t,"video_mode_refresh_rate",refresh_rate);
   experimental_120fps=refresh_rate==120.0;
@@ -264,6 +288,8 @@ bool Settings::Save(const std::filesystem::path& file) const {
   // on it and runs too fast without it. Always on (older files may say off).
   t.insert("vsync", true);
   t.insert("present_letterbox", present_letterbox);
+  t.insert("display_wide_view", display_wide_view);
+  t.insert("display_hud_edges", display_hud_edges);
 
   t.insert("gpu_backend", gpu_backend);
   t.insert("resolution_scale", resolution_scale);

@@ -90,7 +90,9 @@ The launcher's **Wheel** tab is the racing wheel setup from the Pinyon Shift (Fo
 
 Set the rotation in your wheel software first and start with a low strength on a direct-drive base. FM4's clutch is a button: the clutch pedal presses one (B by default); select **Manual with clutch** in the game. Changes apply from the next game start.
 
-`fm4-wheel-probe.exe` lists every device and its raw values without requesting force effects. See [wheel setup and implementation notes](doc/wheels.md).
+`fm4-wheel-probe.exe` lists every device and its raw values without requesting force effects. See [wheel setup and implementation notes](doc/wheels.md). 
+
+In game, the field of view and seat position can be changed live with keys or wheel buttons: see [camera](doc/camera.md). Wide windows (21:9, 32:9) fill with more of the world at the sides and the HUD at 16:9 or at the edges: see [wide screens](doc/wide-screens.md).
 
 ## Project Forza Plus 4
 
@@ -215,7 +217,7 @@ fm4-launcher.exe --screenshot <file.bmp> --tab instructions|profiles|graphics|co
 | `tests/` | Regression fixtures and checks. |
 | `doc/` | Implementation notes and setup documentation. |
 | `doc/img/` | Launcher and gameplay screenshots. |
-| `patches/sdk/` | Runtime changes required by the SDK integration. |
+| `patches/sdk/` | Runtime changes required by the SDK integration (0006: wide-screen HUD placement, video mode from window, thunk reuse). |
 
 ## Antivirus report
 

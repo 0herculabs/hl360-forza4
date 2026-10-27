@@ -17,6 +17,9 @@ struct KeyBind {
   const char* group_es;
   const char* default_keys;
   std::string keys;
+  // The game's camera adjustments (keybind_camera_*): work without the
+  // keyboard pad, shown in their own card.
+  bool camera = false;
 };
 
 // A local profile: the gamertag the game shows and the offline XUID its saves
@@ -42,6 +45,10 @@ struct Settings {
   int window_width = 1600;
   int window_height = 900;
   bool present_letterbox = true;
+  // Wide windows show more of the world at the sides (the game's Hor+); the
+  // HUD and 16:9 screens keep their proportions.
+  bool display_wide_view = true;
+  bool display_hud_edges = false;
   bool experimental_120fps = false;
 
   // Quality
@@ -63,7 +70,8 @@ struct Settings {
   bool audio_mute = false;
 
   Settings();
-  void ResetBinds();
+  // The keyboard pad's keys, or the camera's.
+  void ResetBinds(bool camera = false);
   void ResetDisplay();
   bool Load(const std::filesystem::path& file);
   bool Save(const std::filesystem::path& file) const;

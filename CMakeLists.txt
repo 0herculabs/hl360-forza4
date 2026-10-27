@@ -28,6 +28,8 @@ set(FM4_SOURCES
     src/wheel_mapping.cpp
     src/wheel_input.cpp
     src/wheel_ffb.cpp
+    src/camera_view.cpp
+    src/wide_view.cpp
     src/telemetry/forza_dash.cpp
     src/telemetry/telemetry_out.cpp
     src/telemetry/fm4_car.cpp

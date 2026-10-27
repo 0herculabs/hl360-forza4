@@ -3,6 +3,7 @@
 #pragma once
 
 #include <rex/rex_app.h>
+#include <rex/ui/window_listener.h>
 
 class Fm4App : public rex::ReXApp {
  public:
@@ -26,6 +27,8 @@ class Fm4App : public rex::ReXApp {
   void OnWindowFocusChanged(bool focused) override;
   bool OnWindowCloseRequested() override;
   void OnWindowMinimized() override;
+  // Wide windows widen the view to the window's aspect (wide_view.cpp).
+  void OnWindowPixelSizeChanged(uint32_t pixel_width, uint32_t pixel_height) override;
   void OnGuestThreadExit(rex::system::XThread* thread) override;
   // No achievement toasts. While the ImGui drawer has any dialog registered
   // (this one stays registered even with nothing on screen) the presenter
@@ -34,4 +37,17 @@ class Fm4App : public rex::ReXApp {
   // Without it the window is presented once per game frame (same as the FM2
   // recompilation).
   std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog() override;
+
+ private:
+  // Alt+Enter switches between fullscreen and the window (the SDK's binds
+  // have no modifiers).
+  class FullscreenToggle : public rex::ui::WindowInputListener {
+   public:
+    explicit FullscreenToggle(Fm4App& app) : app_(app) {}
+    void OnKeyDown(rex::ui::KeyEvent& e) override;
+
+   private:
+    Fm4App& app_;
+  };
+  FullscreenToggle fullscreen_toggle_{*this};
 };

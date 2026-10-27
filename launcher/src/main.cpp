@@ -256,6 +256,12 @@ std::vector<Binding> DefaultRows() {
                "Pulsa la entrada que quieras para este botón de Xbox: un botón del aro, una botonera, una leva, una cruceta o una palanca.",
                Kind::kButton, chip, {}};
   };
+  auto camera = [](const char* key, const char* label, const char* label_es) {
+    return Binding{key, label, label_es,
+                   "Press the input you want for this: a rim button, a button box button or a hat direction. Held in game, it keeps going.",
+                   "Pulsa la entrada que quieras para esto: un botón del aro, de una botonera o una cruceta. Mantenido en el juego, sigue.",
+                   Kind::kButton, "", {}};
+  };
   auto gear = [](const char* key, const char* label, const char* label_es, const char* chip, const char* prompt,
                  const char* prompt_es) { return Binding{key, label, label_es, prompt, prompt_es, Kind::kButton, chip, {}}; };
   return {
@@ -295,8 +301,20 @@ std::vector<Binding> DefaultRows() {
       gear("GEAR7", "Shifter 7th", "Palanca 7.\xC2\xAA", "7", "Put the H-shifter in 7th gear, or click Skip if it has no 7th.",
            "Pon la palanca en 7.\xC2\xAA, o pulsa Omitir si no tiene."),
       gear("REVERSE", "Shifter reverse", "Palanca marcha atrás", "R", "Put the H-shifter in reverse.", "Pon la palanca en marcha atrás."),
+      // The game's camera adjustments (src/camera_view.cpp), last: not in the
+      // live view's chips or the guided setup.
+      camera("CAM_FOV_IN", "Field of view: narrower", "Campo de visión: más estrecho"),
+      camera("CAM_FOV_OUT", "Field of view: wider", "Campo de visión: más amplio"),
+      camera("CAM_FOV_RESET", "Field of view: default", "Campo de visión: original"),
+      camera("CAM_SEAT_UP", "Seat up", "Asiento arriba"),
+      camera("CAM_SEAT_DOWN", "Seat down", "Asiento abajo"),
+      camera("CAM_SEAT_FORWARD", "Seat forward", "Asiento adelante"),
+      camera("CAM_SEAT_BACK", "Seat back", "Asiento atrás"),
+      camera("CAM_SEAT_RESET", "Seat: default", "Asiento: original"),
   };
 }
+
+bool IsCamera(const Binding& row) { return std::strncmp(row.key, "CAM_", 4) == 0; }
 
 // Listens for the input a step asks for: the axis that moves furthest
 // (steering, pedals), or the first button, hat direction or lever axis pressed
@@ -439,7 +457,7 @@ void Evaluate(const State&, const w::Settings& c, const Binding& row, const Inpu
   if (input.type == InputType::kAxis && input.index < int(d.axes.size())) {
     const int16_t raw = d.axes[input.index];
     if (row.kind == Kind::kSteering) {
-      value = w::SteeringFromAxis(raw, input.inverted, c.steering_scale, c.steering_deadzone) / 32767.0f;
+      value = w::SteeringFromAxis(raw, input.inverted, w::SteeringScale(c), c.steering_deadzone) / 32767.0f;
       std::snprintf(buffer, sizeof(buffer), "%+.0f %%", value * 100);
       text = buffer;
     } else {
@@ -1271,8 +1289,8 @@ void TabInstructions(App& app) {
       "El mod usa una instalación y partidas separadas y necesita espacio adicional. Esta adaptación experimental conserva el ejecutable del port; no reproduce todos los cambios del ejecutable modificado del mod. Solo se adaptan los DLC ya instalados con sus cabeceras válidas."));
   EndCard();
   BeginCard("##wheelhelp",L("4. Wheel and pedals (optional)", "4. Volante y pedales (opcional)"));
-  ImGui::TextWrapped("%s",L("In the Wheel tab, press Start guided setup and follow each step: steering, pedals, buttons and an optional H-shifter, from any USB devices (a separate pedal set or button box works). The live view shows exactly what the game will read. Pick the device that receives force feedback, press Test, and start with a low strength.",
-      "En la pestaña Volante, pulsa Iniciar configuración guiada y sigue cada paso: dirección, pedales, botones y palanca en H opcional, desde cualquier dispositivo USB (pedales o botonera separados también). La vista en vivo muestra lo que leerá el juego. Elige el dispositivo de force feedback, pulsa Probar y empieza con poca fuerza."));
+  ImGui::TextWrapped("%s",L("In the Wheel tab, press Bind on each control and move it: steering, pedals, buttons and an optional H-shifter, from any USB devices (a separate pedal set or button box works). The live view shows exactly what the game will read. Pick the device that receives force feedback, press Test, and start with a low strength.",
+      "En la pestaña Volante, pulsa Asignar en cada control y muévelo: dirección, pedales, botones y palanca en H opcional, desde cualquier dispositivo USB (pedales o botonera separados también). La vista en vivo muestra lo que leerá el juego. Elige el dispositivo de force feedback, pulsa Probar y empieza con poca fuerza."));
   ImGui::Spacing();
   ImGui::TextWrapped("%s",L("Set the rotation in your wheel software first. The clutch pedal presses a button (B by default), so select Manual with clutch in FM4. SimHub telemetry is in the same tab.",
       "Configura primero el giro en el programa de tu base. El embrague pulsa un botón (B por defecto), así que elige Manual con embrague en FM4. La telemetría para SimHub está en la misma pestaña."));
@@ -1463,14 +1481,36 @@ void TabGraphics(App& app) {
                       {16000900, "1600 x 900"},
                       {19201080, "1920 x 1080"},
                       {25601440, "2560 x 1440"},
-                      {38402160, "3840 x 2160"}})) {
+                      {38402160, "3840 x 2160"},
+                      {25601080, "2560 x 1080 (21:9)"},
+                      {34401440, "3440 x 1440 (21:9)"},
+                      {38401080, "3840 x 1080 (32:9)"},
+                      {51201440, "5120 x 1440 (32:9)"}})) {
         s.window_width = size / 10000;
         s.window_height = size % 10000;
         changed = true;
       }
     }
-    Row(L("Keep 16:9", "Mantener 16:9"));
-    changed |= Toggle("##letterbox", &s.present_letterbox);
+    // Wider than 16:9: the game widens its view (Hor+) and fills the window,
+    // or keeps its 16:9 image with black bars, or stretches it.
+    Row(L("Wide screens", "Pantallas panorámicas"));
+    int wide = s.display_wide_view ? 0 : s.present_letterbox ? 1 : 2;
+    if (Segmented<int>("##wide", wide,
+                       {{0, L("Fill Window", "Llenar ventana")},
+                        {1, L("Black bars", "Bandas negras")},
+                        {2, L("Stretch", "Estirar")}})) {
+      s.display_wide_view = wide == 0;
+      s.present_letterbox = wide != 2;
+      changed = true;
+    }
+    // With Fill Window: the HUD in the middle 16:9, or its sides at the
+    // window's edges.
+    ImGui::BeginDisabled(!s.display_wide_view);
+    Row(L("HUD Position", "Posición del HUD"));
+    if (Segmented<bool>("##hudedges", s.display_hud_edges,
+                        {{false, L("Standard", "Estándar")}, {true, L("Edges", "Bordes")}}))
+      changed = true;
+    ImGui::EndDisabled();
     Row(L("Frame rate", "Fotogramas por segundo"));
     changed |= Segmented<bool>("##framerate",s.experimental_120fps,
         {{false,"60 FPS / 60 Hz"},{true,"120 FPS / 120 Hz"}});
@@ -1581,7 +1621,7 @@ void DrawWheelLive(App& app, const wheel_ui::State& ui) {
   float x = p0.x + S(430), y = p0.y + S(16);
   const float chip_w = S(52), chip_h = S(24), right = p0.x + width - S(12);
   for (const auto& row : ui.rows) {
-    if (row.kind != Kind::kButton) continue;
+    if (row.kind != Kind::kButton || IsCamera(row)) continue;
     if (x + chip_w > right) { x = p0.x + S(430); y += chip_h + S(6); }
     const bool bound = !row.inputs.empty();
     const ImU32 fill = row.pressed ? sound : Col(kControl, bound ? 1.0f : 0.45f);
@@ -1638,6 +1678,26 @@ bool Percent(const char* label, int* value, int lo, int hi, const char* hint = n
   return changed;
 }
 
+// A slider in degrees, in steps of 10; with off_label, values below 90 are 0
+// ("off").
+bool Degrees(const char* label, int* value, int lo, int hi, const char* off_label, const char* hint, float width) {
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(label);
+  if (hint && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", hint);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(width);
+  ImGui::PushID(label);
+  const bool off = off_label && *value <= 0;
+  int shown = off ? lo : *value;
+  const bool changed = ImGui::SliderInt("##v", &shown, lo, hi, off ? off_label : "%d\xC2\xB0", ImGuiSliderFlags_AlwaysClamp);
+  if (hint && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", hint);
+  ImGui::PopID();
+  if (!changed) return false;
+  shown = (shown + 5) / 10 * 10;
+  *value = off_label && shown < 90 ? 0 : std::max(shown, 90);
+  return true;
+}
+
 void TabWheel(App& app) {
   namespace w = fm4::wheel;
   using namespace wheel_ui;
@@ -1672,7 +1732,8 @@ void TabWheel(App& app) {
                   "Listo. Comprueba la vista en vivo: gira el volante, pisa los pedales y pulsa los botones. Asignaciones guardadas.");
   };
   auto advance = [&] {
-    if (cap.guided && cap.row + 1 < int(ui.rows.size())) BeginCapture(ui, cap.row + 1, true, devices);
+    if (cap.guided && cap.row + 1 < int(ui.rows.size()) && !IsCamera(ui.rows[cap.row + 1]))
+      BeginCapture(ui, cap.row + 1, true, devices);
     else end_capture(true);
   };
   auto commit_candidate = [&] {
@@ -1710,19 +1771,45 @@ void TabWheel(App& app) {
   }
 
   // --- Main card: live view and the setup step, always in sight.
-  BeginCard("##wheelmain", L("Wheel, pedals and buttons", "Volante, pedales y botones"),
-            L("Bind your wheel, pedals and buttons from any USB devices. Live: exactly what the game will see. Changes apply from the next game start.",
-              "Asigna volante, pedales y botones desde cualquier dispositivo USB. En vivo: exactamente lo que verá el juego. Los cambios se aplican al iniciar el juego."));
-  if (BeginRows("##wheelon")) {
-    Row(L("Use the racing wheel", "Usar el volante"),
-        L("Off: the game uses controllers and the keyboard as before.", "Desactivado: el juego usa mandos y teclado como antes."));
+  BeginCard("##wheelmain", L("Wheel & Pedals", "Volante y pedales"));
+  if (ImGui::BeginTable("##wheelon", 3, ImGuiTableFlags_None)) {
+    const float toggle = ImGui::GetFrameHeight() * 0.9f * 1.85f;
+    ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed);
+    ImGui::TableSetupColumn("toggle", ImGuiTableColumnFlags_WidthFixed, toggle);
+    ImGui::TableSetupColumn("rotation", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(L("Enable Wheel Support", "Activar volante"));
+    ImGui::TableSetColumnIndex(1);
     if (Toggle("##wheelenabled", &c.enabled)) changed = true;
-    EndRows();
+    // Match the game's steering wheel to the real one: full lock comes at the
+    // game's rotation instead of the wheel's. Right-aligned.
+    ImGui::TableSetColumnIndex(2);
+    const float slider = S(150);
+    const char* wheel_label = L("Wheel rotation", "Giro del volante");
+    const char* game_label = L("In-game rotation", "Giro en el juego");
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float need = ImGui::CalcTextSize(wheel_label).x + ImGui::CalcTextSize(game_label).x + 2 * slider +
+                       3 * style.ItemSpacing.x + S(24);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - need));
+    changed |= Degrees(wheel_label, &c.wheel_rotation, 180, 1440, nullptr,
+                       L("The rotation set in your wheel software (Fanatec, MOZA Pit House, ...), lock to lock.",
+                         "El giro configurado en el software del volante, de tope a tope."),
+                       slider);
+    ImGui::SameLine(0, S(24));
+    changed |= Degrees(game_label, &c.game_rotation, 0, 1080, L("Off", "No"),
+                       L("How far the game's steering wheel turns lock to lock. Set it and the car reaches full lock when your wheel has turned that far, so the wheel in the cockpit follows yours. Off: your wheel's full rotation is full lock.\n\nIn cockpit view, turn your wheel: if the game's wheel turns further than yours, lower it; if less, raise it.",
+                         "Cuánto gira el volante del juego de tope a tope. Con un valor, el coche llega al tope cuando tu volante ha girado eso y el volante de la cabina sigue al tuyo. No: todo el giro de tu volante es el tope.\n\nEn la vista de cabina, gira el volante: si el del juego gira más que el tuyo, bájalo; si gira menos, súbelo."),
+                       slider);
+    ImGui::EndTable();
   }
   DrawWheelLive(app, ui);
   ImGui::Dummy(ImVec2(0, S(6)));
+  // The guided setup is hidden for now; Bind on each row still works.
+  constexpr bool kGuidedSetup = false;
   if (cap.row < 0) {
-    if (PrimaryButton(L("Start guided setup", "Iniciar configuración guiada"), ImVec2(S(240), S(36)))) {
+    if (kGuidedSetup && PrimaryButton(L("Start guided setup", "Iniciar configuración guiada"), ImVec2(S(240), S(36)))) {
       ui.info.clear();
       BeginCapture(ui, 0, true, devices);
     }
@@ -1817,6 +1904,10 @@ void TabWheel(App& app) {
 
   EndCard();
 
+  // The cards below scroll under the main card, which stays fixed so the
+  // live view is in sight while they change.
+  ImGui::BeginChild("##wheelcards", ImVec2(0, 0));
+
   // --- Bindings: collapsible, so the live view above stays in sight while
   // the cards below change dead zones and the like.
   BeginPanel("##wheelbindings");
@@ -1837,6 +1928,16 @@ void TabWheel(App& app) {
     ImGui::TableHeadersRow();
     for (int i = 0; i < int(ui.rows.size()); ++i) {
       Binding& row = ui.rows[i];
+      if (IsCamera(row) && (i == 0 || !IsCamera(ui.rows[i - 1]))) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Dummy(ImVec2(0, S(4)));
+        TextColored(kAccent, L("Camera", "Cámara"));
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Dummy(ImVec2(0, S(4)));
+        TextDim(L("In game: field of view and seat position, for each camera view. Keys for these are in Controls.",
+                  "En el juego: campo de visión y posición del asiento, por vista. Las teclas están en Controles."));
+      }
       ImGui::PushID(i);
       ImGui::TableNextRow();
       if (cap.row == i) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, Col(kAccent, 0.25f));
@@ -1897,7 +1998,7 @@ void TabWheel(App& app) {
   std::snprintf(ffb_summary, sizeof(ffb_summary), "%s \xC2\xB7 %d %%",
                 mode == w::FfbMode::kEffects ? L("On", "Activado") : mode == w::FfbMode::kRumble ? L("Rumble only", "Solo vibración") : L("Off", "Desactivado"),
                 c.ffb_strength);
-  CardHeader("ffb", L("Force feedback", "Force feedback"), ffb_summary, ui.open_ffb);
+  CardHeader("ffb", L("Force Feedback", "Force feedback"), ffb_summary, ui.open_ffb);
   if (ui.open_ffb) {
     TextDim(L("Device that receives the forces", "Dispositivo que recibe las fuerzas"));
     const std::string steer_device = Get(ui, "STEER").inputs.empty() ? std::string() : Get(ui, "STEER").inputs[0].device;
@@ -1922,7 +2023,7 @@ void TabWheel(App& app) {
       app.wheel_monitor->TestHaptics();
     }
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Pulls the wheel LEFT, then RIGHT, gently (15 %)", "Tira del volante a la IZQUIERDA y luego a la DERECHA, suave (15 %)"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Pulls the wheel LEFT, then RIGHT, as hard as Strength: 100 % is half the base's maximum, 200 % all of it", "Tira del volante a la IZQUIERDA y luego a la DERECHA, según Fuerza: 100 % es la mitad del máximo de la base, 200 % todo"));
     if (!snap.haptic_status.empty()) TextDim(snap.haptic_status.c_str());
     TextDim(L("Pick your wheel base. Test pulls the wheel LEFT, then RIGHT. If it pulls right first, tick Reverse force direction. A base can appear twice; if Test does not move the wheel, pick the other entry.",
               "Elige tu base. Probar tira a la IZQUIERDA y luego a la DERECHA. Si tira primero a la derecha, marca Invertir dirección. Una base puede aparecer dos veces; si no se mueve, elige la otra."));
@@ -2073,7 +2174,7 @@ void TabWheel(App& app) {
               "Un dispositivo se ilumina al moverlo, para distinguirlos."));
   }
   EndCard();
-
+  ImGui::EndChild();
 
   if (changed) app.Save();
 }
@@ -2115,14 +2216,15 @@ void TabControls(App& app) {
   }
   EndCard();
 
-  if (s.mnk_mode) {
-    BeginCard("##binds", L("Key bindings", "Asignación de teclas"));
-    if (app.capture_index >= 0) {
+  // One card of key bindings: the keyboard pad's, or the camera's.
+  auto bind_rows = [&](bool camera) {
+    if (app.capture_index >= 0 && s.binds[app.capture_index].camera == camera) {
       TextColored(kAccent, L("Press a key to assign it  ·  Esc cancels", "Pulsa una tecla para asignarla  ·  Esc cancela"));
     }
     const char* group = "";
     for (int i = 0; i < int(s.binds.size()); ++i) {
       auto& b = s.binds[i];
+      if (b.camera != camera) continue;
       if (std::strcmp(group, b.group) != 0) {
         group = b.group;
         ImGui::Dummy(ImVec2(0, S(6)));
@@ -2157,7 +2259,8 @@ void TabControls(App& app) {
       ImGui::SameLine(ImGui::GetContentRegionMax().x - buttons_w);
       if (ImGui::Button(L("Change", "Cambiar"), ImVec2(S(80), 0))) app.capture_index = i, app.capture_append = false;
       ImGui::SameLine(0, S(4));
-      if (ImGui::Button("Reset", ImVec2(S(60), 0))) app.capture_index = i, app.capture_append = true;
+      if (ImGui::Button(L("Add", "Añadir"), ImVec2(S(60), 0))) app.capture_index = i, app.capture_append = true;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Add another key for this", "Añade otra tecla para esto"));
       ImGui::SameLine(0, S(4));
       if (ImGui::Button(L("Clear", "Quitar"), ImVec2(S(64), 0))) b.keys.clear(), changed = true;
       ImGui::SameLine(0, S(4));
@@ -2167,11 +2270,34 @@ void TabControls(App& app) {
     }
     ImGui::Dummy(ImVec2(0, S(8)));
     if (ImGui::Button(L("Restore all keys", "Restaurar todas las teclas"))) {
-      s.ResetBinds();
+      s.ResetBinds(camera);
       changed = true;
     }
+  };
+
+  if (s.mnk_mode) {
+    BeginCard("##binds", L("Key bindings", "Asignación de teclas"));
+    bind_rows(false);
     EndCard();
   }
+
+  // The camera keys work in game with or without the keyboard pad; the wheel's
+  // buttons for the same are in the Wheel tab.
+  BeginCard("##camerakeys", L("Camera", "Cámara"),
+            L("In game, change the field of view and move the seat; hold a key to keep going. Each camera view keeps its own, saved as you go.",
+              "En el juego, cambia el campo de visión y mueve el asiento; mantén la tecla para seguir. Cada vista de cámara guarda los suyos."));
+  bind_rows(true);
+  const fs::path camera_file = app.exe_dir / "fm4.camera.toml";
+  std::error_code ec;
+  const bool saved = fs::exists(camera_file, ec);
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!saved || app.game != nullptr);
+  if (ImGui::Button(L("Reset all camera views", "Restablecer todas las vistas"))) fs::remove(camera_file, ec);
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    ImGui::SetTooltip("%s", app.game ? L("Close the game first", "Cierra el juego primero")
+                                     : L("Back to the game's own field of view and seat in every view", "Vuelve al campo de visión y asiento del juego en todas las vistas"));
+  EndCard();
   if (changed) app.Save();
 }
 

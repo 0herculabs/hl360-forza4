@@ -20,6 +20,10 @@ REXCVAR_DEFINE_INT32(wheel_steering_axis, 0, "FM4/Wheel", "Steering axis on the 
 REXCVAR_DEFINE_BOOL(wheel_steering_invert, false, "FM4/Wheel", "Reverse the steering axis");
 REXCVAR_DEFINE_INT32(wheel_steering_scale, 100, "FM4/Wheel", "Steering sensitivity in percent; 200 reaches full lock at half the wheel's rotation");
 REXCVAR_DEFINE_INT32(wheel_steering_deadzone, 0, "FM4/Wheel", "Steering dead zone in percent of half travel");
+REXCVAR_DEFINE_INT32(wheel_rotation, 900, "FM4/Wheel", "The rotation set in the wheel's software, degrees lock to lock");
+REXCVAR_DEFINE_INT32(wheel_game_rotation, 0, "FM4/Wheel",
+                     "The in-game steering wheel's rotation lock to lock in degrees, so it turns as far as "
+                     "the real one (wheel_rotation); 0 maps the wheel's full rotation to full lock");
 REXCVAR_DEFINE_STRING(wheel_throttle, "", "FM4/Wheel", "Throttle axis, [device|][+|-]axisN");
 REXCVAR_DEFINE_STRING(wheel_brake, "", "FM4/Wheel", "Brake axis, [device|][+|-]axisN");
 REXCVAR_DEFINE_STRING(wheel_clutch, "", "FM4/Wheel", "Clutch axis, [device|][+|-]axisN");
@@ -55,6 +59,7 @@ constexpr DeviceId kWheelId = static_cast<DeviceId>(0xF400000000000001ull);
 std::mutex service_mutex;
 std::weak_ptr<DeviceMonitor> service;
 std::atomic<bool> focused{false};
+std::atomic<uint32_t> camera_held{0};
 std::shared_ptr<DeviceMonitor> Service() { std::lock_guard lock(service_mutex);return service.lock(); }
 
 class Assignment final : public DeviceAssignment {
@@ -87,6 +92,8 @@ Settings ReadSettings() {
   s.steering_invert = REXCVAR_GET(wheel_steering_invert);
   s.steering_scale = REXCVAR_GET(wheel_steering_scale);
   s.steering_deadzone = REXCVAR_GET(wheel_steering_deadzone);
+  s.wheel_rotation = REXCVAR_GET(wheel_rotation);
+  s.game_rotation = REXCVAR_GET(wheel_game_rotation);
   s.throttle = REXCVAR_GET(wheel_throttle);
   s.brake = REXCVAR_GET(wheel_brake);
   s.clutch = REXCVAR_GET(wheel_clutch);
@@ -148,10 +155,12 @@ struct Composer {
     return PedalFromAxis(d->axes[b->axis], ResolveAxisDirection(b->direction, d->rest[b->axis]), bottom,
                          s.deadzone_top[which]);
   }
-  X_INPUT_GAMEPAD Compose(const Snapshot& snap) const {
+  // `camera`: the camera actions held (CAM_* bindings, CameraAction bits).
+  X_INPUT_GAMEPAD Compose(const Snapshot& snap, uint32_t& camera) const {
+    camera = 0;
     X_INPUT_GAMEPAD pad{};
     if (const Device* base = Base(snap); base && s.steering_axis >= 0 && s.steering_axis < int(base->axes.size()))
-      pad.thumb_lx = SteeringFromAxis(base->axes[s.steering_axis], s.steering_invert, s.steering_scale, s.steering_deadzone);
+      pad.thumb_lx = SteeringFromAxis(base->axes[s.steering_axis], s.steering_invert, SteeringScale(s), s.steering_deadzone);
     uint8_t rt = Pedal(snap, throttle, 0), lt = Pedal(snap, brake, 1);
     const uint8_t c = Pedal(snap, clutch, 2);
     uint16_t pressed = 0;
@@ -167,6 +176,10 @@ struct Composer {
       else if (b.button >= 0 && b.button < int(d->buttons.size())) on = d->buttons[b.button];
       else if (b.hat >= 0 && b.hat < int(d->hats.size())) on = (d->hats[b.hat] & b.hat_mask) != 0;
       if (!on) continue;
+      if (b.camera >= 0) {
+        camera |= 1u << b.camera;
+        continue;
+      }
       if (b.gear) gear = b.gear;
       pressed |= b.xbuttons;
       if (b.left_trigger) lt = 255;
@@ -216,8 +229,13 @@ class Driver final : public InputDriver {
     if (id != kWheelId || !out || !composer_.Base(s)) return 1167;
     *out = {};
     out->packet_number = ++packet_;
-    if (window_ && !focused) return 0;
-    out->gamepad = composer_.Compose(s);
+    uint32_t camera = 0;
+    if (window_ && !focused) {
+      camera_held = 0;
+      return 0;
+    }
+    out->gamepad = composer_.Compose(s, camera);
+    camera_held = camera;
     return 0;
   }
   rex::X_RESULT GetDeviceCapabilities(DeviceId id,uint32_t,X_INPUT_CAPABILITIES* out) override {
@@ -271,6 +289,7 @@ bool ForceAvailable(uint32_t user) {
   if(user!=0 || !device || ParseFfbMode(REXCVAR_GET(wheel_ffb_mode))!=FfbMode::kEffects) return false;
   return device->Read().force_supported;
 }
+uint32_t CameraHeld() { return camera_held.load(std::memory_order_relaxed); }
 void SetFocus(bool value) {focused=value;if(auto s=Service()) s->SetActive(value);}
 void SubmitEffect(ForceEffect effect) {
   if(effect.id<1 || effect.id>5) return;
