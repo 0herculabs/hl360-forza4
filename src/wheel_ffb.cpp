@@ -1,6 +1,7 @@
 // FM4 USA Rev 1 native XInput-FF boundary. The game owns its physics and FFB
 // calculation; translate its five effect slots instead of controller rumble.
 #include "wheel_input.h"
+#include "telemetry/fm4_car.h"
 #include "generated/default/fm4_pch.h"
 
 namespace {
@@ -68,6 +69,7 @@ extern "C" void sub_82CA9DF8(PPCContext& __restrict ctx,uint8_t* base) {
 ORIGINAL(sub_823A3F68);
 extern "C" void sub_823A3F68(PPCContext& __restrict ctx,uint8_t* base) {
   const uint32_t object=ctx.r3.u32;
+  if(Buffer(object,1376) && REX_LOAD_U32(object)==0) fm4::telemetry::NoteDriving(REX_LOAD_U8(object+5)!=0);
   if(Buffer(object,1376) && ForceAvailable(REX_LOAD_U32(object))) SetDriving(REX_LOAD_U8(object+5)!=0);
   __imp__sub_823A3F68(ctx,base);
 }

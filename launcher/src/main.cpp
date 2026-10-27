@@ -19,6 +19,7 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -26,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,7 +36,7 @@
 #include <vector>
 
 #include "../../src/crash_handler.h"
-#include "../../src/wheel_calibration.h"
+#include "../../src/wheel.h"
 #include "i18n.h"
 #include "installer.h"
 #include "graphics_fixes.h"
@@ -64,7 +66,7 @@ ImU32 Col(const ImVec4& c, float alpha = 1.0f) {
   return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * alpha));
 }
 
-enum class Tab { kInstructions, kProfiles, kGraphics, kControls, kAudio, kInstall, kSupport };
+enum class Tab { kInstructions, kProfiles, kGraphics, kControls, kWheel, kAudio, kInstall, kSupport };
 
 // --- Key capture -----------------------------------------------------------
 
@@ -205,6 +207,390 @@ bool LoadCover(SDL_GPUDevice* gpu, const fs::path& file, Cover& out) {
   return out.texture && out.sampler;
 }
 
+// --- Wheel tab ---------------------------------------------------------------
+//
+// The racing wheel setup from the Pinyon Shift (Forza Horizon) launcher: bind
+// the wheel, pedals and buttons from any USB devices with a guided setup or
+// one row at a time, watch a live view of exactly what the game will read,
+// and set force feedback and telemetry. Bindings use the game's wheel_*
+// syntax (src/wheel_mapping.h) and are saved as soon as they change.
+
+namespace wheel_ui {
+namespace w = fm4::wheel;
+using Clock = std::chrono::steady_clock;
+
+enum class Kind { kSteering, kPedal, kButton };
+enum class InputType { kAxis, kButton, kHat };
+
+// One physical input. `device` is the device match text (empty for none).
+struct Input {
+  std::string device;
+  InputType type = InputType::kAxis;
+  int index = 0;
+  uint8_t hat = 0;
+  bool inverted = false;
+  bool Same(const Input& o) const {
+    return type == o.type && index == o.index && hat == o.hat && device == o.device;
+  }
+};
+
+struct Binding {
+  const char* key;  // STEER, THROTTLE, BRAKE, CLUTCH, an Xbox control or a gear
+  const char* label;
+  const char* label_es;
+  const char* prompt;
+  const char* prompt_es;
+  Kind kind;
+  const char* chip;
+  std::vector<Input> inputs;  // buttons may have several (any of them presses it)
+  // Live, as the game would read it.
+  float value = 0;
+  bool pressed = false;
+  std::string text;
+};
+
+std::vector<Binding> DefaultRows() {
+  auto button = [](const char* key, const char* label, const char* label_es, const char* chip) {
+    return Binding{key, label, label_es,
+               "Press the input you want for this Xbox button: a rim button, a button box, a shifter paddle, a hat or a lever.",
+               "Pulsa la entrada que quieras para este botón de Xbox: un botón del aro, una botonera, una leva, una cruceta o una palanca.",
+               Kind::kButton, chip, {}};
+  };
+  auto gear = [](const char* key, const char* label, const char* label_es, const char* chip, const char* prompt,
+                 const char* prompt_es) { return Binding{key, label, label_es, prompt, prompt_es, Kind::kButton, chip, {}}; };
+  return {
+      {"STEER", "Steering", "Dirección", "Turn the wheel to the LEFT, at least a quarter turn, then back to centre.",
+       "Gira el volante a la IZQUIERDA, al menos un cuarto de vuelta, y vuelve al centro.", Kind::kSteering, "", {}},
+      {"THROTTLE", "Throttle", "Acelerador", "Press the THROTTLE pedal all the way down, then release it.",
+       "Pisa el ACELERADOR a fondo y suéltalo.", Kind::kPedal, "", {}},
+      {"BRAKE", "Brake", "Freno", "Press the BRAKE pedal all the way down, then release it.",
+       "Pisa el FRENO a fondo y suéltalo.", Kind::kPedal, "", {}},
+      {"CLUTCH", "Clutch", "Embrague",
+       "Press the CLUTCH pedal all the way down, then release it. It presses the clutch button set under Steering and pedals; choose Manual with clutch in the game.",
+       "Pisa el EMBRAGUE a fondo y suéltalo. Pulsa el botón de embrague elegido en Dirección y pedales; elige Manual con embrague en el juego.",
+       Kind::kPedal, "", {}},
+      button("RB", "RB (shift up)", "RB (subir marcha)", "RB"),
+      button("LB", "LB (shift down)", "LB (bajar marcha)", "LB"),
+      button("A", "A", "A", "A"),
+      button("B", "B", "B", "B"),
+      button("X", "X", "X", "X"),
+      button("Y", "Y", "Y", "Y"),
+      button("BACK", "Back (view)", "Back (vista)", "Back"),
+      button("START", "Start (pause)", "Start (pausa)", "Start"),
+      button("LS", "LS (left stick click)", "LS (clic stick izq.)", "LS"),
+      button("RS", "RS (right stick click)", "RS (clic stick der.)", "RS"),
+      button("UP", "D-pad up", "Cruceta arriba", "\xE2\x86\x91"),
+      button("DOWN", "D-pad down", "Cruceta abajo", "\xE2\x86\x93"),
+      button("LEFT", "D-pad left", "Cruceta izquierda", "\xE2\x86\x90"),
+      button("RIGHT", "D-pad right", "Cruceta derecha", "\xE2\x86\x92"),
+      // An H-pattern shifter, last so a wheel without one skips them all at 1st gear.
+      gear("GEAR1", "Shifter 1st", "Palanca 1.\xC2\xAA", "1",
+           "Put the H-shifter in 1st gear. No H-shifter? Click Skip to finish the setup.",
+           "Pon la palanca en 1.\xC2\xAA. ¿Sin palanca en H? Pulsa Omitir para terminar."),
+      gear("GEAR2", "Shifter 2nd", "Palanca 2.\xC2\xAA", "2", "Put the H-shifter in 2nd gear.", "Pon la palanca en 2.\xC2\xAA."),
+      gear("GEAR3", "Shifter 3rd", "Palanca 3.\xC2\xAA", "3", "Put the H-shifter in 3rd gear.", "Pon la palanca en 3.\xC2\xAA."),
+      gear("GEAR4", "Shifter 4th", "Palanca 4.\xC2\xAA", "4", "Put the H-shifter in 4th gear.", "Pon la palanca en 4.\xC2\xAA."),
+      gear("GEAR5", "Shifter 5th", "Palanca 5.\xC2\xAA", "5", "Put the H-shifter in 5th gear.", "Pon la palanca en 5.\xC2\xAA."),
+      gear("GEAR6", "Shifter 6th", "Palanca 6.\xC2\xAA", "6", "Put the H-shifter in 6th gear.", "Pon la palanca en 6.\xC2\xAA."),
+      gear("GEAR7", "Shifter 7th", "Palanca 7.\xC2\xAA", "7", "Put the H-shifter in 7th gear, or click Skip if it has no 7th.",
+           "Pon la palanca en 7.\xC2\xAA, o pulsa Omitir si no tiene."),
+      gear("REVERSE", "Shifter reverse", "Palanca marcha atrás", "R", "Put the H-shifter in reverse.", "Pon la palanca en marcha atrás."),
+  };
+}
+
+// Listens for the input a step asks for: the axis that moves furthest
+// (steering, pedals), or the first button, hat direction or lever axis pressed
+// after the step began.
+struct Capture {
+  int row = -1;
+  bool guided = false, adding = false;
+  struct Base { std::vector<int16_t> axes; std::vector<bool> buttons; std::vector<uint8_t> hats; };
+  std::map<uint32_t, Base> base;
+  bool found = false, user_invert = false;
+  Input candidate;
+  uint32_t candidate_id = 0;
+  int16_t rest = 0, peak = 0;
+  Clock::time_point released_at{};
+};
+
+struct State {
+  bool loaded = false;
+  std::vector<Binding> rows = DefaultRows();
+  Capture capture;
+  std::string info, error;
+  std::map<uint32_t, std::pair<std::vector<int16_t>, Clock::time_point>> activity;
+  char target[64] = {};
+  bool open_bindings = true, open_devices = false, open_ffb = false, open_steering = false, open_telemetry = false;
+};
+
+Binding& Get(State& s, const char* key) {
+  for (auto& r : s.rows)
+    if (std::strcmp(r.key, key) == 0) return r;
+  return s.rows.front();
+}
+
+const w::Device* Resolve(const std::vector<w::Device>& devices, const std::string& match) {
+  return match.empty() ? nullptr : w::FindDevice(devices, match);
+}
+
+std::string DeviceName(const std::vector<w::Device>& devices, const std::string& match) {
+  if (match.empty()) return L("Wheel base", "Base del volante");
+  if (const auto* d = Resolve(devices, match)) return d->name;
+  return match + L(" (not connected)", " (no conectado)");
+}
+
+std::string Describe(const Input& i) {
+  static const char* hats[] = {"", "up", "right", "", "down", "", "", "", "left"};
+  switch (i.type) {
+    case InputType::kAxis: return "axis " + std::to_string(i.index);
+    case InputType::kButton: return "button " + std::to_string(i.index);
+    default: return "hat " + std::to_string(i.index) + " " + (i.hat < 9 ? hats[i.hat] : "?");
+  }
+}
+
+// Reads the wheel_* settings, with inputs that name no device on the wheel base.
+void Load(State& s, const w::Settings& c) {
+  s.rows = DefaultRows();
+  if (!c.device.empty())
+    Get(s, "STEER").inputs.push_back({c.device, InputType::kAxis, std::clamp(c.steering_axis, 0, 63), 0, c.steering_invert});
+  auto split = [&](std::string_view text, std::string& device, std::string_view& rest) {
+    const size_t bar = text.rfind('|');
+    device = bar == std::string_view::npos ? c.device : std::string(text.substr(0, bar));
+    rest = bar == std::string_view::npos ? text : text.substr(bar + 1);
+  };
+  const std::pair<const char*, const std::string*> pedals[] = {{"THROTTLE", &c.throttle}, {"BRAKE", &c.brake}, {"CLUTCH", &c.clutch}};
+  for (const auto& [key, text] : pedals) {
+    if (auto b = w::ParseAxisBinding(*text)) {
+      Input i{b->device.empty() ? c.device : b->device, InputType::kAxis, b->axis, 0, b->direction == w::AxisDirection::kInverted};
+      Get(s, key).inputs.push_back(i);
+    }
+  }
+  // wheel_buttons, entry by entry, keeping each input's device.
+  std::string target;
+  size_t start = 0;
+  const std::string& text = c.buttons;
+  while (start <= text.size()) {
+    size_t comma = text.find(',', start);
+    if (comma == std::string::npos) comma = text.size();
+    std::string part = text.substr(start, comma - start);
+    start = comma + 1;
+    const size_t eq = part.find('=');
+    if (eq != std::string::npos) {
+      target = part.substr(0, eq);
+      for (auto& ch : target) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+      part = part.substr(eq + 1);
+    }
+    auto parsed = w::ParseButtonBindings("A=" + part);
+    if (parsed.empty() || target.empty()) continue;
+    Binding* row = nullptr;
+    for (auto& r : s.rows)
+      if (r.kind == Kind::kButton && target == r.key) row = &r;
+    if (!row) continue;
+    const auto& b = parsed.front();
+    Input i;
+    i.device = b.device.empty() ? c.device : b.device;
+    if (b.axis >= 0) { i.type = InputType::kAxis; i.index = b.axis; i.inverted = b.axis_direction == w::AxisDirection::kInverted; }
+    else if (b.hat >= 0) { i.type = InputType::kHat; i.index = b.hat; i.hat = b.hat_mask; }
+    else { i.type = InputType::kButton; i.index = b.button; }
+    if (std::none_of(row->inputs.begin(), row->inputs.end(), [&](const Input& o) { return o.Same(i); }))
+      row->inputs.push_back(i);
+  }
+}
+
+// Writes the bindings back into the wheel_* settings.
+void Store(State& s, w::Settings& c) {
+  const Binding& steer = Get(s, "STEER");
+  c.device = steer.inputs.empty() ? std::string() : steer.inputs[0].device;
+  if (!steer.inputs.empty()) {
+    c.steering_axis = steer.inputs[0].index;
+    c.steering_invert = steer.inputs[0].inverted;
+  }
+  // Inputs on the wheel base (or with no device, such as the default hat) name none.
+  auto prefix = [&](const Input& i) { return i.device.empty() || i.device == c.device ? std::string() : i.device + "|"; };
+  auto axis = [&](const Binding& r) {
+    if (r.inputs.empty()) return std::string();
+    const Input& i = r.inputs[0];
+    return prefix(i) + (i.inverted ? "-" : "+") + "axis" + std::to_string(i.index);
+  };
+  c.throttle = axis(Get(s, "THROTTLE"));
+  c.brake = axis(Get(s, "BRAKE"));
+  c.clutch = axis(Get(s, "CLUTCH"));
+  static const char* hats[] = {"", "up", "right", "", "down", "", "", "", "left"};
+  std::string buttons;
+  for (const auto& r : s.rows) {
+    if (r.kind != Kind::kButton) continue;
+    for (const auto& i : r.inputs) {
+      if (!buttons.empty()) buttons += ",";
+      buttons += std::string(r.key) + "=" + prefix(i);
+      if (i.type == InputType::kAxis) buttons += std::string(i.inverted ? "-" : "+") + "axis" + std::to_string(i.index);
+      else if (i.type == InputType::kHat) buttons += "h" + std::to_string(i.index) + "." + (i.hat < 9 ? hats[i.hat] : "up");
+      else buttons += std::to_string(i.index);
+    }
+  }
+  c.buttons = buttons;
+  c.enabled = !c.device.empty();
+}
+
+// What the game reads from `input` for `row`.
+void Evaluate(const State&, const w::Settings& c, const Binding& row, const Input& input, const w::Device& d, float& value,
+              bool& pressed, std::string& text) {
+  value = 0; pressed = false; text.clear();
+  char buffer[32];
+  if (input.type == InputType::kAxis && input.index < int(d.axes.size())) {
+    const int16_t raw = d.axes[input.index];
+    if (row.kind == Kind::kSteering) {
+      value = w::SteeringFromAxis(raw, input.inverted, c.steering_scale, c.steering_deadzone) / 32767.0f;
+      std::snprintf(buffer, sizeof(buffer), "%+.0f %%", value * 100);
+      text = buffer;
+    } else {
+      int bottom = 0, top = 0;
+      if (row.kind == Kind::kPedal) {
+        const int which = std::strcmp(row.key, "THROTTLE") == 0 ? 0 : std::strcmp(row.key, "BRAKE") == 0 ? 1 : 2;
+        bottom = c.deadzone_bottom[which] < 0 ? c.pedal_deadzone : c.deadzone_bottom[which];
+        top = c.deadzone_top[which];
+      }
+      const uint8_t p = w::PedalFromAxis(raw, input.inverted ? w::AxisDirection::kInverted : w::AxisDirection::kNormal, bottom, top);
+      value = p / 255.0f;
+      pressed = p >= 128;
+      if (row.kind == Kind::kPedal) { std::snprintf(buffer, sizeof(buffer), "%.0f %%", value * 100); text = buffer; }
+      else if (pressed) text = L("pressed", "pulsado");
+    }
+  } else if (input.type == InputType::kButton && input.index < int(d.buttons.size())) {
+    pressed = d.buttons[input.index];
+  } else if (input.type == InputType::kHat && input.index < int(d.hats.size())) {
+    pressed = (d.hats[input.index] & input.hat) != 0;
+  }
+  if (row.kind == Kind::kButton) { value = pressed ? 1.0f : 0.0f; if (pressed) text = L("pressed", "pulsado"); }
+}
+
+void UpdateLive(State& s, const w::Settings& c, const std::vector<w::Device>& devices) {
+  for (auto& r : s.rows) {
+    r.value = 0; r.pressed = false; r.text.clear();
+    for (const auto& i : r.inputs) {
+      const auto* d = Resolve(devices, i.device);
+      if (!d) continue;
+      float v; bool p; std::string t;
+      Evaluate(s, c, r, i, *d, v, p, t);
+      if (&i == &r.inputs.front() || p) { r.value = v; r.pressed = p; r.text = t; }
+      if (p) break;
+    }
+  }
+}
+
+// An axis already used by steering or a pedal is not offered again.
+bool AxisTaken(const State& s, int row, const std::string& device, int axis) {
+  for (size_t i = 0; i < s.rows.size(); ++i) {
+    const auto& r = s.rows[i];
+    if (int(i) == row || r.kind == Kind::kButton || r.inputs.empty()) continue;
+    if (r.inputs[0].type == InputType::kAxis && r.inputs[0].index == axis && r.inputs[0].device == device) return true;
+  }
+  return false;
+}
+
+void BeginCapture(State& s, int row, bool guided, const std::vector<w::Device>& devices) {
+  Capture c;
+  c.row = row;
+  c.guided = guided;
+  for (const auto& d : devices) c.base[d.id] = {d.axes, d.buttons, d.hats};
+  s.capture = std::move(c);
+  s.error.clear();
+}
+
+void TrackCapture(State& s, const std::vector<w::Device>& devices) {
+  Capture& c = s.capture;
+  if (c.row < 0) return;
+  const Binding& row = s.rows[c.row];
+  const bool steering = row.kind == Kind::kSteering;
+  auto direction = [&] { return steering ? c.peak > c.rest : c.peak < c.rest; };
+  if (c.found) {
+    // Follow the detected axis to its full travel; the direction comes from that.
+    if (c.candidate.type != InputType::kAxis) return;
+    for (const auto& d : devices) {
+      if (d.id != c.candidate_id || c.candidate.index >= int(d.axes.size())) continue;
+      const int16_t value = d.axes[c.candidate.index];
+      if (std::abs(value - c.rest) > std::abs(c.peak - c.rest)) c.peak = value;
+      if (!c.user_invert) c.candidate.inverted = direction();
+    }
+    return;
+  }
+  if (row.kind != Kind::kButton) {
+    const int threshold = steering ? 10000 : 16000;
+    int best = 0, best_axis = -1;
+    const w::Device* best_device = nullptr;
+    for (const auto& d : devices) {
+      auto it = c.base.find(d.id);
+      if (it == c.base.end()) { c.base[d.id] = {d.axes, d.buttons, d.hats}; continue; }
+      const std::string match = w::DeviceMatch(d, devices);
+      for (size_t i = 0; i < d.axes.size() && i < it->second.axes.size(); ++i) {
+        if (AxisTaken(s, c.row, match, int(i))) continue;
+        const int delta = d.axes[i] - it->second.axes[i];
+        if (std::abs(delta) > std::abs(best)) { best = delta; best_device = &d; best_axis = int(i); }
+      }
+    }
+    if (!best_device || std::abs(best) < threshold) return;
+    c.found = true;
+    c.candidate_id = best_device->id;
+    c.rest = c.base[best_device->id].axes[best_axis];
+    c.peak = best_device->axes[best_axis];
+    c.candidate = {w::DeviceMatch(*best_device, devices), InputType::kAxis, best_axis, 0, direction()};
+    return;
+  }
+  for (const auto& d : devices) {
+    auto it = c.base.find(d.id);
+    if (it == c.base.end()) { c.base[d.id] = {d.axes, d.buttons, d.hats}; continue; }
+    auto& b = it->second;
+    // A button or hat held when the step began (an H-shifter left in gear)
+    // counts again once it is let go, so moving out of the gate and back binds it.
+    for (size_t i = 0; i < d.buttons.size() && i < b.buttons.size(); ++i) if (!d.buttons[i]) b.buttons[i] = false;
+    for (size_t i = 0; i < d.hats.size() && i < b.hats.size(); ++i) b.hats[i] &= d.hats[i];
+    const std::string match = w::DeviceMatch(d, devices);
+    for (size_t i = 0; i < d.buttons.size() && i < b.buttons.size(); ++i) {
+      if (d.buttons[i] && !b.buttons[i]) {
+        c.found = true; c.candidate_id = d.id; c.candidate = {match, InputType::kButton, int(i), 0, false};
+        return;
+      }
+    }
+    for (size_t i = 0; i < d.hats.size() && i < b.hats.size(); ++i) {
+      const uint8_t pressed = d.hats[i] & ~b.hats[i];
+      if (!pressed) continue;
+      uint8_t bit = 1;
+      while (!(pressed & bit)) bit <<= 1;
+      c.found = true; c.candidate_id = d.id; c.candidate = {match, InputType::kHat, int(i), bit, false};
+      return;
+    }
+    for (size_t i = 0; i < d.axes.size() && i < b.axes.size(); ++i) {
+      if (AxisTaken(s, c.row, match, int(i))) continue;
+      const int delta = d.axes[i] - b.axes[i];
+      if (std::abs(delta) >= 24000) {
+        c.found = true; c.candidate_id = d.id; c.rest = b.axes[i];
+        c.candidate = {match, InputType::kAxis, int(i), 0, delta < 0};
+        return;
+      }
+    }
+  }
+}
+
+// The detected input is back at rest: a button or hat let go, an axis returned.
+bool CandidateReleased(const State& s, const std::vector<w::Device>& devices) {
+  const Capture& c = s.capture;
+  for (const auto& d : devices) {
+    if (d.id != c.candidate_id) continue;
+    switch (c.candidate.type) {
+      case InputType::kButton: return c.candidate.index < int(d.buttons.size()) && !d.buttons[c.candidate.index];
+      case InputType::kHat: return c.candidate.index < int(d.hats.size()) && !(d.hats[c.candidate.index] & c.candidate.hat);
+      default: return c.candidate.index < int(d.axes.size()) && std::abs(d.axes[c.candidate.index] - c.rest) < 3000;
+    }
+  }
+  return false;
+}
+
+bool RestsMidRange(const State& s) {
+  const Capture& c = s.capture;
+  return c.found && c.candidate.type == InputType::kAxis && s.rows[c.row].kind != Kind::kSteering && std::abs(int(c.rest)) < 12000;
+}
+
+}  // namespace wheel_ui
+
 // --- App state -------------------------------------------------------------
 
 struct App {
@@ -248,11 +634,7 @@ struct App {
   std::string plus_zip, plus_update;
   int plus_mode = 0;
   std::unique_ptr<fm4::wheel::DeviceMonitor> wheel_monitor;
-  std::vector<bool> wheel_previous_buttons;
-  int wheel_capture = -1;
-  fm4::wheel::CalibrationTour wheel_tour;
-  fm4::wheel::ClutchCalibrationTour clutch_tour;
-  bool clutch_capture_error=false;
+  wheel_ui::State wheel_ui;
   // Profiles
   char new_profile[32] = {};
   int delete_candidate = -1;
@@ -494,10 +876,7 @@ struct App {
     // DirectInput wheel handles are exclusive. Release the preview before
     // starting the child, including any diagnostic haptic effect.
     wheel_monitor.reset();
-    wheel_tour.Cancel();
-    clutch_tour.Cancel();
-    wheel_previous_buttons.clear();
-    wheel_capture = -1;
+    wheel_ui.capture = {};
     const std::string exe = game_exe.u8string();
     const std::string cwd = exe_dir.u8string();
     const char* args[] = {exe.c_str(), nullptr};
@@ -546,7 +925,9 @@ struct App {
         last_exit = std::string(L("The game closed with an error (", "El juego se cerró con un error (")) + hex +
                     L("). The log and crash report are in the logs folder.",
                       "). El registro y el informe de fallo están en la carpeta logs.");
-      } else {
+      } else if (!settings.wheel.enabled && !settings.wheel.telemetry_udp) {
+        // Wheel and telemetry sessions keep their log: it lists the devices,
+        // force feedback and the telemetry values read.
         DeleteSessionLogs();
       }
     }
@@ -890,12 +1271,12 @@ void TabInstructions(App& app) {
       "El mod usa una instalación y partidas separadas y necesita espacio adicional. Esta adaptación experimental conserva el ejecutable del port; no reproduce todos los cambios del ejecutable modificado del mod. Solo se adaptan los DLC ya instalados con sus cabeceras válidas."));
   EndCard();
   BeginCard("##wheelhelp",L("4. Wheel and pedals (optional)", "4. Volante y pedales (opcional)"));
-  ImGui::TextWrapped("%s",L("In Controls, select your wheel and run guided calibration. Follow each prompt and finish when it shows OK. Live Axis bars let you check steering and pedals. Assign menu buttons and paddles; select Manual or Manual with clutch in FM4 if needed. The optional clutch currently acts as a configurable button above a pedal threshold.",
-      "En Controles, selecciona tu volante e inicia la calibración guiada. Sigue las indicaciones hasta ver OK. Las barras Axis muestran el giro y los pedales en vivo. Asigna botones de menú y levas; selecciona Manual o Manual con embrague en FM4 si lo necesitas. El embrague opcional activa un botón configurable al superar un umbral del pedal."));
+  ImGui::TextWrapped("%s",L("In the Wheel tab, press Start guided setup and follow each step: steering, pedals, buttons and an optional H-shifter, from any USB devices (a separate pedal set or button box works). The live view shows exactly what the game will read. Pick the device that receives force feedback, press Test, and start with a low strength.",
+      "En la pestaña Volante, pulsa Iniciar configuración guiada y sigue cada paso: dirección, pedales, botones y palanca en H opcional, desde cualquier dispositivo USB (pedales o botonera separados también). La vista en vivo muestra lo que leerá el juego. Elige el dispositivo de force feedback, pulsa Probar y empieza con poca fuerza."));
   ImGui::Spacing();
-  ImGui::TextWrapped("%s",L("Tested user setup: MOZA R3, 360 degrees in Pit House and Invert constant torque enabled. Set rotation before calibrating. FFB is experimental; start at low gain and adjust gradually. Other wheelbases may need different settings.",
-      "Configuración probada por el usuario: MOZA R3, 360 grados en Pit House e Invert constant torque activado. Configura el giro antes de calibrar. El FFB es experimental: empieza con poca ganancia y ajústala gradualmente. Otras bases pueden necesitar ajustes diferentes."));
-  if(ImGui::Button(L("Open controls", "Abrir controles"))) app.tab=Tab::kControls;
+  ImGui::TextWrapped("%s",L("Set the rotation in your wheel software first. The clutch pedal presses a button (B by default), so select Manual with clutch in FM4. SimHub telemetry is in the same tab.",
+      "Configura primero el giro en el programa de tu base. El embrague pulsa un botón (B por defecto), así que elige Manual con embrague en FM4. La telemetría para SimHub está en la misma pestaña."));
+  if(ImGui::Button(L("Open the Wheel tab", "Abrir la pestaña Volante"))) app.tab=Tab::kWheel;
   EndCard();
   BeginCard("##updatehelp",L("Updates and troubleshooting", "Actualizaciones y problemas"));
   ImGui::TextWrapped("%s",L("Close the game and launcher before replacing release files. Keep fm4.user.toml, your game folders and user data. If installation fails, check free space, shorten folder paths and read the task error. Close the game before changing wheel settings.",
@@ -1140,242 +1521,571 @@ void TabGraphics(App& app) {
   if (changed) app.Save();
 }
 
-bool WheelCalibrationTour(App& app,const fm4::wheel::Snapshot& state) {
-  namespace w=fm4::wheel;
-  auto& tour=app.wheel_tour;
-  auto& config=app.settings.wheel;
-  if(!tour.Active()) {
-    TextColored(w::Valid(config)?kOk:kWarn,w::Valid(config)?L("OK - wheel calibrated", "OK - volante calibrado")
-        :L("Calibrate the wheel and pedals to drive.", "Calibra el volante y los pedales para conducir."));
-    if(ImGui::Button(w::Valid(config)?L("Calibrate again", "Volver a calibrar"):L("Start guided calibration", "Iniciar calibracion guiada"))) {
-      tour.Start(config);app.wheel_capture=-1;app.clutch_tour.Cancel();
-    }
-  }
-  if(!tour.Active()) return false;
-  const char* instructions[]{
-    L("Center the wheel and release both pedals.", "Centra el volante y suelta los dos pedales."),
-    L("Press the accelerator fully and hold it there.", "Pisa el acelerador a fondo y mantenlo pisado."),
-    L("Release the accelerator completely.", "Suelta el acelerador por completo."),
-    L("Press the brake fully and hold it there.", "Pisa el freno a fondo y mantenlo pisado."),
-    L("Release the brake completely.", "Suelta el freno por completo."),
-    L("Turn fully left and hold it there. Keep both pedals released.", "Gira al tope izquierdo y mantenlo ahi. Deja sueltos los pedales."),
-    L("Turn fully right and hold it there.", "Gira al tope derecho y mantenlo ahi."),
-    L("Return the wheel to the center.", "Devuelve el volante al centro.")};
-  TextDim(L("Set rotation in your wheel software before calibrating; keep that setting afterwards.",
-      "Configura el giro en el programa de tu base antes de calibrar y conservalo despues."));
-  ImGui::Text(L("Step %d of 8", "Paso %d de 8"),tour.step+1);
-  ImGui::ProgressBar(float(tour.step)/8,ImVec2(-1,S(12)),"");
-  ImGui::TextWrapped("%s",instructions[tour.step]);
-  if(tour.step>=2) ImGui::Text(L("Accelerator detected: Axis %d", "Acelerador detectado: Axis %d"),tour.draft.throttle_axis);
-  if(tour.step>=4) ImGui::Text(L("Brake detected: Axis %d", "Freno detectado: Axis %d"),tour.draft.brake_axis);
-  if(tour.step>=6) ImGui::Text(L("Steering detected: Axis %d", "Direccion detectada: Axis %d"),tour.draft.steering_axis);
-  TextDim(L("Hold the requested position and press Next. Move only the requested control.",
-      "Manten la posicion indicada y pulsa Siguiente. Mueve solo el control solicitado."));
-  bool complete=false;
-  if(ImGui::Button(tour.step==7?L("Finish and save", "Finalizar y guardar"):L("Next", "Siguiente"))) {
-    if(tour.Next(state) && tour.step==8) {config=tour.draft;complete=true;}
-  }
-  ImGui::SameLine();
-  if(ImGui::Button(L("Cancel", "Cancelar"))) tour.Cancel();
-  if(tour.error!=w::CalibrationTour::None) {
-    const char* errors[]{"",
-      L("Reconnect the same wheel to continue.", "Reconecta el mismo volante para continuar."),
-      L("No clear movement detected. Move the requested control fully and retry.", "No se ha detectado recorrido. Mueve el control indicado hasta el final y repite."),
-      L("Several axes moved. Release the other controls and retry, or use manual calibration.", "Se han movido varios ejes. Suelta los otros controles y repite, o usa la calibracion manual."),
-      L("The position does not match this step. Check the instructions and retry.", "La posicion no corresponde a este paso. Comprueba la indicacion y repite.")};
-    TextColored(kWarn,errors[tour.error]);
-  }
-  if(complete) TextColored(kOk,L("OK - calibration saved", "OK - calibracion guardada"));
-  return complete;
+// A card without a title, for cards whose header opens and closes them.
+void BeginPanel(const char* id) {
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, kCard);
+  ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(12));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(S(20), S(14)));
+  ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 }
-bool WheelControls(App& app) {
+
+void DrawWheelLive(App& app, const wheel_ui::State& ui) {
+  using namespace wheel_ui;
+  const float height = S(210);
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const float width = ImGui::GetContentRegionAvail().x;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(p0, ImVec2(p0.x + width, p0.y + height), Col(ImVec4(0.07f, 0.075f, 0.085f, 1)), S(14));
+  const ImU32 strong = Col(ImVec4(0.42f, 0.43f, 0.47f, 1)), track = Col(kControl), accent = Col(kAccent), sound = Col(kOk);
+
+  // Wheel, turned as a 900-degree wheel would be.
+  const Binding& steer = ui.rows[0];
+  const float angle = steer.value * 450.0f * 3.14159265f / 180.0f;
+  const ImVec2 c(p0.x + S(105), p0.y + S(95));
+  const float r = S(78);
+  auto rot = [&](float x, float y) {
+    return ImVec2(c.x + x * std::cos(angle) - y * std::sin(angle), c.y + x * std::sin(angle) + y * std::cos(angle));
+  };
+  auto bar = [&](float x0, float y0, float x1, float y1, ImU32 col) {
+    dl->AddQuadFilled(rot(x0, y0), rot(x1, y0), rot(x1, y1), rot(x0, y1), col);
+  };
+  dl->AddCircle(c, r, strong, 64, S(14));
+  bar(-r, -S(6), r, S(6), strong);
+  bar(-S(6), 0, S(6), r, strong);
+  dl->AddCircleFilled(c, S(22), Col(kControl), 32);
+  dl->AddCircle(c, S(22), strong, 32, S(3));
+  bar(-S(4), -r - S(8), S(4), -r + S(8), accent);
+  char text[48];
+  std::snprintf(text, sizeof(text), "%s %s", L("Steering", "Dirección"), steer.inputs.empty() ? "\xE2\x80\x94" : steer.text.c_str());
+  const ImVec2 ts = ImGui::CalcTextSize(text);
+  dl->AddText(ImVec2(c.x - ts.x / 2, p0.y + height - S(28)), Col(kText), text);
+
+  // Pedals.
+  const char* pedals[] = {"CLUTCH", "BRAKE", "THROTTLE"};
+  const char* names[] = {L("Clutch", "Embrague"), L("Brake", "Freno"), L("Throttle", "Acelerador")};
+  for (int i = 0; i < 3; ++i) {
+    const Binding* row = nullptr;
+    for (const auto& rr : ui.rows) if (std::strcmp(rr.key, pedals[i]) == 0) row = &rr;
+    const float x = p0.x + S(230) + i * S(62), top = p0.y + S(18), bottom = p0.y + height - S(54);
+    dl->AddRectFilled(ImVec2(x, top), ImVec2(x + S(30), bottom), track, S(6));
+    if (row && !row->inputs.empty() && row->value > 0)
+      dl->AddRectFilled(ImVec2(x, bottom - (bottom - top) * row->value), ImVec2(x + S(30), bottom), i == 2 ? sound : accent, S(6));
+    const ImVec2 ns = ImGui::CalcTextSize(names[i]);
+    dl->AddText(ImVec2(x + S(15) - ns.x / 2, bottom + S(6)), Col(kDim), names[i]);
+    const std::string value = row && !row->inputs.empty() ? row->text : "\xE2\x80\x94";
+    const ImVec2 vs = ImGui::CalcTextSize(value.c_str());
+    dl->AddText(ImVec2(x + S(15) - vs.x / 2, bottom + S(24)), Col(kText), value.c_str());
+  }
+
+  // Button chips.
+  float x = p0.x + S(430), y = p0.y + S(16);
+  const float chip_w = S(52), chip_h = S(24), right = p0.x + width - S(12);
+  for (const auto& row : ui.rows) {
+    if (row.kind != Kind::kButton) continue;
+    if (x + chip_w > right) { x = p0.x + S(430); y += chip_h + S(6); }
+    const bool bound = !row.inputs.empty();
+    const ImU32 fill = row.pressed ? sound : Col(kControl, bound ? 1.0f : 0.45f);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + chip_w, y + chip_h), fill, chip_h / 2);
+    const ImVec2 cs = ImGui::CalcTextSize(row.chip);
+    dl->AddText(ImVec2(x + (chip_w - cs.x) / 2, y + (chip_h - cs.y) / 2), Col(row.pressed ? ImVec4(0, 0, 0, 1) : kText, bound ? 1.0f : 0.5f), row.chip);
+    x += chip_w + S(6);
+  }
+  ImGui::Dummy(ImVec2(width, height));
+  (void)app;
+}
+
+// A small horizontal meter: centred for steering, filled from the left otherwise.
+void Meter(float value, bool centred, float width) {
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  const float h = S(8), y = p.y + (ImGui::GetFrameHeight() - h) / 2;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(ImVec2(p.x, y), ImVec2(p.x + width, y + h), Col(kControl), h / 2);
+  if (centred) {
+    const float mid = p.x + width / 2, end = mid + value * width / 2;
+    if (std::fabs(end - mid) >= 1) dl->AddRectFilled(ImVec2(std::min(mid, end), y), ImVec2(std::max(mid, end), y + h), Col(kAccent), h / 2);
+  } else if (value > 0) {
+    dl->AddRectFilled(ImVec2(p.x, y), ImVec2(p.x + width * std::clamp(value, 0.0f, 1.0f), y + h), Col(kAccent), h / 2);
+  }
+  ImGui::Dummy(ImVec2(width, ImGui::GetFrameHeight()));
+}
+
+bool CardHeader(const char* id, const char* title, const char* summary, bool& open) {
+  ImGui::PushID(id);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  const float w = ImGui::GetContentRegionAvail().x;
+  const bool clicked = ImGui::InvisibleButton("hdr", ImVec2(w, ImGui::GetTextLineHeight() * 1.4f));
+  if (clicked) open = !open;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  ImGui::PushFont(g_bold, ImGui::GetStyle().FontSizeBase * 1.1f);
+  dl->AddText(p, Col(kText), title);
+  ImGui::PopFont();
+  const ImVec2 ss = ImGui::CalcTextSize(summary);
+  dl->AddText(ImVec2(p.x + w - ss.x - S(22), p.y + S(2)), Col(kDim), summary);
+  dl->AddText(ImVec2(p.x + w - S(12), p.y + S(1)), Col(kDim), open ? "-" : "+");
+  ImGui::PopID();
+  return clicked;
+}
+
+bool Percent(const char* label, int* value, int lo, int hi, const char* hint = nullptr) {
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(label);
+  if (hint && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", hint);
+  ImGui::SameLine(S(170));
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::PushID(label);
+  const bool changed = ImGui::SliderInt("##v", value, lo, hi, "%d %%", ImGuiSliderFlags_AlwaysClamp);
+  ImGui::PopID();
+  return changed;
+}
+
+void TabWheel(App& app) {
   namespace w = fm4::wheel;
+  using namespace wheel_ui;
+  auto& ui = app.wheel_ui;
   auto& c = app.settings.wheel;
   if (app.game) {
-    TextDim(L("The game has control of the wheel. Close it to calibrate or test FFB.",
-        "El juego tiene el control del volante. Cierralo para calibrar o probar FFB."));
-    return false;
+    BeginCard("##wheelbusy", L("Wheel", "Volante"));
+    TextDim(L("The game has the wheel. Close the game to change bindings or test force feedback; changes apply from the next game start.",
+              "El juego tiene el volante. Ciérralo para cambiar asignaciones o probar el force feedback; los cambios se aplican al volver a iniciarlo."));
+    EndCard();
+    return;
   }
   if (!app.wheel_monitor) app.wheel_monitor = std::make_unique<w::DeviceMonitor>(true);
-  app.wheel_monitor->Select(c.device);
-  app.wheel_monitor->SetActive((SDL_GetWindowFlags(app.window) & SDL_WINDOW_INPUT_FOCUS) != 0 && !app.game);
-  const auto snapshot = app.wheel_monitor->Read();
+  app.wheel_monitor->ConfigureForce(c);
+  const auto snap = app.wheel_monitor->Read();
+  const auto& devices = snap.devices;
+  if (!ui.loaded) {
+    Load(ui, c);
+    std::snprintf(ui.target, sizeof(ui.target), "%s", c.telemetry_target.c_str());
+    ui.loaded = true;
+  }
   bool changed = false;
-  BeginCard("##wheel", L("Steering wheel - experimental", "Volante - experimental"));
-  ImGui::BeginDisabled(app.game != nullptr);
-  changed |= ImGui::Checkbox(L("Use steering wheel", "Usar volante"), &c.enabled);
-  if(!app.wheel_tour.Active() && ImGui::CollapsingHeader("Force feedback")) {
-  changed |= ImGui::Checkbox(L("Experimental game FFB", "FFB experimental del juego"), &c.ffb);
-  if(c.ffb) {
-    changed |= ImGui::SliderInt(L("Force limit (%)", "Límite de fuerza (%)"),&c.ffb_gain,0,100);
-    changed |= ImGui::Checkbox(L("Invert constant torque", "Invertir fuerza constante"),&c.ffb_invert);
-  }
-  }
-  if (ImGui::BeginCombo(L("Device", "Dispositivo"), snapshot.connected && snapshot.key==c.device ? snapshot.name.c_str() : L("Select a wheel", "Selecciona un volante"))) {
-    for (size_t i=0;i<snapshot.devices.size();++i) {
-      const auto& d = snapshot.devices[i];
-      ImGui::PushID(int(i));
-      if (ImGui::Selectable(d.name.c_str(), c.device == d.key)) {
-        c.device = d.key; c.calibration = 0; app.wheel_capture = -1; changed = true;
-        app.wheel_tour.Cancel();
-        app.clutch_tour.Cancel();c.clutch_calibration=0;
+  auto commit = [&] { Store(ui, c); changed = true; };
+  TrackCapture(ui, devices);
+  UpdateLive(ui, c, devices);
+  Capture& cap = ui.capture;
+  auto end_capture = [&](bool finished) {
+    const bool guided = cap.guided;
+    cap = Capture{};
+    if (finished && guided)
+      ui.info = L("All set. Check the live view: turn the wheel, press the pedals and buttons. Bindings are saved.",
+                  "Listo. Comprueba la vista en vivo: gira el volante, pisa los pedales y pulsa los botones. Asignaciones guardadas.");
+  };
+  auto advance = [&] {
+    if (cap.guided && cap.row + 1 < int(ui.rows.size())) BeginCapture(ui, cap.row + 1, true, devices);
+    else end_capture(true);
+  };
+  auto commit_candidate = [&] {
+    if (!cap.found) return;
+    Binding& row = ui.rows[cap.row];
+    if (row.kind == Kind::kButton) {
+      for (auto& other : ui.rows) {
+        if (&other == &row || other.kind != Kind::kButton) continue;
+        other.inputs.erase(std::remove_if(other.inputs.begin(), other.inputs.end(),
+                                          [&](const Input& i) { return i.Same(cap.candidate); }),
+                           other.inputs.end());
       }
+    }
+    if (cap.adding && row.kind == Kind::kButton) {
+      if (std::none_of(row.inputs.begin(), row.inputs.end(), [&](const Input& i) { return i.Same(cap.candidate); }))
+        row.inputs.push_back(cap.candidate);
+    } else {
+      row.inputs = {cap.candidate};
+    }
+    commit();
+    advance();
+  };
+  // A single Bind needs no Finish: a button binds as soon as it is pressed, an
+  // axis once it has moved through its travel and come back.
+  if (cap.row >= 0 && !cap.guided && cap.found) {
+    if (cap.candidate.type != InputType::kAxis) commit_candidate();
+    else if (CandidateReleased(ui, devices) && !RestsMidRange(ui)) {
+      if (cap.released_at == Clock::time_point{}) cap.released_at = Clock::now();
+      else if (Clock::now() - cap.released_at > std::chrono::milliseconds(300)) commit_candidate();
+    } else cap.released_at = {};
+  }
+  if (cap.row >= 0 && !ImGui::GetIO().WantTextInput) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter) && cap.found) commit_candidate();
+    else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) end_capture(false);
+  }
+
+  // --- Main card: live view and the setup step, always in sight.
+  BeginCard("##wheelmain", L("Wheel, pedals and buttons", "Volante, pedales y botones"),
+            L("Bind your wheel, pedals and buttons from any USB devices. Live: exactly what the game will see. Changes apply from the next game start.",
+              "Asigna volante, pedales y botones desde cualquier dispositivo USB. En vivo: exactamente lo que verá el juego. Los cambios se aplican al iniciar el juego."));
+  if (BeginRows("##wheelon")) {
+    Row(L("Use the racing wheel", "Usar el volante"),
+        L("Off: the game uses controllers and the keyboard as before.", "Desactivado: el juego usa mandos y teclado como antes."));
+    if (Toggle("##wheelenabled", &c.enabled)) changed = true;
+    EndRows();
+  }
+  DrawWheelLive(app, ui);
+  ImGui::Dummy(ImVec2(0, S(6)));
+  if (cap.row < 0) {
+    if (PrimaryButton(L("Start guided setup", "Iniciar configuración guiada"), ImVec2(S(240), S(36)))) {
+      ui.info.clear();
+      BeginCapture(ui, 0, true, devices);
+    }
+  } else if (ImGui::Button(cap.guided ? L("Stop setup", "Detener configuración") : L("Cancel", "Cancelar"), ImVec2(S(240), S(36)))) {
+    end_capture(false);
+  }
+  if (!ui.info.empty()) { ImGui::SameLine(); ImGui::PushTextWrapPos(); TextColored(kOk, ui.info.c_str()); ImGui::PopTextWrapPos(); }
+
+  if (cap.row >= 0) {
+    Binding& row = ui.rows[cap.row];
+    ImGui::Dummy(ImVec2(0, S(6)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.13f, 0.135f, 0.155f, 1));
+    ImGui::PushStyleColor(ImGuiCol_Border, kAccent);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(8));
+    ImGui::BeginChild("##step", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+    Title(L(row.label, row.label_es), 1.2f);
+    if (cap.guided) {
+      ImGui::SameLine();
+      char step[48];
+      std::snprintf(step, sizeof(step), L("Step %d of %d", "Paso %d de %d"), cap.row + 1, int(ui.rows.size()));
+      TextDim(step);
+    }
+    ImGui::TextWrapped("%s", L(row.prompt, row.prompt_es));
+    if (!cap.guided)
+      TextDim(row.kind == Kind::kButton ? L("It binds as soon as you press it.", "Se asigna en cuanto lo pulses.")
+                                        : L("It binds when you let go.", "Se asigna al soltarlo."));
+    if (!cap.found) {
+      const float t = float(ImGui::GetTime());
+      StatusDot(ImVec4(kOk.x, kOk.y, kOk.z, 0.4f + 0.6f * std::fabs(std::sin(t * 2.2f))));
+      ImGui::TextUnformatted(row.kind == Kind::kSteering ? L("Listening - turn the wheel left...", "Escuchando: gira el volante a la izquierda...")
+                             : row.kind == Kind::kPedal  ? L("Listening - press the pedal...", "Escuchando: pisa el pedal...")
+                                                         : L("Listening - press a button...", "Escuchando: pulsa un botón..."));
+    } else {
+      StatusDot(kOk);
+      std::string where = std::string(L("Detected: ", "Detectado: ")) + DeviceName(devices, cap.candidate.device) + " \xC2\xB7 " + Describe(cap.candidate);
+      if (cap.candidate.type == InputType::kAxis) where += std::string(L(" \xC2\xB7 rests at ", " \xC2\xB7 reposo ")) + std::to_string(cap.rest);
+      ImGui::TextWrapped("%s", where.c_str());
+      if (const auto* d = Resolve(devices, cap.candidate.device)) {
+        float v; bool p; std::string t;
+        Evaluate(ui, c, row, cap.candidate, *d, v, p, t);
+        Meter(row.kind == Kind::kSteering ? v : v, row.kind == Kind::kSteering, ImGui::GetContentRegionAvail().x - S(200));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(cap.candidate.type == InputType::kAxis ? t.c_str() : p ? L("pressed", "pulsado") : L("released", "suelto"));
+        if (cap.candidate.type == InputType::kAxis) {
+          ImGui::SameLine();
+          if (ImGui::Checkbox(L("Invert##step", "Invertir##step"), &cap.candidate.inverted)) cap.user_invert = true;
+        }
+      }
+      if (RestsMidRange(ui))
+        TextColored(kWarn, L("This axis rests in the middle of its range, so the game would read it as half pressed. Calibrate it to its full range in the device's own software, or Rebind.",
+                             "Este eje reposa a media carrera, así que el juego lo leería medio pisado. Calíbralo en el programa del dispositivo o vuelve a asignarlo."));
+      else if (row.kind == Kind::kButton) {
+        for (const auto& other : ui.rows) {
+          if (&other == &row || other.kind != Kind::kButton) continue;
+          if (std::any_of(other.inputs.begin(), other.inputs.end(), [&](const Input& i) { return i.Same(cap.candidate); })) {
+            TextColored(kWarn, (std::string(L("This is also bound to ", "También está asignado a ")) + L(other.label, other.label_es) +
+                                L(". Next moves it here.", ". Siguiente lo mueve aquí.")).c_str());
+            break;
+          }
+        }
+      }
+    }
+    ImGui::Dummy(ImVec2(0, S(4)));
+    if (cap.guided) {
+      ImGui::BeginDisabled(cap.row == 0);
+      if (ImGui::Button(L("Back", "Atrás"))) BeginCapture(ui, cap.row - 1, true, devices);
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+    }
+    if (ImGui::Button(L("Leave unbound", "Dejar sin asignar"))) { row.inputs.clear(); commit(); advance(); }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("This control has nothing on your rig", "Este control no existe en tu equipo"));
+    ImGui::SameLine();
+    if (ImGui::Button(cap.guided ? L("Skip", "Omitir") : L("Cancel##step", "Cancelar##step"))) {
+      // No H-shifter: skipping 1st gear while it is unbound skips the others too.
+      if (cap.guided && std::strcmp(row.key, "GEAR1") == 0 && row.inputs.empty()) end_capture(true);
+      else if (cap.guided) advance();
+      else end_capture(false);
+    }
+    if (cap.row >= 0 && cap.found) {
+      ImGui::SameLine();
+      if (ImGui::Button(L("Rebind", "Reasignar"))) BeginCapture(ui, cap.row, cap.guided, devices);
+      if (cap.guided) {
+        ImGui::SameLine();
+        if (PrimaryButton(cap.row + 1 == int(ui.rows.size()) ? L("Finish", "Terminar") : L("Next", "Siguiente"), ImVec2(S(120), 0)))
+          commit_candidate();
+      }
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+  }
+
+  EndCard();
+
+  // --- Bindings: collapsible, so the live view above stays in sight while
+  // the cards below change dead zones and the like.
+  BeginPanel("##wheelbindings");
+  int bound = 0;
+  for (const auto& r : ui.rows) bound += r.inputs.empty() ? 0 : 1;
+  char bindings_summary[48];
+  std::snprintf(bindings_summary, sizeof(bindings_summary), L("%d of %d bound", "%d de %d asignados"), bound, int(ui.rows.size()));
+  CardHeader("bindings", L("Bindings", "Asignaciones"), bindings_summary, ui.open_bindings);
+  if (ui.open_bindings || cap.row >= 0) {
+  ImGui::Dummy(ImVec2(0, S(4)));
+  if (ImGui::BeginTable("##bindings", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+    ImGui::TableSetupColumn(L("Control", "Control"), ImGuiTableColumnFlags_WidthFixed, S(150));
+    ImGui::TableSetupColumn(L("Bound to", "Asignado a"), ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn(L("Live", "En vivo"), ImGuiTableColumnFlags_WidthFixed, S(110));
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, S(72));
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, S(46));
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, S(58));
+    ImGui::TableHeadersRow();
+    for (int i = 0; i < int(ui.rows.size()); ++i) {
+      Binding& row = ui.rows[i];
+      ImGui::PushID(i);
+      ImGui::TableNextRow();
+      if (cap.row == i) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, Col(kAccent, 0.25f));
+      ImGui::TableSetColumnIndex(0);
+      ImGui::AlignTextToFramePadding();
+      ImGui::TextUnformatted(L(row.label, row.label_es));
+      ImGui::TableSetColumnIndex(1);
+      std::string bound;
+      for (const auto& in : row.inputs) bound += (bound.empty() ? "" : "  +  ") + DeviceName(devices, in.device) + " \xC2\xB7 " + Describe(in);
+      ImGui::AlignTextToFramePadding();
+      if (bound.empty()) TextDim(L("Not bound", "Sin asignar"));
+      else {
+        ImGui::TextUnformatted(bound.c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", bound.c_str());
+      }
+      ImGui::TableSetColumnIndex(2);
+      if (row.kind == Kind::kButton) {
+        StatusDot(row.pressed ? kOk : kControl);
+        ImGui::TextUnformatted(row.text.c_str());
+      } else {
+        Meter(row.value, row.kind == Kind::kSteering, S(56));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(row.text.c_str());
+      }
+      ImGui::TableSetColumnIndex(3);
+      if (row.kind != Kind::kButton && !row.inputs.empty()) {
+        if (ImGui::Checkbox(L("Invert", "Invertir"), &row.inputs[0].inverted)) commit();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Reverse this axis. Use it if the live bar moves the wrong way.", "Invierte este eje si la barra se mueve al revés."));
+      }
+      ImGui::TableSetColumnIndex(4);
+      ImGui::BeginDisabled(cap.row >= 0 && cap.guided);
+      if (ImGui::SmallButton(L("Bind", "Asignar"))) { ui.info.clear(); BeginCapture(ui, i, false, devices); }
+      ImGui::EndDisabled();
+      ImGui::TableSetColumnIndex(5);
+      if (row.kind == Kind::kButton && !row.inputs.empty()) {
+        if (ImGui::SmallButton("+")) {
+          BeginCapture(ui, i, false, devices);
+          cap.adding = true;
+          ui.info = L("Press another input for this button; it keeps the ones it has.", "Pulsa otra entrada para este botón; conserva las que tiene.");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Add another input that presses this same button (e.g. a handbrake lever and a rim button)", "Añade otra entrada que pulse este mismo botón"));
+        ImGui::SameLine(0, S(4));
+      }
+      if (!row.inputs.empty() && ImGui::SmallButton("x")) { row.inputs.clear(); commit(); }
       ImGui::PopID();
     }
-    ImGui::EndCombo();
+    ImGui::EndTable();
   }
-  TextDim(L("Close the game before changing calibration. In wheel mode, assign menu buttons on the wheel too.",
-      "Cierra el juego para cambiar la calibración. Asigna tambien los botones de menú al volante."));
-  const bool connected = snapshot.connected && snapshot.key == c.device && !snapshot.axes.empty();
-  if (connected) {
-    changed |= WheelCalibrationTour(app,snapshot);
-    if(!app.wheel_tour.Active() && w::Valid(c)) {
-      ImGui::TextUnformatted(L("Live controls", "Controles en vivo"));
-      auto live_axis = [&](const char* name,int axis,float value,bool steering) {
-        if(axis<0 || size_t(axis)>=snapshot.axes.size()) return;
-        ImGui::Text("%s - Axis %d",name,axis);
-        char overlay[32];std::snprintf(overlay,sizeof(overlay),"%.0f%%",value*100);
-        ImGui::ProgressBar(steering?(value+1)*0.5f:value,ImVec2(-1,S(22)),overlay);
-        if(steering) {
-          const auto min=ImGui::GetItemRectMin(),max=ImGui::GetItemRectMax();
-          const float center=(min.x+max.x)*0.5f;
-          ImGui::GetWindowDrawList()->AddLine(ImVec2(center,min.y),ImVec2(center,max.y),IM_COL32(255,255,255,160));
-        }
-      };
-      if(size_t(c.steering_axis)<snapshot.axes.size()) live_axis(L("Steering", "Direccion"),c.steering_axis,w::Steering(snapshot.axes[c.steering_axis],c),true);
-      if(size_t(c.throttle_axis)<snapshot.axes.size()) live_axis(L("Accelerator", "Acelerador"),c.throttle_axis,w::Pedal(snapshot.axes[c.throttle_axis],c.throttle_rest,c.throttle_full),false);
-      if(size_t(c.brake_axis)<snapshot.axes.size()) live_axis(L("Brake", "Freno"),c.brake_axis,w::Pedal(snapshot.axes[c.brake_axis],c.brake_rest,c.brake_full),false);
-      if(w::ValidClutch(c) && size_t(c.clutch_axis)<snapshot.axes.size()) live_axis(L("Clutch", "Embrague"),c.clutch_axis,w::Pedal(snapshot.axes[c.clutch_axis],c.clutch_rest,c.clutch_full),false);
-    }
-    if(ImGui::CollapsingHeader(L("View all axes in real time", "Ver todos los ejes en tiempo real"))) {
-      for(size_t i=0;i<snapshot.axes.size();++i) {
-        char text[80];std::snprintf(text,sizeof(text),"Axis %zu: %.0f%%",i,(snapshot.axes[i]+32768)/65535.0f*100);
-        ImGui::ProgressBar((snapshot.axes[i]+32768)/65535.0f,ImVec2(-1,S(20)),text);
-      }
-    }
-    ImGui::BeginDisabled(app.wheel_tour.Active());
-    const char* action_names[]{"A","B","X","Y","LB","RB","Start","Back","LS","RS","Up","Down","Left","Right"};
-    if(ImGui::CollapsingHeader(L("Paddles and clutch", "Levas y embrague"))) {
-      TextDim(L("Match these destination buttons to the wheel layout selected in FM4. Select Manual or Manual with clutch in game.",
-          "Haz coincidir los botones de destino con el esquema de volante de FM4. Elige Manual o Manual con embrague en el juego."));
-      for(int paddle=0;paddle<2;++paddle) {
-        ImGui::PushID(100+paddle);
-        ImGui::Text("%s: %d",paddle==0?L("Shift up", "Subir marcha"):L("Shift down", "Bajar marcha"),c.buttons[14+paddle]);
-        ImGui::SameLine();
-        if(ImGui::SmallButton(L("Assign paddle", "Asignar leva"))) app.wheel_capture=14+paddle;
-        ImGui::SameLine();
-        if(ImGui::SmallButton(L("Clear", "Quitar"))) {c.buttons[14+paddle]=-1;changed=true;}
-        int& action=paddle==0?c.shift_up_action:c.shift_down_action;
-        changed |= ImGui::Combo(L("Game button", "Boton del juego"),&action,action_names,14);
+  TextDim(L("Enter: next step \xC2\xB7 Esc: stop the setup \xC2\xB7 Bind on any row binds just that control.",
+            "Intro: siguiente paso \xC2\xB7 Esc: detener \xC2\xB7 Asignar en una fila asigna solo ese control."));
+  }
+  EndCard();
+
+  // --- Force feedback.
+  BeginPanel("##wheelffb");
+  const w::FfbMode mode = w::ParseFfbMode(c.ffb_mode);
+  char ffb_summary[64];
+  std::snprintf(ffb_summary, sizeof(ffb_summary), "%s \xC2\xB7 %d %%",
+                mode == w::FfbMode::kEffects ? L("On", "Activado") : mode == w::FfbMode::kRumble ? L("Rumble only", "Solo vibración") : L("Off", "Desactivado"),
+                c.ffb_strength);
+  CardHeader("ffb", L("Force feedback", "Force feedback"), ffb_summary, ui.open_ffb);
+  if (ui.open_ffb) {
+    TextDim(L("Device that receives the forces", "Dispositivo que recibe las fuerzas"));
+    const std::string steer_device = Get(ui, "STEER").inputs.empty() ? std::string() : Get(ui, "STEER").inputs[0].device;
+    std::string preview = c.ffb_device.empty()
+        ? std::string(L("The wheel base", "La base del volante")) + (steer_device.empty() ? "" : " (" + DeviceName(devices, steer_device) + ")")
+        : DeviceName(devices, c.ffb_device);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - S(110));
+    if (ImGui::BeginCombo("##ffbdevice", preview.c_str())) {
+      if (ImGui::Selectable(L("The wheel base", "La base del volante"), c.ffb_device.empty())) { c.ffb_device.clear(); changed = true; }
+      for (const auto& d : devices) {
+        ImGui::PushID(int(d.id));
+        const std::string match = w::DeviceMatch(d, devices);
+        if (ImGui::Selectable(d.name.c_str(), c.ffb_device == match)) { c.ffb_device = match; changed = true; }
         ImGui::PopID();
       }
-      changed |= ImGui::Checkbox(L("Use clutch pedal", "Usar pedal de embrague"),&c.clutch_enabled);
-      if(c.clutch_enabled) {
-        auto& ct=app.clutch_tour;
-        if(!ct.Active() && ImGui::Button(L("Calibrate clutch", "Calibrar embrague"))) {ct.Start(c);app.clutch_capture_error=false;}
-        if(ct.Active()) {
-          const char* prompts[]{L("Release all pedals and keep the wheel still.", "Suelta todos los pedales y deja el volante quieto."),
-              L("Press only the clutch fully and hold it.", "Pisa solo el embrague a fondo y mantenlo pisado."),
-              L("Release the clutch completely.", "Suelta el embrague por completo.")};
-          ImGui::Text(L("Clutch: step %d of 3", "Embrague: paso %d de 3"),ct.step+1);
-          ImGui::TextWrapped("%s",prompts[ct.step]);
-          if(ImGui::Button(ct.step==2?L("Save clutch", "Guardar embrague"):L("Next##clutch", "Siguiente##clutch"))) {
-            app.clutch_capture_error=!ct.Next(snapshot);
-            if(ct.step==3) {
-              c.clutch_axis=ct.draft.clutch_axis;c.clutch_rest=ct.draft.clutch_rest;
-              c.clutch_full=ct.draft.clutch_full;c.clutch_calibration=3;changed=true;
-            }
-          }
-          ImGui::SameLine();if(ImGui::Button(L("Cancel##clutch", "Cancelar##clutch"))) ct.Cancel();
-          if(app.clutch_capture_error) TextColored(kWarn,L("Position not detected. Move only the clutch and retry.", "Posicion no detectada. Mueve solo el embrague y repite."));
-        }
-        changed |= ImGui::Combo(L("Clutch game button", "Boton de embrague del juego"),&c.clutch_action,action_names,14);
-        changed |= ImGui::SliderInt(L("Activation threshold (%)", "Umbral de activacion (%)"),&c.clutch_threshold,1,100);
-        TextDim(L("The pedal activates this button past the threshold; native analog clutch support is not implemented.",
-            "El pedal activa este boton al superar el umbral; el embrague analogico nativo aun no esta implementado."));
-        if(w::ValidClutch(c)) ImGui::Text(L("OK - clutch Axis %d", "OK - embrague Axis %d"),c.clutch_axis);
-      } else app.clutch_tour.Cancel();
+      ImGui::EndCombo();
     }
-    if(ImGui::CollapsingHeader(L("Advanced calibration and FFB test", "Calibracion avanzada y prueba FFB"))) {
-    ImGui::Text(L("%zu axes, %zu buttons", "%zu ejes, %zu botones"), snapshot.axes.size(), snapshot.buttons.size());
-    ImGui::BeginDisabled(snapshot.test_busy);
-    if (ImGui::Button(L("Test FFB: 20% pulse, 150 ms", "Probar FFB: pulso al 20%, 150 ms"))) app.wheel_monitor->TestHaptics();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(snap.test_busy);
+    if (ImGui::Button(L("Test", "Probar"), ImVec2(S(100), 0))) {
+      app.wheel_monitor->ConfigureForce(c);
+      app.wheel_monitor->TestHaptics();
+    }
     ImGui::EndDisabled();
-    if (!snapshot.haptic_status.empty()) ImGui::TextWrapped("%s",snapshot.haptic_status.c_str());
-    auto axis = [&](const char* label, int& selected, int mask) {
-      if (ImGui::SliderInt(label, &selected,0,int(snapshot.axes.size())-1)) {c.calibration &= ~mask; changed=true;}
-    };
-    axis(L("Steering axis", "Eje de dirección"),c.steering_axis,7);
-    axis(L("Throttle axis", "Eje del acelerador"),c.throttle_axis,24);
-    axis(L("Brake axis", "Eje del freno"),c.brake_axis,96);
-    if (snapshot.axes.size() > 5 && ImGui::Button(L("MOZA R3 pedals: throttle axis 2 / brake axis 5", "Pedales MOZA R3: acelerador eje 2 / freno eje 5"))) {
-      c.throttle_axis = 2; c.brake_axis = 5; c.calibration &= ~120; changed = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Pulls the wheel LEFT, then RIGHT, gently (15 %)", "Tira del volante a la IZQUIERDA y luego a la DERECHA, suave (15 %)"));
+    if (!snap.haptic_status.empty()) TextDim(snap.haptic_status.c_str());
+    TextDim(L("Pick your wheel base. Test pulls the wheel LEFT, then RIGHT. If it pulls right first, tick Reverse force direction. A base can appear twice; if Test does not move the wheel, pick the other entry.",
+              "Elige tu base. Probar tira a la IZQUIERDA y luego a la DERECHA. Si tira primero a la derecha, marca Invertir dirección. Una base puede aparecer dos veces; si no se mueve, elige la otra."));
+    ImGui::Dummy(ImVec2(0, S(4)));
+    if (BeginRows("##ffbmode")) {
+      Row(L("Force feedback", "Force feedback"));
+      if (Combo<std::string>("##mode", c.ffb_mode, {{"on", L("On: the game's own wheel effects", "Activado: los efectos del propio juego")},
+                                                     {"rumble", L("Rumble only", "Solo vibración")},
+                                                     {"off", L("Off", "Desactivado")}}))
+        changed = true;
+      EndRows();
     }
-    TextDim(L("Axis numbers start at 0. Capture released and fully pressed positions after selecting pedal axes.",
-        "Los ejes empiezan en 0. Tras elegirlos, captura cada pedal suelto y pisado a fondo."));
-    auto capture = [&](const char* label,int index,int& value,int bit) {
-      ImGui::PushID(bit);
-      const bool valid = index>=0 && size_t(index)<snapshot.axes.size();
-      ImGui::BeginDisabled(!valid);
-      if (ImGui::Button(label)) {value=snapshot.axes[index];c.calibration |= bit;changed=true;}
+    changed |= Percent(L("Strength", "Fuerza"), &c.ffb_strength, 0, 200,
+                       L("Overall force feedback strength. Above 100 % the game's strongest forces clip at the base's maximum.", "Fuerza general. Por encima del 100 % las fuerzas más fuertes se recortan al máximo de la base."));
+    changed |= Percent(L("Minimum force", "Fuerza mínima"), &c.ffb_min_force, 0, 30,
+                       L("Lifts small forces past a geared or belted wheel's friction. A direct-drive base needs 0.", "Eleva las fuerzas pequeñas en volantes de engranajes o correa. Una base direct drive necesita 0."));
+    changed |= Percent(L("Spring", "Muelle"), &c.ffb_spring, 0, 200, L("The game's centring spring, which stiffens with speed", "El muelle de centrado del juego"));
+    changed |= Percent(L("Damper", "Amortiguador"), &c.ffb_damper, 0, 200, L("The game's damper (resists fast wheel movement)", "El amortiguador del juego"));
+    changed |= Percent(L("Friction", "Fricción"), &c.ffb_friction, 0, 200, L("The game's friction effect", "La fricción del juego"));
+    changed |= Percent(L("Inertia", "Inercia"), &c.ffb_inertia, 0, 200, L("The game's inertia effect", "La inercia del juego"));
+    changed |= Percent(L("Rumble", "Vibración"), &c.ffb_rumble, 0, 100, L("The game's controller rumble, played as a vibration on the wheel", "La vibración del juego, en el volante"));
+    changed |= Percent(L("Engine rumble", "Vibración motor"), &c.ffb_rumble_engine, 0, 100, L("Share for the engine (right) motor", "Parte del motor derecho (motor)"));
+    changed |= Percent(L("Road rumble", "Vibración firme"), &c.ffb_rumble_road, 0, 100, L("Share for the bumps, kerbs and impacts (left) motor", "Parte del motor izquierdo (baches, pianos, golpes)"));
+    changed |= ImGui::Checkbox(L("Reverse force direction", "Invertir dirección de la fuerza"), &c.ffb_invert);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", L("Leave off unless the wheel pushes away from centre in corners", "Déjalo desactivado salvo que el volante empuje hacia fuera en las curvas"));
+    TextDim(L("Start low on a direct-drive base. FM4 sends its own spring, damper, friction, inertia and constant-force effects; these sliders scale them.",
+              "Empieza bajo en una base direct drive. FM4 envía sus propios efectos; estos controles los escalan."));
+  }
+  EndCard();
+
+  // --- Telemetry.
+  BeginPanel("##wheeltelemetry");
+  CardHeader("telemetry", L("Telemetry", "Telemetría"), c.telemetry_udp ? c.telemetry_target.c_str() : L("Off", "Desactivada"), ui.open_telemetry);
+  if (ui.open_telemetry) {
+    if (BeginRows("##telem")) {
+      Row(L("Send telemetry", "Enviar telemetría"),
+          L("For SimHub, dashboards and shakers: RPM, gear, speed, pedals, wheel slip and suspension in Forza's Data Out format. Menus and pause send race off.",
+            "Para SimHub, paneles y shakers: RPM, marcha, velocidad, pedales, deslizamiento y suspensión en el formato Data Out de Forza."));
+      changed |= Toggle("##telemetry", &c.telemetry_udp);
+      Row(L("Game in SimHub", "Juego en SimHub"));
+      const std::string before = c.telemetry_format;
+      if (Combo<std::string>("##format", c.telemetry_format, {{"fm7", "Forza Motorsport 7"}, {"horizon", "Forza Horizon 4 / 5"}})) {
+        // Follow the port to the chosen game's usual one, unless it was changed.
+        const std::string fm7 = "127.0.0.1:5300", horizon = "127.0.0.1:8000";
+        if (c.telemetry_target == (before == "horizon" ? horizon : fm7))
+          c.telemetry_target = c.telemetry_format == "horizon" ? horizon : fm7;
+        std::snprintf(ui.target, sizeof(ui.target), "%s", c.telemetry_target.c_str());
+        changed = true;
+      }
+      Row(L("Send to", "Enviar a"), L("host:port", "host:puerto"));
+      if (ImGui::InputText("##target", ui.target, sizeof(ui.target)) && std::strchr(ui.target, ':')) {
+        c.telemetry_target = ui.target;
+        changed = true;
+      }
+      Row(L("Only while the car moves", "Solo con el coche en marcha"),
+          L("Silent while standing still too, not just in menus.", "En silencio también parado, no solo en menús."));
+      changed |= Toggle("##moving", &c.telemetry_moving_only);
+      EndRows();
+    }
+    TextDim(L("In SimHub pick the same game as above and set its UDP port to match. The game log lists the values sent every few seconds (doc/telemetry.md).",
+              "En SimHub elige el mismo juego y el mismo puerto UDP. El registro del juego muestra los valores enviados (doc/telemetry.md)."));
+  }
+  EndCard();
+
+  // --- Deadzones (and steering sensitivity, clutch button).
+  BeginPanel("##wheelsteer");
+  char steer_summary[64];
+  std::snprintf(steer_summary, sizeof(steer_summary), "%d %% \xC2\xB7 %s %s", c.steering_scale, L("clutch", "embrague"), c.clutch_button.c_str());
+  CardHeader("steer", L("Deadzones", "Zonas muertas"), steer_summary, ui.open_steering);
+  if (ui.open_steering) {
+    // What the game reads with these values, beside the sliders that change it.
+    auto live = [&](const char* key) {
+      const Binding& r = Get(ui, key);
+      ImGui::AlignTextToFramePadding();
+      TextDim(L("Live", "En vivo"));
+      ImGui::SameLine(S(170));
+      Meter(r.value, r.kind == Kind::kSteering, ImGui::GetContentRegionAvail().x - S(90));
       ImGui::SameLine();
-      ImGui::TextUnformatted((c.calibration&bit)?"OK":"--");
-      ImGui::EndDisabled(); ImGui::PopID();
+      if (r.inputs.empty()) TextDim(L("not bound", "sin asignar"));
+      else ImGui::TextUnformatted(r.text.c_str());
     };
-    capture(L("Turn fully left and capture", "Gira al tope izquierdo y captura"),c.steering_axis,c.left,1);
-    capture(L("Center and capture", "Centra el volante y captura"),c.steering_axis,c.center,2);
-    capture(L("Turn fully right and capture", "Gira al tope derecho y captura"),c.steering_axis,c.right,4);
-    capture(L("Release throttle and capture", "Suelta el acelerador y captura"),c.throttle_axis,c.throttle_rest,8);
-    capture(L("Press throttle fully and capture", "Pisa el acelerador a fondo y captura"),c.throttle_axis,c.throttle_full,16);
-    capture(L("Release brake and capture", "Suelta el freno y captura"),c.brake_axis,c.brake_rest,32);
-    capture(L("Press brake fully and capture", "Pisa el freno a fondo y captura"),c.brake_axis,c.brake_full,64);
-    if (w::Valid(c) && c.steering_axis < int(snapshot.axes.size()) && c.throttle_axis < int(snapshot.axes.size()) && c.brake_axis < int(snapshot.axes.size())) {
-      ImGui::Text(L("Steering %.0f%% | throttle %.0f%% | brake %.0f%%", "Dirección %.0f%% | acelerador %.0f%% | freno %.0f%%"),
-          w::Steering(snapshot.axes[c.steering_axis],c)*100,
-          w::Pedal(snapshot.axes[c.throttle_axis],c.throttle_rest,c.throttle_full)*100,
-          w::Pedal(snapshot.axes[c.brake_axis],c.brake_rest,c.brake_full)*100);
-    }
-    TextDim(L("A POV hat maps to the D-pad automatically. If your D-pad sends buttons, assign the four directions below.",
-        "La cruceta POV es automatica. Si tu cruceta envia botones, asigna las cuatro direcciones de abajo."));
-    }
-    if(ImGui::CollapsingHeader(L("Assign wheel buttons", "Asignar botones del volante"))) {
-    const char* labels[]{"A","B","X","Y","LB","RB","Start","Back","LS","RS",
-        L("D-pad up","Cruceta arriba"),L("D-pad down","Cruceta abajo"),L("D-pad left","Cruceta izquierda"),L("D-pad right","Cruceta derecha")};
-    for(size_t i=0;i<14;++i) {
-      ImGui::PushID(int(i));
-      ImGui::Text("%s: %d",labels[i],c.buttons[i]); ImGui::SameLine();
-      if(ImGui::SmallButton(L("Assign", "Asignar"))) app.wheel_capture=i;
-      ImGui::SameLine();
-      if(ImGui::SmallButton(L("Clear", "Quitar"))) {c.buttons[i]=-1;changed=true;}
+    changed |= Percent(L("Steering sensitivity", "Sensibilidad"), &c.steering_scale, 50, 450,
+                       L("200 % reaches full lock at half your wheel's rotation. Set the rotation in your wheel software.", "200 % llega al tope con la mitad del giro del volante."));
+    changed |= Percent(L("Steering deadzone", "Zona muerta dirección"), &c.steering_deadzone, 0, 20);
+    live("STEER");
+    ImGui::Dummy(ImVec2(0, S(4)));
+    Title(L("Pedal dead zones", "Zonas muertas de pedales"), 1.0f);
+    TextDim(L("Bottom: travel at rest the game ignores. Top: the last part of travel that already counts as 100 %.",
+              "Abajo: recorrido en reposo que se ignora. Arriba: el último tramo que ya cuenta como 100 %."));
+    const char* pedal_names[] = {L("Throttle", "Acelerador"), L("Brake", "Freno"), L("Clutch", "Embrague")};
+    for (int i = 0; i < 3; ++i) {
+      ImGui::PushID(i);
+      int bottom = c.deadzone_bottom[i] < 0 ? c.pedal_deadzone : c.deadzone_bottom[i];
+      if (Percent((std::string(pedal_names[i]) + L(" bottom", " abajo")).c_str(), &bottom, 0, 25)) { c.deadzone_bottom[i] = bottom; changed = true; }
+      changed |= Percent((std::string(pedal_names[i]) + L(" top", " arriba")).c_str(), &c.deadzone_top[i], 0, 25);
+      live(i == 0 ? "THROTTLE" : i == 1 ? "BRAKE" : "CLUTCH");
+      ImGui::Dummy(ImVec2(0, S(4)));
       ImGui::PopID();
     }
+    ImGui::Dummy(ImVec2(0, S(4)));
+    if (BeginRows("##clutchrows")) {
+      Row(L("Clutch pedal presses", "El embrague pulsa"),
+          L("FM4's clutch is a button: match it to the game's controls. The pedal presses it past half travel.",
+            "El embrague de FM4 es un botón: hazlo coincidir con los controles del juego."));
+      if (Combo<std::string>("##clutchbtn", c.clutch_button, {{"A", "A"}, {"B", "B"}, {"X", "X"}, {"Y", "Y"}, {"LB", "LB"}, {"RB", "RB"}, {"LS", "LS"}, {"RS", "RS"}, {"", L("Nothing", "Nada")}}))
+        changed = true;
+      Row(L("Analog clutch (experimental)", "Embrague analógico (experimental)"),
+          L("Also sends the pedal as the right stick's Y axis, where Forza Horizon reads a clutch. Not confirmed in FM4.",
+            "También envía el pedal como eje Y del stick derecho, como Forza Horizon. No confirmado en FM4."));
+      changed |= Toggle("##clutchanalog", &c.clutch_analog);
+      Row(L("Log raw inputs", "Registrar entradas"), L("Writes every axis, button and hat change to the game log.", "Escribe cada cambio de eje, botón y cruceta en el registro."));
+      changed |= Toggle("##loginputs", &c.log_inputs);
+      EndRows();
     }
-    if(app.wheel_capture>=0) {
-      TextDim(L("Press a wheel button to assign it.", "Pulsa un botón del volante para asignarlo."));
-      if(ImGui::Button(L("Cancel assignment", "Cancelar asignación"))) app.wheel_capture=-1;
-      for(size_t i=0;app.wheel_capture>=0 && i<snapshot.buttons.size();++i) {
-        if(snapshot.buttons[i] && i<app.wheel_previous_buttons.size() && !app.wheel_previous_buttons[i]) {
-          c.buttons[app.wheel_capture]=int(i);app.wheel_capture=-1;changed=true;
-        }
-      }
-    }
-    ImGui::EndDisabled();
-  } else {
-    if(app.wheel_tour.Active() && ImGui::Button(L("Cancel calibration", "Cancelar calibracion"))) app.wheel_tour.Cancel();
-    TextDim(L("Connect the wheel in PC mode, then select it above.", "Conecta el volante en modo PC y selecciónalo arriba."));
-    if (!snapshot.status.empty()) ImGui::TextWrapped("%s", snapshot.status.c_str());
   }
-  if(!connected && app.clutch_tour.Active() && ImGui::Button(L("Cancel clutch calibration", "Cancelar calibracion del embrague"))) app.clutch_tour.Cancel();
-  app.wheel_previous_buttons = snapshot.buttons;
-  ImGui::EndDisabled();
   EndCard();
-  return changed;
+
+  // --- Devices.
+  BeginPanel("##wheeldevices");
+  char summary[64];
+  std::snprintf(summary, sizeof(summary), L("%d connected", "%d conectados"), int(devices.size()));
+  CardHeader("devices", L("Devices", "Dispositivos"), summary, ui.open_devices);
+  if (ui.open_devices) {
+    if (devices.empty())
+      TextDim(L("No game controllers found. Connect your wheel, pedals and other devices; the list updates by itself.",
+                "No hay mandos. Conecta volante, pedales y otros dispositivos; la lista se actualiza sola."));
+    const auto now = Clock::now();
+    for (const auto& d : devices) {
+      auto& [last, at] = ui.activity[d.id];
+      bool moved = last.size() != d.axes.size();
+      for (size_t i = 0; !moved && i < d.axes.size(); ++i) moved = std::abs(d.axes[i] - last[i]) > 1500;
+      moved = moved || std::any_of(d.buttons.begin(), d.buttons.end(), [](bool b) { return b; }) ||
+              std::any_of(d.hats.begin(), d.hats.end(), [](uint8_t h) { return h != 0; });
+      last = d.axes;
+      if (moved) at = now;
+      const bool active = now - at < std::chrono::milliseconds(400);
+      StatusDot(active ? kOk : kControl);
+      ImGui::TextUnformatted(d.name.c_str());
+      char line[160];
+      std::snprintf(line, sizeof(line), "%04x:%04x \xC2\xB7 %zu %s, %zu %s, %zu %s%s", d.vendor, d.product, d.axes.size(),
+                    L("axes", "ejes"), d.buttons.size(), L("buttons", "botones"), d.hats.size(), L("hats", "crucetas"),
+                    d.wheel ? L(" \xC2\xB7 wheel", " \xC2\xB7 volante") : "");
+      ImGui::Indent(S(16));
+      TextDim(line);
+      ImGui::Unindent(S(16));
+    }
+    TextDim(L("A device lights up while you move it, so you can tell which is which.",
+              "Un dispositivo se ilumina al moverlo, para distinguirlos."));
+  }
+  EndCard();
+
+
+  if (changed) app.Save();
 }
 
 void TabControls(App& app) {
   Settings& s = app.settings;
   bool changed = false;
-  changed |= WheelControls(app);
+  BeginCard("##wheelnote", L("Racing wheel", "Volante"));
+  TextDim(L("Wheel, pedals, buttons, force feedback and SimHub telemetry are in the Wheel tab.",
+            "Volante, pedales, botones, force feedback y telemetría para SimHub están en la pestaña Volante."));
+  if (ImGui::Button(L("Open the Wheel tab", "Abrir la pestaña Volante"))) app.tab = Tab::kWheel;
+  EndCard();
 
   BeginCard("##pad", L("Controller", "Mando"));
   if (BeginRows("##p")) {
@@ -1743,6 +2453,7 @@ void TabBar(App& app) {
                                               {Tab::kProfiles, L("Profiles", "Perfiles")},
                                               {Tab::kGraphics, L("Graphics", "Gráficos")},
                                               {Tab::kControls, L("Controls", "Controles")},
+                                              {Tab::kWheel, L("Wheel", "Volante")},
                                               {Tab::kAudio, L("Language & sound", "Idioma y sonido")},
                                               {Tab::kInstall, L("Install", "Instalación")},
                                               {Tab::kSupport, L("Support", "Apoyar")}};
@@ -2039,6 +2750,7 @@ int main(int argc, char** argv) {
                 : t == "support" ? Tab::kSupport
                 : t == "graphics" ? Tab::kGraphics
                 : t == "controls" ? Tab::kControls
+                : t == "wheel"    ? Tab::kWheel
                 : t == "audio"    ? Tab::kAudio
                 : t == "install"  ? Tab::kInstall
                                   : Tab::kProfiles;
@@ -2083,7 +2795,7 @@ int main(int argc, char** argv) {
     }
     if (app.wheel_monitor) {
       app.wheel_monitor->SetActive(
-          app.tab == Tab::kControls && !app.game && (SDL_GetWindowFlags(app.window) & SDL_WINDOW_INPUT_FOCUS) != 0);
+          app.tab == Tab::kWheel && !app.game && (SDL_GetWindowFlags(app.window) & SDL_WINDOW_INPUT_FOCUS) != 0);
       app.wheel_monitor->Pump();
     }
     if (SDL_GetWindowFlags(app.window) & SDL_WINDOW_MINIMIZED) {
@@ -2166,6 +2878,7 @@ int main(int argc, char** argv) {
       case Tab::kProfiles: TabProfiles(app); break;
       case Tab::kGraphics: TabGraphics(app); break;
       case Tab::kControls: TabControls(app); break;
+      case Tab::kWheel: TabWheel(app); break;
       case Tab::kAudio: TabAudio(app); break;
       case Tab::kInstall: TabInstall(app); break;
       case Tab::kSupport: TabSupport(); break;

@@ -1,5 +1,6 @@
 ﻿#include "settings.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <random>
@@ -62,6 +63,126 @@ bool WriteFile(const std::filesystem::path& file, const std::string& header, con
   return !ec;
 }
 
+
+// The wheel_* and telemetry_* keys (src/wheel_input.cpp, src/telemetry).
+void ReadWheel(const toml::table& t, fm4::wheel::Settings& w) {
+  Read(t, "wheel_enabled", w.enabled);
+  Read(t, "wheel_device", w.device);
+  w.device = fm4::wheel::MigrateDeviceKey(w.device);
+  ReadInt(t, "wheel_steering_axis", w.steering_axis);
+  Read(t, "wheel_steering_invert", w.steering_invert);
+  ReadInt(t, "wheel_steering_scale", w.steering_scale);
+  ReadInt(t, "wheel_steering_deadzone", w.steering_deadzone);
+  Read(t, "wheel_throttle", w.throttle);
+  Read(t, "wheel_brake", w.brake);
+  Read(t, "wheel_clutch", w.clutch);
+  Read(t, "wheel_clutch_button", w.clutch_button);
+  Read(t, "wheel_clutch_analog", w.clutch_analog);
+  Read(t, "wheel_buttons", w.buttons);
+  ReadInt(t, "wheel_pedal_deadzone", w.pedal_deadzone);
+  const char* pedals[]{"throttle", "brake", "clutch"};
+  for (int i = 0; i < 3; ++i) {
+    ReadInt(t, (std::string("wheel_") + pedals[i] + "_deadzone_bottom").c_str(), w.deadzone_bottom[i]);
+    ReadInt(t, (std::string("wheel_") + pedals[i] + "_deadzone_top").c_str(), w.deadzone_top[i]);
+  }
+  Read(t, "wheel_ffb_device", w.ffb_device);
+  Read(t, "wheel_ffb_mode", w.ffb_mode);
+  w.ffb_mode = fm4::wheel::FfbModeName(fm4::wheel::ParseFfbMode(w.ffb_mode));
+  ReadInt(t, "wheel_ffb_strength", w.ffb_strength);
+  ReadInt(t, "wheel_ffb_min_force", w.ffb_min_force);
+  ReadInt(t, "wheel_ffb_spring", w.ffb_spring);
+  ReadInt(t, "wheel_ffb_damper", w.ffb_damper);
+  ReadInt(t, "wheel_ffb_friction", w.ffb_friction);
+  ReadInt(t, "wheel_ffb_inertia", w.ffb_inertia);
+  ReadInt(t, "wheel_ffb_rumble", w.ffb_rumble);
+  ReadInt(t, "wheel_ffb_rumble_engine", w.ffb_rumble_engine);
+  ReadInt(t, "wheel_ffb_rumble_road", w.ffb_rumble_road);
+  Read(t, "wheel_ffb_invert", w.ffb_invert);
+  Read(t, "wheel_log_inputs", w.log_inputs);
+  Read(t, "telemetry_udp", w.telemetry_udp);
+  Read(t, "telemetry_udp_format", w.telemetry_format);
+  Read(t, "telemetry_udp_target", w.telemetry_target);
+  Read(t, "telemetry_udp_moving_only", w.telemetry_moving_only);
+
+  // FM4 0.3 stored calibrated axes and button numbers on the one wheel device.
+  // Carry them over once; the next save writes only the keys above.
+  auto old_int = [&](const char* key, int fallback) {
+    auto v = t[key].value<int64_t>();
+    return v ? int(*v) : fallback;
+  };
+  auto old_axis = [&](const char* axis, const char* rest, const char* full) {
+    if (!t.contains(axis)) return std::string();
+    const bool inverted = old_int(rest, -32768) > old_int(full, 32767);
+    return std::string(inverted ? "-" : "+") + "axis" + std::to_string(old_int(axis, 0));
+  };
+  if (!t.contains("wheel_throttle") && t.contains("wheel_throttle_axis")) {
+    w.throttle = old_axis("wheel_throttle_axis", "wheel_throttle_rest", "wheel_throttle_full");
+    w.brake = old_axis("wheel_brake_axis", "wheel_brake_rest", "wheel_brake_full");
+    if (t["wheel_clutch_enabled"].value_or(false) && old_int("wheel_clutch_axis", -1) >= 0)
+      w.clutch = old_axis("wheel_clutch_axis", "wheel_clutch_rest", "wheel_clutch_full");
+    // The old steering ran from a captured left to right; the new one uses
+    // the axis's whole range, so the old right end tells its direction.
+    w.steering_invert = old_int("wheel_right", 32767) < old_int("wheel_left", -32768);
+    const char* names[]{"A", "B", "X", "Y", "LB", "RB", "START", "BACK", "LS", "RS", "UP", "DOWN", "LEFT", "RIGHT"};
+    const char* keys[]{"a", "b", "x", "y", "lb", "rb", "start", "back", "ls", "rs", "up", "down", "left", "right"};
+    std::string buttons = "UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right";
+    for (int i = 0; i < 14; ++i) {
+      const int n = old_int((std::string("wheel_button_") + keys[i]).c_str(), -1);
+      if (n >= 0) buttons += std::string(",") + names[i] + "=" + std::to_string(n);
+    }
+    const int up = old_int("wheel_button_shift_up", -1), down = old_int("wheel_button_shift_down", -1);
+    const int up_action = old_int("wheel_shift_up_action", 5), down_action = old_int("wheel_shift_down_action", 4);
+    if (up >= 0 && up_action >= 0 && up_action < 14) buttons += std::string(",") + names[up_action] + "=" + std::to_string(up);
+    if (down >= 0 && down_action >= 0 && down_action < 14)
+      buttons += std::string(",") + names[down_action] + "=" + std::to_string(down);
+    w.buttons = buttons;
+    const int clutch_action = old_int("wheel_clutch_action", 1);
+    if (clutch_action >= 0 && clutch_action < 14) w.clutch_button = names[clutch_action];
+  }
+  if (!t.contains("wheel_ffb_mode") && t.contains("wheel_ffb")) {
+    w.ffb_mode = t["wheel_ffb"].value_or(false) ? "on" : "off";
+    w.ffb_strength = std::clamp(old_int("wheel_ffb_gain", w.ffb_strength), 0, 100);
+  }
+}
+
+void WriteWheel(toml::table& t, const fm4::wheel::Settings& w) {
+  t.insert("wheel_enabled", w.enabled);
+  t.insert("wheel_device", w.device);
+  t.insert("wheel_steering_axis", w.steering_axis);
+  t.insert("wheel_steering_invert", w.steering_invert);
+  t.insert("wheel_steering_scale", std::clamp(w.steering_scale, 10, 1000));
+  t.insert("wheel_steering_deadzone", std::clamp(w.steering_deadzone, 0, 50));
+  t.insert("wheel_throttle", w.throttle);
+  t.insert("wheel_brake", w.brake);
+  t.insert("wheel_clutch", w.clutch);
+  t.insert("wheel_clutch_button", w.clutch_button);
+  t.insert("wheel_clutch_analog", w.clutch_analog);
+  t.insert("wheel_buttons", w.buttons);
+  t.insert("wheel_pedal_deadzone", std::clamp(w.pedal_deadzone, 0, 50));
+  const char* pedals[]{"throttle", "brake", "clutch"};
+  for (int i = 0; i < 3; ++i) {
+    t.insert(std::string("wheel_") + pedals[i] + "_deadzone_bottom", std::clamp(w.deadzone_bottom[i], -1, 50));
+    t.insert(std::string("wheel_") + pedals[i] + "_deadzone_top", std::clamp(w.deadzone_top[i], 0, 50));
+  }
+  t.insert("wheel_ffb_device", w.ffb_device);
+  t.insert("wheel_ffb_mode", w.ffb_mode);
+  t.insert("wheel_ffb_strength", std::clamp(w.ffb_strength, 0, 200));
+  t.insert("wheel_ffb_min_force", std::clamp(w.ffb_min_force, 0, 30));
+  t.insert("wheel_ffb_spring", std::clamp(w.ffb_spring, 0, 200));
+  t.insert("wheel_ffb_damper", std::clamp(w.ffb_damper, 0, 200));
+  t.insert("wheel_ffb_friction", std::clamp(w.ffb_friction, 0, 200));
+  t.insert("wheel_ffb_inertia", std::clamp(w.ffb_inertia, 0, 200));
+  t.insert("wheel_ffb_rumble", std::clamp(w.ffb_rumble, 0, 100));
+  t.insert("wheel_ffb_rumble_engine", std::clamp(w.ffb_rumble_engine, 0, 100));
+  t.insert("wheel_ffb_rumble_road", std::clamp(w.ffb_rumble_road, 0, 100));
+  t.insert("wheel_ffb_invert", w.ffb_invert);
+  t.insert("wheel_log_inputs", w.log_inputs);
+  t.insert("telemetry_udp", w.telemetry_udp);
+  t.insert("telemetry_udp_format", w.telemetry_format == "horizon" ? "horizon" : "fm7");
+  t.insert("telemetry_udp_target", w.telemetry_target);
+  t.insert("telemetry_udp_moving_only", w.telemetry_moving_only);
+}
+
 }  // namespace
 
 Settings::Settings() { ResetBinds(); }
@@ -116,23 +237,7 @@ bool Settings::Load(const std::filesystem::path& file) {
   Read(t, "present_effect", present_effect);
 
   Read(t, "input_backend", input_backend);
-  Read(t, "wheel_enabled", wheel.enabled);
-  Read(t, "wheel_device", wheel.device);
-  Read(t, "wheel_ffb", wheel.ffb); Read(t, "wheel_ffb_invert", wheel.ffb_invert);
-  ReadInt(t, "wheel_ffb_gain", wheel.ffb_gain);
-  wheel.ffb_gain = std::clamp(wheel.ffb_gain,0,100);
-#define READ_WHEEL(name) ReadInt(t, "wheel_" #name, wheel.name)
-  READ_WHEEL(steering_axis); READ_WHEEL(throttle_axis); READ_WHEEL(brake_axis);
-  READ_WHEEL(left); READ_WHEEL(center); READ_WHEEL(right);
-  READ_WHEEL(throttle_rest); READ_WHEEL(throttle_full); READ_WHEEL(brake_rest); READ_WHEEL(brake_full);
-  READ_WHEEL(calibration);
-  READ_WHEEL(shift_up_action); READ_WHEEL(shift_down_action);
-  Read(t, "wheel_clutch_enabled", wheel.clutch_enabled);
-  READ_WHEEL(clutch_axis); READ_WHEEL(clutch_rest); READ_WHEEL(clutch_full);
-  READ_WHEEL(clutch_calibration); READ_WHEEL(clutch_action); READ_WHEEL(clutch_threshold);
-#undef READ_WHEEL
-  const char* wheel_buttons[]{"a","b","x","y","lb","rb","start","back","ls","rs","up","down","left","right","shift_up","shift_down"};
-  for (size_t i=0;i<wheel.buttons.size();++i) ReadInt(t,(std::string("wheel_button_")+wheel_buttons[i]).c_str(),wheel.buttons[i]);
+  ReadWheel(t, wheel);
   Read(t, "mnk_mode", mnk_mode);
   Read(t, "mnk_mouse", mnk_mouse);
   Read(t, "mnk_sensitivity", mnk_sensitivity);
@@ -173,22 +278,7 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("input_backend", input_backend);
   t.insert("video_mode_refresh_rate", experimental_120fps?120.0:60.0);
   t.insert("vsync",true);
-  t.insert("wheel_enabled", wheel.enabled);
-  t.insert("wheel_device", wheel.device);
-  t.insert("wheel_ffb", wheel.ffb);t.insert("wheel_ffb_invert", wheel.ffb_invert);
-  t.insert("wheel_ffb_gain", std::clamp(wheel.ffb_gain,0,100));
-#define WRITE_WHEEL(name) t.insert("wheel_" #name, wheel.name)
-  WRITE_WHEEL(steering_axis); WRITE_WHEEL(throttle_axis); WRITE_WHEEL(brake_axis);
-  WRITE_WHEEL(left); WRITE_WHEEL(center); WRITE_WHEEL(right);
-  WRITE_WHEEL(throttle_rest); WRITE_WHEEL(throttle_full); WRITE_WHEEL(brake_rest); WRITE_WHEEL(brake_full);
-  WRITE_WHEEL(calibration);
-  WRITE_WHEEL(shift_up_action); WRITE_WHEEL(shift_down_action);
-  t.insert("wheel_clutch_enabled", wheel.clutch_enabled);
-  WRITE_WHEEL(clutch_axis); WRITE_WHEEL(clutch_rest); WRITE_WHEEL(clutch_full);
-  WRITE_WHEEL(clutch_calibration); WRITE_WHEEL(clutch_action); WRITE_WHEEL(clutch_threshold);
-#undef WRITE_WHEEL
-  const char* wheel_buttons[]{"a","b","x","y","lb","rb","start","back","ls","rs","up","down","left","right","shift_up","shift_down"};
-  for (size_t i=0;i<wheel.buttons.size();++i) t.insert(std::string("wheel_button_")+wheel_buttons[i],wheel.buttons[i]);
+  WriteWheel(t, wheel);
   t.insert("mnk_mode", mnk_mode);
   t.insert("mnk_mouse", mnk_mouse);
   t.insert("mnk_sensitivity", mnk_sensitivity);

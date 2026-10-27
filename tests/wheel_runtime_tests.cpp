@@ -2,133 +2,105 @@
 #include <SDL3/SDL.h>
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
-#include <chrono>
 #include <cstdio>
+#include <functional>
 #include <stdexcept>
-#include <thread>
 
 REXCVAR_DECLARE(bool,wheel_enabled);
-REXCVAR_DECLARE(bool,wheel_ffb);
 REXCVAR_DECLARE(std::string,wheel_device);
-REXCVAR_DECLARE(int32_t,wheel_calibration);
-REXCVAR_DECLARE(int32_t,wheel_button_a);
-REXCVAR_DECLARE(int32_t,wheel_button_left);
-REXCVAR_DECLARE(int32_t,wheel_throttle_axis);
-REXCVAR_DECLARE(int32_t,wheel_brake_axis);
-REXCVAR_DECLARE(int32_t,wheel_button_shift_up);
-REXCVAR_DECLARE(int32_t,wheel_button_shift_down);
-REXCVAR_DECLARE(bool,wheel_clutch_enabled);
-REXCVAR_DECLARE(int32_t,wheel_clutch_axis);
-REXCVAR_DECLARE(int32_t,wheel_clutch_rest);
-REXCVAR_DECLARE(int32_t,wheel_clutch_full);
-REXCVAR_DECLARE(int32_t,wheel_clutch_calibration);
+REXCVAR_DECLARE(std::string,wheel_throttle);
+REXCVAR_DECLARE(std::string,wheel_brake);
+REXCVAR_DECLARE(std::string,wheel_clutch);
+REXCVAR_DECLARE(std::string,wheel_buttons);
+REXCVAR_DECLARE(std::string,wheel_clutch_button);
+REXCVAR_DECLARE(std::string,wheel_ffb_mode);
+REXCVAR_DECLARE(bool,wheel_clutch_analog);
+REXCVAR_DECLARE(int32_t,wheel_pedal_deadzone);
 
 void Check(bool v,const char* why) {if(!v) throw std::runtime_error(why);}
+SDL_Joystick* Attach(const char* name,SDL_JoystickType type,int axes,int buttons,int hats,SDL_JoystickID& id) {
+  SDL_VirtualJoystickDesc desc{};SDL_INIT_INTERFACE(&desc);
+  desc.type=Uint16(type);desc.naxes=Uint16(axes);desc.nbuttons=Uint16(buttons);desc.nhats=Uint16(hats);desc.name=name;
+  id=SDL_AttachVirtualJoystick(&desc);Check(id!=0,SDL_GetError());
+  auto* j=SDL_OpenJoystick(id);Check(j!=nullptr,SDL_GetError());
+  return j;
+}
+bool WaitFor(rex::input::InputSystem* input,rex::input::X_INPUT_STATE& state,const std::function<bool(const rex::input::X_INPUT_STATE&)>& ok) {
+  for(int i=0;i<300;++i) {
+    SDL_PumpEvents();SDL_UpdateJoysticks();
+    if(input->GetState(0,&state)==0 && ok(state)) return true;
+    SDL_Delay(10);
+  }
+  return false;
+}
 int main() {
   try {
     SDL_ResetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS);
     Check(SDL_Init(SDL_INIT_JOYSTICK),SDL_GetError());
-    SDL_VirtualJoystickDesc desc{};SDL_INIT_INTERFACE(&desc);
-    desc.type=SDL_JOYSTICK_TYPE_WHEEL;desc.naxes=8;desc.nbuttons=4;desc.nhats=1;desc.name="FM4 runtime test wheel";
-    const auto id=SDL_AttachVirtualJoystick(&desc);Check(id!=0,SDL_GetError());
-    auto* joystick=SDL_OpenJoystick(id);Check(joystick!=nullptr,SDL_GetError());
-    std::string key;
-    {
-      fm4::wheel::DeviceMonitor monitor;
-      for(int i=0;i<250 && key.empty();++i) {
-        for(const auto& d:monitor.Read().devices) if(d.name==desc.name) key=d.key;
-        SDL_Delay(10);
-      }
-    }
-    Check(!key.empty(),"Virtual test device was not discovered");
-    Check(SDL_GetHintBoolean(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,false),
-        "Raw wheel polling depends on an SDL window in the same module");
-    REXCVAR_SET(wheel_enabled,true);REXCVAR_SET(wheel_ffb,false);REXCVAR_SET(wheel_device,key);
-    REXCVAR_SET(wheel_calibration,127);REXCVAR_SET(wheel_button_a,3);
-    REXCVAR_SET(wheel_calibration,0);
-    auto uncalibrated=fm4::wheel::CreateInputSystem(false);
-    auto* menu_input=static_cast<rex::input::InputSystem*>(uncalibrated.get());
-    SDL_SetJoystickVirtualButton(joystick,3,true);
-    SDL_SetJoystickVirtualAxis(joystick,1,32767);
-    rex::input::X_INPUT_STATE menu_state{};
-    bool menu_button=false;
-    for(int i=0;i<250;++i) {
-      SDL_PumpEvents();SDL_UpdateJoysticks();
-      if(menu_input->GetState(0,&menu_state)==0 && (uint16_t(menu_state.gamepad.buttons)&0x1000)) {menu_button=true;break;}
-      SDL_Delay(10);
-    }
-    Check(menu_button,"Uncalibrated wheel A button did not reach guest menus");
-    Check(menu_state.gamepad.thumb_lx==0 && menu_state.gamepad.left_trigger==0 && menu_state.gamepad.right_trigger==0,
-        "Uncalibrated axes must remain neutral");
-    menu_input->Shutdown();uncalibrated.reset();
-    REXCVAR_SET(wheel_calibration,127);
-    REXCVAR_SET(wheel_throttle_axis,2);REXCVAR_SET(wheel_brake_axis,5);
-    REXCVAR_SET(wheel_button_left,2);
-    REXCVAR_SET(wheel_button_shift_up,0);REXCVAR_SET(wheel_button_shift_down,1);
-    REXCVAR_SET(wheel_clutch_enabled,true);REXCVAR_SET(wheel_clutch_axis,6);
-    REXCVAR_SET(wheel_clutch_rest,32767);REXCVAR_SET(wheel_clutch_full,-32768);
-    REXCVAR_SET(wheel_clutch_calibration,3);
-    auto generic=fm4::wheel::CreateInputSystem(false);
-    auto* input=static_cast<rex::input::InputSystem*>(generic.get());
-    SDL_SetJoystickVirtualAxis(joystick,0,16384);
-    SDL_SetJoystickVirtualAxis(joystick,2,32767);
-    SDL_SetJoystickVirtualAxis(joystick,5,-32768);
-    SDL_SetJoystickVirtualButton(joystick,2,true);
-    SDL_SetJoystickVirtualAxis(joystick,6,32767);
-    SDL_SetJoystickVirtualButton(joystick,3,true);
-    SDL_SetJoystickVirtualHat(joystick,0,SDL_HAT_RIGHTUP);
+    SDL_JoystickID wheel_id,pedal_id;
+    // The wheel base and a separate USB pedal set, as with a direct-drive base.
+    auto* wheel=Attach("FM4 runtime test wheel",SDL_JOYSTICK_TYPE_WHEEL,4,8,1,wheel_id);
+    auto* pedals=Attach("FM4 test pedals",SDL_JOYSTICK_TYPE_UNKNOWN,3,0,0,pedal_id);
+    SDL_SetJoystickVirtualAxis(pedals,0,-32768);SDL_SetJoystickVirtualAxis(pedals,1,32767);SDL_SetJoystickVirtualAxis(pedals,2,-32768);
+    REXCVAR_SET(wheel_enabled,true);
+    REXCVAR_SET(wheel_device,std::string("runtime test wheel"));
+    REXCVAR_SET(wheel_throttle,std::string("FM4 test pedals|+axis0"));
+    REXCVAR_SET(wheel_brake,std::string("FM4 test pedals|-axis1"));
+    REXCVAR_SET(wheel_clutch,std::string("FM4 test pedals|+axis2"));
+    REXCVAR_SET(wheel_buttons,std::string("UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right,A=3,RB=0,LB=1,X=FM4 test pedals|+axis0"));
+    REXCVAR_SET(wheel_clutch_button,std::string("B"));
+    REXCVAR_SET(wheel_ffb_mode,std::string("off"));
+    REXCVAR_SET(wheel_pedal_deadzone,0);
+    auto system=fm4::wheel::CreateInputSystem(false);
+    auto* input=static_cast<rex::input::InputSystem*>(system.get());
     rex::input::X_INPUT_STATE state{};
-    bool matched=false;
-    for(int i=0;i<250;++i) {
-      SDL_PumpEvents();SDL_UpdateJoysticks();
-      if(input->GetState(0,&state)==0 && state.gamepad.right_trigger==255 &&
-          int16_t(state.gamepad.thumb_lx)>=16383 && (uint16_t(state.gamepad.buttons)&0x100D)==0x100D) {matched=true;break;}
-      SDL_Delay(10);
-    }
-    Check(matched,"Wheel axes/buttons did not reach the guest InputSystem");
+    Check(WaitFor(input,state,[](auto& s){return s.gamepad.left_trigger==0 && s.gamepad.right_trigger==0;}),
+        "Wheel did not reach the guest, or pedals at rest read pressed");
+
+    SDL_SetJoystickVirtualAxis(wheel,0,16384);
+    SDL_SetJoystickVirtualAxis(pedals,0,32767);
+    SDL_SetJoystickVirtualButton(wheel,3,true);
+    SDL_SetJoystickVirtualHat(wheel,0,SDL_HAT_RIGHTUP);
+    Check(WaitFor(input,state,[](auto& s){return s.gamepad.right_trigger==255 && int16_t(s.gamepad.thumb_lx)>=16383 &&
+        (uint16_t(s.gamepad.buttons)&0x1009)==0x1009;}),"Steering, throttle on the pedal device, A or the hat did not reach the guest");
     Check(state.gamepad.left_trigger==0,"Released brake became pressed");
-    SDL_SetJoystickVirtualAxis(joystick,2,-32768);
-    SDL_SetJoystickVirtualAxis(joystick,5,32767);
-    bool brake_matched=false;
-    for(int i=0;i<250;++i) {
-      SDL_PumpEvents();SDL_UpdateJoysticks();
-      if(input->GetState(0,&state)==0 && state.gamepad.left_trigger==255 && state.gamepad.right_trigger==0) {
-        brake_matched=true;break;
-      }
-      SDL_Delay(10);
-    }
-    Check(brake_matched,"Brake axis 5 / throttle axis 2 were not independent");
-    SDL_SetJoystickVirtualButton(joystick,0,true);
-    SDL_SetJoystickVirtualButton(joystick,1,true);
-    SDL_SetJoystickVirtualAxis(joystick,6,-32768);
-    bool shifted=false;
-    for(int i=0;i<250;++i) {
-      SDL_PumpEvents();SDL_UpdateJoysticks();
-      if(input->GetState(0,&state)==0 && (uint16_t(state.gamepad.buttons)&0x2300)==0x2300) {shifted=true;break;}
-      SDL_Delay(10);
-    }
-    Check(shifted,"Paddles RB/LB and clutch B did not reach guest input");
-    SDL_SetJoystickVirtualButton(joystick,0,false);SDL_SetJoystickVirtualButton(joystick,1,false);
-    SDL_SetJoystickVirtualAxis(joystick,6,32767);
-    bool released=false;
-    for(int i=0;i<250;++i) {
-      SDL_PumpEvents();SDL_UpdateJoysticks();
-      if(input->GetState(0,&state)==0 && (uint16_t(state.gamepad.buttons)&0x2300)==0) {released=true;break;}
-      SDL_Delay(10);
-    }
-    Check(released,"Clutch or paddle buttons stuck after release");
+    Check((uint16_t(state.gamepad.buttons)&0x4000)==0x4000,"An axis on another device did not press its button (X)");
+
+    SDL_SetJoystickVirtualAxis(pedals,0,-32768);
+    SDL_SetJoystickVirtualAxis(pedals,1,-32768);
+    Check(WaitFor(input,state,[](auto& s){return s.gamepad.left_trigger==255 && s.gamepad.right_trigger==0;}),
+        "Inverted brake on the pedal device was not independent of throttle");
+
+    SDL_SetJoystickVirtualButton(wheel,0,true);SDL_SetJoystickVirtualButton(wheel,1,true);
+    SDL_SetJoystickVirtualAxis(pedals,2,32767);
+    Check(WaitFor(input,state,[](auto& s){return (uint16_t(s.gamepad.buttons)&0x2300)==0x2300;}),
+        "Paddles RB/LB and the clutch pedal's B did not reach guest input");
+    Check(int16_t(state.gamepad.thumb_ry)==0,"Clutch sent as analog while off");
+    SDL_SetJoystickVirtualButton(wheel,0,false);SDL_SetJoystickVirtualButton(wheel,1,false);
+    SDL_SetJoystickVirtualAxis(pedals,2,-32768);
+    Check(WaitFor(input,state,[](auto& s){return (uint16_t(s.gamepad.buttons)&0x2300)==0;}),"Clutch or paddle buttons stuck after release");
+
     rex::input::X_INPUT_CAPABILITIES caps{};
     Check(input->GetCapabilities(0,1,&caps)==0 && caps.sub_type==2 && uint16_t(caps.flags)==0,
         "Wheel subtype or disabled FFB capability incorrect");
-    SDL_CloseJoystick(joystick);SDL_DetachVirtualJoystick(id);
+    input->Shutdown();system.reset();
+
+    REXCVAR_SET(wheel_clutch_analog,true);
+    system=fm4::wheel::CreateInputSystem(false);
+    input=static_cast<rex::input::InputSystem*>(system.get());
+    SDL_SetJoystickVirtualAxis(pedals,2,32767);
+    Check(WaitFor(input,state,[](auto& s){return int16_t(s.gamepad.thumb_ry)==32767;}),"Analog clutch not on the right stick's Y axis");
+
+    SDL_CloseJoystick(pedals);SDL_DetachVirtualJoystick(pedal_id);
+    SDL_CloseJoystick(wheel);SDL_DetachVirtualJoystick(wheel_id);
     bool disconnected=false;
-    for(int i=0;i<250;++i) {
+    for(int i=0;i<300;++i) {
       SDL_PumpEvents();SDL_UpdateJoysticks();
       if(input->GetCapabilities(0,1,&caps)!=0 || caps.sub_type!=2) {disconnected=true;break;}
       SDL_Delay(10);
     }
     Check(disconnected,"Disconnected wheel still presented as connected");
-    input->Shutdown();generic.reset();SDL_Quit();
-    std::puts("Runtime wheel assignment, guest axes/triggers/buttons, capabilities and disconnect passed.");return 0;
+    input->Shutdown();system.reset();SDL_Quit();
+    std::puts("Runtime wheel on two devices: steering, pedals, buttons, hat, clutch, capabilities and disconnect passed.");return 0;
   }catch(const std::exception& e){std::fprintf(stderr,"Runtime wheel test failed: %s\n",e.what());return 1;}
 }
