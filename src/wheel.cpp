@@ -266,7 +266,8 @@ struct DeviceMonitor::Impl {
     if (test_id >= 0) { SDL_DestroyHapticEffect(haptic, test_id); test_id = -1; }
     if (test_stage == 3) {
       haptic_status = "Pulled \"" + open[haptic_owner].device.name +
-                      "\" LEFT, then RIGHT (15 %). If it pulled right first, tick Reverse force direction.";
+                      "\" LEFT, then RIGHT (" + std::to_string(s.ffb_strength) +
+                      " % strength). If it pulled right first, tick Reverse force direction.";
       test_stage = 0;
       test_cooldown = now + 500ms;
       if (caller_thread) CloseHaptic();
@@ -274,7 +275,8 @@ struct DeviceMonitor::Impl {
     }
     // A positive level pulls left (SDL and DirectInput name the side a force
     // comes from); the game's forces go out the same way, so Reverse flips both.
-    const Sint16 left = s.ffb_invert ? -4915 : 4915;
+    const Sint16 level = TestForceLevel(s);
+    const Sint16 left = s.ffb_invert ? Sint16(-level) : level;
     SDL_HapticEffect pulse{};
     pulse.type = SDL_HAPTIC_CONSTANT;
     pulse.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;

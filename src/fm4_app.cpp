@@ -5,6 +5,8 @@
 #include "crash_handler.h"
 #include "file_signatures.h"
 #include "wheel_input.h"
+#include "camera_view.h"
+#include "wide_view.h"
 
 #include <charconv>
 
@@ -52,6 +54,10 @@ void Fm4App::OnConfigurePaths(rex::PathConfig& paths) {
     rex::cvar::LoadConfig(user_config);
     paths.config_path = user_config;
   }
+  // The camera adjustments the game saved (camera_view.cpp).
+  if (std::filesystem::exists(fm4::camera::ConfigFile())) {
+    rex::cvar::LoadConfig(fm4::camera::ConfigFile());
+  }
   if (paths.game_data_root.empty()) {
     const std::string from_config = REXCVAR_GET(game_data_root);
     paths.game_data_root = from_config.empty() ? exe_dir / "game" : std::filesystem::path(from_config);
@@ -68,6 +74,11 @@ void Fm4App::OnPostInitLogging() {
 
 void Fm4App::OnPreSetup(rex::RuntimeConfig& config) {
   config.input_factory = fm4::wheel::CreateInputSystem;
+  // FM4 always renders 1280x720. Reporting the window as the TV (the SDK's
+  // default when a window size is set) made the presenter treat that image as
+  // the window's aspect and stretch it, so black bars never appeared on a wide
+  // window; the image keeps 16:9 and wide windows go through display_wide_view.
+  rex::cvar::SetFlagByName("video_mode_from_window", "false");
   if (config.graphics || !config.gpu_plugin.empty()) {
     return;  // --gpu_plugin given explicitly; let ReXApp load it.
   }
@@ -104,6 +115,12 @@ void Fm4App::OnPostLoadXexImage() {
 
 void Fm4App::OnPostSetup() {
   fm4::wheel::SetFocus(window() && window()->HasFocus());
+  if (window()) window()->AddInputListener(&fullscreen_toggle_, 100);
+  fm4::camera::AttachKeys(window());
+  if (window()) {
+    fm4::wide_view::SetWindowSize(window()->GetActualPhysicalWidth(),
+                                  window()->GetActualPhysicalHeight());
+  }
   MountCachePartition(runtime(), user_data_root());
 
   auto* profile = runtime()->kernel_state()->user_profile();
@@ -131,9 +148,24 @@ void Fm4App::OnPostSetup() {
   }
 }
 
-void Fm4App::OnWindowFocusChanged(bool focused) { fm4::wheel::SetFocus(focused); }
+void Fm4App::OnWindowFocusChanged(bool focused) {
+  fm4::wheel::SetFocus(focused);
+  if (!focused) fm4::camera::ReleaseKeys();
+}
 bool Fm4App::OnWindowCloseRequested() { fm4::wheel::SetFocus(false);fm4::wheel::ResetEffects();return true; }
 void Fm4App::OnWindowMinimized() { fm4::wheel::SetFocus(false); }
+
+void Fm4App::FullscreenToggle::OnKeyDown(rex::ui::KeyEvent& e) {
+  if (e.virtual_key() != rex::ui::VirtualKey::kReturn || !e.is_alt_pressed() || e.prev_state()) return;
+  if (auto* window = app_.window()) {
+    window->SetFullscreen(!window->IsFullscreen());
+    e.set_handled(true);
+  }
+}
+
+void Fm4App::OnWindowPixelSizeChanged(uint32_t pixel_width, uint32_t pixel_height) {
+  fm4::wide_view::SetWindowSize(pixel_width, pixel_height);
+}
 void Fm4App::OnGuestThreadExit(rex::system::XThread*) { fm4::wheel::SetFocus(false);fm4::wheel::ResetEffects(); }
 
 std::unique_ptr<rex::ui::AchievementNotificationDialog> Fm4App::CreateAchievementNotificationDialog() {

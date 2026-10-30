@@ -35,8 +35,8 @@ struct AxisBinding {
 // One entry of wheel_buttons, "NAME=[device|]input": button N, a hat
 // direction ("hN.up"), or an axis past half travel ("[+|-]axisN", e.g. a
 // handbrake lever). NAME is an Xbox control (A, B, X, Y, LB, RB, LT, RT, LS,
-// RS, BACK, START, UP, DOWN, LEFT, RIGHT) or an H-shifter gate (GEAR1 to
-// GEAR7, REVERSE).
+// RS, BACK, START, UP, DOWN, LEFT, RIGHT), an H-shifter gate (GEAR1 to
+// GEAR7, REVERSE) or a camera action (CAM_FOV_IN, ..., see CameraAction).
 struct ButtonBinding {
   std::string device;
   int button = -1;
@@ -47,7 +47,24 @@ struct ButtonBinding {
   uint16_t xbuttons = 0;
   bool left_trigger = false, right_trigger = false;
   int8_t gear = 0;  // -1 reverse, 1-7 a gear, 0 a pad control
+  int8_t camera = -1;  // a CameraAction, -1 none
 };
+
+// The in-game camera adjustments (camera_view.cpp), bound to keys
+// (keybind_camera_*) and wheel buttons (CAM_*). Held, they repeat.
+enum class CameraAction : uint8_t {
+  kFovIn,       // CAM_FOV_IN: narrower field of view
+  kFovOut,      // CAM_FOV_OUT: wider
+  kFovReset,    // CAM_FOV_RESET: the game's own
+  kSeatUp,      // CAM_SEAT_UP
+  kSeatDown,    // CAM_SEAT_DOWN
+  kSeatForward, // CAM_SEAT_FORWARD
+  kSeatBack,    // CAM_SEAT_BACK
+  kSeatReset,   // CAM_SEAT_RESET: the game's own position
+  kCount,
+};
+// "CAM_FOV_IN" and so on, by action.
+const char* CameraActionName(CameraAction action);
 
 std::optional<AxisBinding> ParseAxisBinding(std::string_view text);
 // Malformed entries are skipped, so a typo loses one button, not all of them.
@@ -66,6 +83,10 @@ AxisDirection ResolveAxisDirection(AxisDirection direction, int16_t rest);
 // Steering axis to the guest's left stick X. `scale_percent` above 100 needs
 // less rotation for full lock; the deadzone is a percentage of half travel.
 int16_t SteeringFromAxis(int16_t raw, bool invert, int scale_percent, int deadzone_percent);
+struct Settings;
+// The steering scale in percent: the sensitivity, times the wheel's rotation
+// over the game's when game_rotation is set (900 over 360: 250 %).
+int SteeringScale(const Settings& s);
 // A pedal axis to a trigger value, 0 at rest and 255 fully pressed, with a
 // dead zone at rest (bottom) and one at full travel (top), in percent.
 uint8_t PedalFromAxis(int16_t raw, AxisDirection direction, int bottom_percent, int top_percent);
@@ -79,6 +100,11 @@ struct Settings {
   int steering_axis = 0;
   bool steering_invert = false;
   int steering_scale = 100, steering_deadzone = 0;
+  // The rotation set in the wheel's software and the in-game steering wheel's
+  // lock to lock, in degrees; with game_rotation set, steering is scaled so the
+  // game's wheel turns as far as the real one (0: the wheel's full rotation is
+  // the game's full lock).
+  int wheel_rotation = 900, game_rotation = 0;
   std::string throttle, brake, clutch;
   std::string buttons = "UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right";
   // The clutch pedal past half travel also presses these Xbox buttons; FM4's
@@ -125,6 +151,9 @@ struct ForceTuning {
   bool invert = false;
 };
 ForceTuning TuningFrom(const Settings& s);
+// The Test's constant-force level: Strength, 100 % being half the base's
+// maximum and 200 % all of it.
+int16_t TestForceLevel(const Settings& s);
 // SDL constant-force level: magnitude x gain, lifted to min_force, scaled by
 // strength (up to 200 %, clipped at full scale), reversed by invert. SDL and DirectInput name the side a force
 // comes from, as the game's effects do.

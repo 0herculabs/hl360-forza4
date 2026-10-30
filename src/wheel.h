@@ -46,7 +46,8 @@ class DeviceMonitor {
   void SetActive(bool active);
   // The force device (FfbDevice matching) and how the game's effects play.
   void ConfigureForce(const Settings& settings);
-  // Pulls the wheel LEFT, then RIGHT, at 15 % (reversed by ffb_invert).
+  // Pulls the wheel LEFT, then RIGHT, at the strength set (TestForceLevel;
+  // reversed by ffb_invert).
   void TestHaptics();
   void UpdateForce(ForceEffect effect);
   void OperateForce(int id, bool start);

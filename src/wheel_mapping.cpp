@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
+#include <iterator>
 
 namespace fm4::wheel {
 namespace {
@@ -53,12 +54,21 @@ struct Target {
   uint16_t xbuttons = 0;
   bool left_trigger = false, right_trigger = false;
   int8_t gear = 0;
+  int8_t camera = -1;
 };
+
+constexpr const char* kCameraActionNames[] = {"CAM_FOV_IN",    "CAM_FOV_OUT",  "CAM_FOV_RESET",
+                                              "CAM_SEAT_UP",   "CAM_SEAT_DOWN", "CAM_SEAT_FORWARD",
+                                              "CAM_SEAT_BACK", "CAM_SEAT_RESET"};
+static_assert(std::size(kCameraActionNames) == size_t(CameraAction::kCount));
 
 std::optional<Target> TargetForName(std::string_view name) {
   const std::string lower = Lower(Trim(name));
   auto gear = [](int value) { Target t; t.gear = int8_t(value); return t; };
   if (lower == "reverse") return gear(-1);
+  for (size_t i = 0; i < std::size(kCameraActionNames); ++i) {
+    if (lower == Lower(kCameraActionNames[i])) { Target t; t.camera = int8_t(i); return t; }
+  }
   if (lower.size() == 5 && lower.compare(0, 4, "gear") == 0 && lower[4] >= '1' && lower[4] <= '7')
     return gear(lower[4] - '0');
   static const std::pair<const char*, uint16_t> names[] = {
@@ -121,6 +131,7 @@ std::vector<ButtonBinding> ParseButtonBindings(std::string_view text) {
     binding.left_trigger = target->left_trigger;
     binding.right_trigger = target->right_trigger;
     binding.gear = target->gear;
+    binding.camera = target->camera;
     std::string_view axis_text = rest;
     AxisDirection axis_direction = AxisDirection::kAuto;
     if (!axis_text.empty() && (axis_text.front() == '+' || axis_text.front() == '-')) {
@@ -156,6 +167,10 @@ std::vector<ButtonBinding> ParseButtonBindings(std::string_view text) {
     if (comma == text.size()) break;
   }
   return out;
+}
+
+const char* CameraActionName(CameraAction action) {
+  return size_t(action) < std::size(kCameraActionNames) ? kCameraActionNames[size_t(action)] : "";
 }
 
 uint16_t ButtonsFromNames(std::string_view text) {
@@ -211,9 +226,17 @@ int16_t SteeringFromAxis(int16_t raw, bool invert, int scale_percent, int deadzo
   const int32_t magnitude = std::abs(value);
   if (magnitude <= deadzone) return 0;
   int64_t scaled = int64_t(magnitude - deadzone) * 32767 / (32767 - deadzone);
-  scaled = scaled * std::clamp(scale_percent, 10, 1000) / 100;
+  scaled = scaled * std::clamp(scale_percent, 10, 4000) / 100;
   scaled = std::min<int64_t>(scaled, 32767);
   return int16_t(value < 0 ? -scaled : scaled);
+}
+
+int SteeringScale(const Settings& s) {
+  int64_t scale = std::clamp(s.steering_scale, 10, 1000);
+  if (s.game_rotation > 0) {
+    scale = scale * std::clamp(s.wheel_rotation, 90, 3600) / std::clamp(s.game_rotation, 90, 3600);
+  }
+  return int(std::clamp<int64_t>(scale, 10, 4000));
 }
 
 uint8_t PedalFromAxis(int16_t raw, AxisDirection direction, int bottom_percent, int top_percent) {
@@ -247,10 +270,18 @@ const char* FfbModeName(FfbMode mode) {
   }
 }
 
+int16_t TestForceLevel(const Settings& s) {
+  return int16_t(std::clamp(s.ffb_strength, 0, 200) * 32767 / 200);
+}
+
 ForceTuning TuningFrom(const Settings& s) {
+  // The game's constant force takes the sign of the steering it opposes; SDL's
+  // (DirectInput's) runs the other way, so it is negated, as in FH1, and
+  // ffb_invert reverses that for a wheel that differs. The Test pulls are
+  // plain SDL directions and are not affected.
   return {std::clamp(s.ffb_strength, 0, 200), std::clamp(s.ffb_min_force, 0, 30), std::clamp(s.ffb_spring, 0, 200),
           std::clamp(s.ffb_damper, 0, 200), std::clamp(s.ffb_friction, 0, 200), std::clamp(s.ffb_inertia, 0, 200),
-          s.ffb_invert};
+          !s.ffb_invert};
 }
 
 namespace {

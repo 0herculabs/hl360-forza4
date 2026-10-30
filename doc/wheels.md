@@ -20,17 +20,18 @@ take the wheel exclusively before starting the game.
 ## Setup (launcher, **Wheel** tab)
 
 1. Set the rotation in your wheel software (Fanatec, MOZA Pit House, ...).
-2. Turn on **Use the racing wheel** and press **Start guided setup**. Each
-   step listens on every connected device: turn the wheel left, press each
-   pedal, then press the input for each Xbox button. **Skip** keeps a control
-   as it is, **Leave unbound** clears it; skipping 1st gear while it is unbound
-   skips the whole H-shifter.
+2. Turn on **Enable Wheel Support**. On the same line, set **Wheel rotation**
+   (as set in the wheel software) and **In-game rotation** (how far the
+   game's steering wheel turns; match it by eye in cockpit view, lower it if
+   the game's wheel turns further than yours; Off maps your wheel's full
+   rotation to full lock).
 3. Check the live view (it stays at the top while the cards below open and close): the wheel, pedal bars and button chips show exactly
-   what the game will read. **Bind** on a row rebinds just that control, **+**
+   what the game will read. **Bind** on a row binds just that control, **+**
    adds another input for the same button, **x** clears it, **Invert**
    reverses an axis.
-4. **Force feedback**: pick the device that receives the forces (by default
-   the wheel base), press **Test** (left, then right, 15 %), and tick
+4. **Force Feedback**: pick the device that receives the forces (by default
+   the wheel base), press **Test** (left, then right, as hard as **Strength**:
+   100 % is half the base's maximum, 200 % all of it), and tick
    **Reverse force direction** if it pulled right first. Start with a low
    **Strength** on a direct-drive base.
 5. **Deadzones**: steering sensitivity and dead zone, dead zones per pedal with
@@ -57,9 +58,10 @@ are on the wheel base (`wheel_device`).
 | `wheel_enabled` | `false` | Use the wheel bindings for player one. |
 | `wheel_device` | `""` | The wheel base; empty for the first device SDL types as a wheel. |
 | `wheel_steering_axis`, `wheel_steering_invert` | `0`, `false` | Steering axis on the base. |
+| `wheel_rotation`, `wheel_game_rotation` | `900`, `0` | The rotation set in the wheel's software and the in-game steering wheel's, degrees lock to lock. With `wheel_game_rotation` set, full lock comes when the wheel has turned that far (900 on 360: 250 % sensitivity), so the cockpit wheel follows the real one; `0` maps the wheel's full rotation to full lock. |
 | `wheel_steering_scale`, `wheel_steering_deadzone` | `100`, `0` | Sensitivity and dead zone, percent. |
 | `wheel_throttle`, `wheel_brake`, `wheel_clutch` | `""` | Pedal axes, `[device|][+|-]axisN` (`-`: the pedal rests at the top). |
-| `wheel_buttons` | the hat as the D-pad | `NAME=input,...`: `N` a button, `hN.up` a hat direction, `[+|-]axisN` an axis past half travel. NAME is A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START, UP, DOWN, LEFT, RIGHT, or GEAR1-GEAR7 / REVERSE. A NAME may appear more than once. |
+| `wheel_buttons` | the hat as the D-pad | `NAME=input,...`: `N` a button, `hN.up` a hat direction, `[+|-]axisN` an axis past half travel. NAME is A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START, UP, DOWN, LEFT, RIGHT, GEAR1-GEAR7 / REVERSE, or a camera action (CAM_FOV_IN, CAM_FOV_OUT, CAM_FOV_RESET, CAM_SEAT_UP, CAM_SEAT_DOWN, CAM_SEAT_FORWARD, CAM_SEAT_BACK, CAM_SEAT_RESET; see [camera](camera.md)). A NAME may appear more than once. |
 | `wheel_clutch_button` | `B` | Buttons the clutch pedal presses past half travel. |
 | `wheel_clutch_analog` | `false` | Also send the clutch as the right stick's Y axis (FH1's analog clutch; not confirmed in FM4). |
 | `wheel_pedal_deadzone`, `wheel_{throttle,brake,clutch}_deadzone_{bottom,top}` | `3`, `-1`/`0` | Pedal dead zones, percent; bottom `-1` uses `wheel_pedal_deadzone`. |
@@ -75,7 +77,10 @@ are on the wheel base (`wheel_device`).
 H-shifter gears are sent as FH1 reads them (the held gear on the right stick's
 X axis, with a shifter reported in the capabilities); FM4 shares FH1's wheel
 code but this is not confirmed in FM4 yet. FH1's 900-degree flag does not exist
-in FM4 (no comparison against 900 in its code), so it is not offered.
+in FM4 (no comparison against 900 in its code); the rotation is matched by
+scaling the steering instead (`wheel_game_rotation`). FM4 has no single
+steering rotation to read: each car has its own lock in its data
+(`SteerLock`, `SteeringWheelAngleScale`).
 
 ## Force feedback implementation
 

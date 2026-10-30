@@ -11,4 +11,6 @@ void SubmitEffect(ForceEffect effect);
 void OperateEffect(int id, bool start);
 void ResetEffects();
 void SetDriving(bool driving);
+// The camera actions the wheel's CAM_* buttons hold (CameraAction bits).
+uint32_t CameraHeld();
 }
