@@ -1,9 +1,11 @@
-# Initial settings inherited from the FM3 runtime; FM4 validation is ongoing.
+# Defaults adapted from the local FM4 Xenia Canary profile.
+# Keep guest vblank pacing enabled: this runtime ties it to vsync.
 gpu_backend = "d3d12"
 vsync = true
-readback_resolve = "fast"
+readback_resolve = "none"
+readback_memexport = false
 audio_maxqframes = 16
-async_shader_compilation = false
+async_shader_compilation = true
 gpu_allow_invalid_fetch_constants = true
 execute_unclipped_draw_vs_on_cpu = true
 

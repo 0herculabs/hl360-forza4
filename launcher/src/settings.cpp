@@ -66,6 +66,15 @@ bool WriteFile(const std::filesystem::path& file, const std::string& header, con
 
 Settings::Settings() { ResetBinds(); }
 
+void Settings::ApplyGraphicsPreset(int preset) {
+  graphics_preset = std::clamp(preset, 0, 3);
+  if (graphics_preset == 3) return;
+  resolution_scale = graphics_preset == 0 ? 1 : 2;
+  anisotropic_override = 3 + graphics_preset;
+  present_effect = graphics_preset == 2 ? "bilinear" : "fsr";
+  swap_post_effect = "none";
+}
+
 void Settings::ResetBinds() {
   binds.assign(std::begin(kDefaultBinds), std::end(kDefaultBinds));
   for (auto& b : binds) b.keys = b.default_keys;
@@ -74,6 +83,7 @@ void Settings::ResetBinds() {
 void Settings::ResetDisplay() {
   Settings defaults;
   fullscreen = defaults.fullscreen;
+  vsync = defaults.vsync;
   monitor = defaults.monitor;
   window_width = defaults.window_width;
   window_height = defaults.window_height;
@@ -83,6 +93,10 @@ void Settings::ResetDisplay() {
   anisotropic_override = defaults.anisotropic_override;
   swap_post_effect = defaults.swap_post_effect;
   present_effect = defaults.present_effect;
+  video_mode_width = defaults.video_mode_width;
+  video_mode_height = defaults.video_mode_height;
+  present_fsr_sharpness_reduction = defaults.present_fsr_sharpness_reduction;
+  ApplyGraphicsPreset(1);
 }
 
 bool Settings::Load(const std::filesystem::path& file) {
@@ -99,6 +113,7 @@ bool Settings::Load(const std::filesystem::path& file) {
   ReadInt(t, "user_language", user_language);
 
   Read(t, "fullscreen", fullscreen);
+  Read(t, "vsync", vsync);
   ReadInt(t, "monitor", monitor);
   ReadInt(t, "window_width", window_width);
   ReadInt(t, "window_height", window_height);
@@ -110,10 +125,23 @@ bool Settings::Load(const std::filesystem::path& file) {
 
   ReadInt(t, "resolution_scale", resolution_scale);
   ReadInt(t, "anisotropic_override", anisotropic_override);
+  graphics_preset = 3;
+  ReadInt(t, "graphics_preset", graphics_preset);
+  graphics_preset = std::clamp(graphics_preset, 0, 3);
   // Vulkan renders FM4 incorrectly: always D3D12 (drops stale values).
   gpu_backend = "d3d12";
   Read(t, "swap_post_effect", swap_post_effect);
   Read(t, "present_effect", present_effect);
+  // Xenia profile baseline: default 720p guest mode, independent of output size.
+  video_mode_width = 1280;
+  video_mode_height = 720;
+  present_fsr_sharpness_reduction = 0.2;
+  async_shader_compilation = true;
+  readback_resolve = "none";
+  resolution_scale = std::clamp(resolution_scale, 1, 4);
+  anisotropic_override = std::clamp(anisotropic_override, 0, 5);
+  swap_post_effect = "none";
+  if (graphics_preset < 3) ApplyGraphicsPreset(graphics_preset);
 
   Read(t, "input_backend", input_backend);
   Read(t, "wheel_enabled", wheel.enabled);
@@ -140,6 +168,9 @@ bool Settings::Load(const std::filesystem::path& file) {
     Read(t, (std::string("keybind_") + b.id).c_str(), b.keys);
   }
   Read(t, "audio_mute", audio_mute);
+  Read(t, "audio_output_mode", audio_output_mode);
+  if (audio_output_mode != "auto" && audio_output_mode != "stereo" && audio_output_mode != "surround")
+    audio_output_mode = "auto";
   return true;
 }
 
@@ -155,24 +186,24 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("monitor", monitor);
   t.insert("window_width", window_width);
   t.insert("window_height", window_height);
-  // Not the host's vertical sync but the guest vblank timer: FM4 paces itself
-  // on it and runs too fast without it. Always on (older files may say off).
-  t.insert("vsync", true);
+  t.insert("vsync", vsync);
   t.insert("present_letterbox", present_letterbox);
 
   t.insert("gpu_backend", gpu_backend);
   t.insert("resolution_scale", resolution_scale);
+  t.insert("graphics_preset", graphics_preset);
   t.insert("anisotropic_override", anisotropic_override);
   t.insert("swap_post_effect", swap_post_effect);
   t.insert("present_effect", present_effect);
-  // FM4 needs render-to-texture readback for the road and car thumbnails.
-  // "fast" keeps the fix without the 30 fps cost of the synchronous mode.
-  // Always write it so old launcher files containing full/some/none are healed.
-  t.insert("readback_resolve", "fast");
+  t.insert("video_mode_width", 1280);
+  t.insert("video_mode_height", 720);
+  t.insert("present_fsr_sharpness_reduction", 0.2);
+  // Preserve the selected mode across every launcher save.
+  t.insert("readback_resolve", "none");
+  t.insert("readback_memexport", false);
 
   t.insert("input_backend", input_backend);
   t.insert("video_mode_refresh_rate", experimental_120fps?120.0:60.0);
-  t.insert("vsync",true);
   t.insert("wheel_enabled", wheel.enabled);
   t.insert("wheel_device", wheel.device);
   t.insert("wheel_ffb", wheel.ffb);t.insert("wheel_ffb_invert", wheel.ffb_invert);
@@ -195,11 +226,10 @@ bool Settings::Save(const std::filesystem::path& file) const {
   for (const auto& b : binds) {
     t.insert(std::string("keybind_") + b.id, b.keys);
   }
-  // Stable port defaults; migrate values written by the experimental UI.
-  // Cached pipelines are already precompiled by the runtime at startup.
-  t.insert("async_shader_compilation", false);
+  t.insert("async_shader_compilation", true);
   t.insert("frame_stats", false);
   t.insert("audio_mute", audio_mute);
+  t.insert("audio_output_mode", audio_output_mode);
   return WriteFile(file,
                    "# Written by the FM4 launcher. The game loads this after fm4.toml,\n"
                    "# so these values win. Edit from the launcher.\n\n",

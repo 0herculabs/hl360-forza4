@@ -1,4 +1,5 @@
 #include "graphics_fixes.h"
+#include "plus_physics_profile.h"
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -54,6 +55,41 @@ void CheckPath(const fs::path& root, const fs::path& path) {
   }
 
 }
+}
+std::string SetPlus120Physics(const fs::path& game, bool enabled) {
+  try {
+    if (!fs::exists(game / ".fm4-plus-ready")) return {};
+    const auto live = game / "Media/physics/PhysicsSettings.ini";
+    const auto backup = game / ".fm4-120-physics-original.ini";
+    CheckPath(game, live); CheckPath(game, backup);
+    const auto before = Read(live);
+    if (fs::exists(backup)) {
+      const auto original = Read(backup);
+      if (before != original && before != kPlus120Physics)
+        throw std::runtime_error("PhysicsSettings.ini was externally modified; refusing to overwrite it");
+      if (!enabled) { Write(live, original); return {}; }
+    } else {
+      if (!enabled) return {};
+      Write(backup, before);
+    }
+    if (before != kPlus120Physics) Write(live, kPlus120Physics);
+    return {};
+  } catch (const std::exception& e) { return e.what(); }
+}
+std::vector<ManifestEntry> PhysicsVerificationManifest(const fs::path& game,
+    const std::vector<ManifestEntry>& manifest) {
+  auto out = manifest;
+  if (!fs::exists(game / ".fm4-plus-ready")) return out;
+  try {
+    const auto live = game / "Media/physics/PhysicsSettings.ini";
+    const auto backup = game / ".fm4-120-physics-original.ini";
+    CheckPath(game, live); CheckPath(game, backup);
+    if (fs::exists(backup) && Read(live) == kPlus120Physics)
+      for (auto& entry : out)
+        if (fs::path(entry.path) == fs::path("Media/physics/PhysicsSettings.ini"))
+          entry.path = ".fm4-120-physics-original.ini";
+  } catch (...) { /* Report modifications through normal verification. */ }
+  return out;
 }
 bool RaceShadowWorkaroundEnabled(const fs::path& game) {
   return fs::exists(game / kBackup / "active");

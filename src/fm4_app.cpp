@@ -5,6 +5,7 @@
 #include "crash_handler.h"
 #include "file_signatures.h"
 #include "wheel_input.h"
+#include "audio_output.h"
 
 #include <charconv>
 
@@ -68,6 +69,9 @@ void Fm4App::OnPostInitLogging() {
 
 void Fm4App::OnPreSetup(rex::RuntimeConfig& config) {
   config.input_factory = fm4::wheel::CreateInputSystem;
+  config.audio_factory = [](rex::runtime::FunctionDispatcher* dispatcher) {
+    return std::make_unique<fm4::OutputSystem>(dispatcher);
+  };
   if (config.graphics || !config.gpu_plugin.empty()) {
     return;  // --gpu_plugin given explicitly; let ReXApp load it.
   }

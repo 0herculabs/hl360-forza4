@@ -39,7 +39,7 @@ These hashes identify the **uncompressed ISO files**, not their ZIP archives. Th
 
 ### Requirements
 
-- Windows x64 and a Direct3D 12-capable GPU.
+- Windows x64 and a Vulkan-capable GPU for the current Vulkan package.
 - Microsoft Visual C++ 2015–2022 Redistributable, x64.
 - The supported game discs and enough free space for extraction and content installation.
 - Additional space for a separate game/content copy if installing Project Forza Plus 4.
@@ -76,7 +76,7 @@ The SDL3 / Dear ImGui launcher has an English/Spanish interface and an integrate
 - **Frame rate:** default 60 FPS / 60 Hz target and an optional experimental 120 FPS / 120 Hz target.
 - **Controls:** SDL/XInput controllers, keyboard bindings, optional mouse-to-right-stick input, and a wheel calibration wizard.
 - **Wheels:** live Axis percentages, button/D-pad mappings, paddle assignments and an optional clutch pedal.
-- **Language and audio:** in-game language selection and audio mute.
+- **Language and audio:** in-game language selection, audio mute, and Automatic, Stereo or 5.1 PCM output.
 - **Project Forza Plus 4:** optional installation, original/mod switching and removal with save preservation.
 
 The sidebar shows separate green indicators for the installed game and Project Forza Plus 4. Mod installation is managed under **Install**, without a separate mod tab.
@@ -130,7 +130,7 @@ To select another mode, close the game, press **Uninstall Forza Plus**, then rei
 
 The adaptation uses separate `.fm4-plus` folders under the selected game and user roots. It retains the port's executable and adapts mod data; it does not run the mod's different-build `default.xex`. Only DLC already installed with the required headers can be adapted. Other bundled DLC is skipped.
 
-Extra FOV, harder-AI and alternative high-FPS physics options from the mod are not currently exposed in the launcher. Full compatibility with every mod feature is not established. See [integration and uninstall details](doc/forza-plus.md).
+With Forza Plus active, selecting 120 FPS applies the supplied physics profile (`CarPhysicsUpdateHz 695`, `TimeScale 1`) when pressing Play. Returning to 60 FPS restores the previous physics file on Play. Extra FOV and harder-AI options are not currently exposed in the launcher. Full compatibility with every mod feature is not established. See [integration and uninstall details](doc/forza-plus.md).
 
 ## Gameplay screenshots
 
@@ -142,11 +142,11 @@ These captures show individual runs, not a performance guarantee.
 
 ## Performance and current limitations
 
-**Playing at 60 FPS is strongly recommended. The experimental 120 FPS mode causes visual artifacts.** Keep the default 60 FPS target for the recommended experience. The 120 FPS option changes the guest video refresh target to 120 Hz and requires a game restart. Configure a capable display to 120 Hz or higher in Windows separately; the launcher does not change the desktop refresh rate.
+The default is 60 FPS. The optional 120 FPS mode is experimental and requires a game restart. Configure a capable display to 120 Hz or higher in Windows separately; the launcher does not change the desktop refresh rate.
 
-A startup measurement reached 120 guest present calls per second, but race performance can fluctuate. Physics, animation and audio timing at 120 Hz still need validation. Use 60 FPS if timing or behavior changes. Reducing internal resolution to 720p (1x) is a useful comparison when investigating GPU load.
+The Vulkan build follows the [Xenia graphics profile](doc/xenia-graphics-profile.md), with a fixed 720p guest video mode and Low, Medium, High and Custom settings. Async shader compilation is enabled, while CPU resolve/memexport readback and postprocess AA are disabled. Custom settings expose render scale, anisotropic filtering and output scaling. The old exterior shadow-map suppression patch is removed in this build. Shader compilation can still cause first-time stalls, and the renderer is not identical to Xenia Canary.
 
-Direct3D 12 and the required render readback settings are configured by the port. A race-shadow workaround currently skips exterior shadow maps while retaining cockpit shadows. Shader compilation can still cause first-time stalls. Vulkan is not offered as a supported backend in the launcher.
+The 60/120 FPS options now set the host presentation limit as well as game pacing. Showroom camera motion uses elapsed time to avoid accelerating at 120 FPS. These fixes do not establish correct timing in every game mode or guarantee sustained 120 FPS. Fullscreen exit now explicitly releases presentation and destroys the SDL window before terminating, addressing the reported desktop HDR dimming.
 
 Long-term Career/save compatibility and complete mode coverage remain work in progress. Profiles are local; Xbox Live functionality is not provided. Please include your game/mod version, hardware, graphics settings and reproduction steps when reporting a problem, plus available logs or crash reports.
 

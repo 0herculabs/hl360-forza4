@@ -1,0 +1,27 @@
+# Vulkan profile adapted from the user's working Xenia Canary settings.
+gpu_backend = 'vulkan'
+vsync = false
+video_mode_width = 1280
+video_mode_height = 720
+video_mode_refresh_rate = 60.0
+host_present_fps_limit = 60
+async_shader_compilation = true
+readback_resolve = 'none'
+readback_memexport = false
+vulkan_depth_bias_force_unorm = true
+# Prefer transfers over FH1-specific color/stencil shortcuts for FM4.
+fh1_color_overwrite_claims = false
+fh1_scrambled_stencil_claims = false
+fh1_surfaceless_clears = false
+clear_memory_page_state = false
+vulkan_pipeline_creation_threads = -1
+gpu_allow_invalid_fetch_constants = true
+execute_unclipped_draw_vs_on_cpu = true
+# Medium preset: 2x rendering, 8x anisotropic filtering, FSR.
+graphics_preset = 1
+resolution_scale = 2
+anisotropic_override = 4
+present_effect = 'fsr'
+present_fsr_sharpness_reduction = 0.2
+swap_post_effect = 'none'
+frame_stats = false

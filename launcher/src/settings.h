@@ -38,6 +38,7 @@ struct Settings {
 
   // Display
   bool fullscreen = true;
+  bool vsync = true;
   int monitor = 0;
   int window_width = 1600;
   int window_height = 900;
@@ -46,10 +47,18 @@ struct Settings {
 
   // Quality
   std::string gpu_backend = "d3d12";  // d3d12 | vulkan
-  int resolution_scale = 1;      // internal render scale over 1280x720
-  int anisotropic_override = 3;  // 0..5 = off,1x,2x,4x,8x,16x
+  int resolution_scale = 2;      // internal render scale over 1280x720
+  int anisotropic_override = 4;  // 0..5 = off,1x,2x,4x,8x,16x
   std::string swap_post_effect = "none";    // none | fxaa | fxaa_extreme
-  std::string present_effect = "bilinear";  // bilinear | cas | fsr
+  std::string present_effect = "fsr";  // bilinear | cas | fsr
+  int video_mode_width = 1280;
+  int video_mode_height = 720;
+  double present_fsr_sharpness_reduction = 0.2;
+  int graphics_preset = 1;  // 0 low, 1 medium, 2 high, 3 custom
+  void ApplyGraphicsPreset(int preset);
+
+  bool async_shader_compilation = true;
+  std::string readback_resolve = "none";  // none | fast | full
 
   // Input
   std::string input_backend = "sdl";  // sdl | xinput
@@ -61,6 +70,7 @@ struct Settings {
 
   // Audio
   bool audio_mute = false;
+  std::string audio_output_mode = "auto";
 
   Settings();
   void ResetBinds();

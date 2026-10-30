@@ -1,0 +1,34 @@
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index d53af6b..26cb518 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -37,6 +37,8 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+ REXCVAR_DEFINE_INT32(host_present_fps_limit, 60, "UI/Presenter",
+                      "Host presentation FPS limit (0 disables pacing)")
+     .range(0, 240);
++REXCVAR_DEFINE_BOOL(host_present_stats, false, "UI/Presenter",
++                    "Log completed host presentations every five seconds");
+ 
+ REXCVAR_DEFINE_BOOL(host_present_sleep_spin, true, "UI/Presenter",
+                     "Use a sleep/yield hybrid for host presentation pacing");
+@@ -1595,6 +1597,20 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+   }
+   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+   if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
++    if (REXCVAR_GET(host_present_stats)) {
++      static thread_local auto stats_start = PresentationClock::now();
++      static thread_local uint64_t stats_count = 0;
++      ++stats_count;
++      const auto stats_now = PresentationClock::now();
++      const double stats_seconds = std::chrono::duration<double>(stats_now - stats_start).count();
++      if (stats_seconds >= 5.0) {
++        REXLOG_INFO("Host completed presentations: {:.1f} FPS ({} in {:.1f}s), limit={}",
++            double(stats_count) / stats_seconds, stats_count, stats_seconds,
++            REXCVAR_GET(host_present_fps_limit));
++        stats_count = 0;
++        stats_start = stats_now;
++      }
++    }
+     const int64_t present_time_ns =
+         std::chrono::duration_cast<std::chrono::nanoseconds>(
+             PresentationClock::now().time_since_epoch())

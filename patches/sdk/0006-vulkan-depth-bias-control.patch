@@ -1,0 +1,222 @@
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index fb1f808..d6fa5b8 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -363,6 +363,21 @@ class DeferredCommandBuffer {
+     args.depth_bias_slope_factor = depth_bias_slope_factor;
+   }
+ 
++  // VK_EXT_depth_bias_control.
++  void CmdVkSetDepthBias2EXT(
++      float depth_bias_constant_factor, float depth_bias_clamp,
++      float depth_bias_slope_factor,
++      VkDepthBiasRepresentationEXT depth_bias_representation,
++      bool depth_bias_exact) {
++    auto& args = *reinterpret_cast<ArgsVkSetDepthBias2EXT*>(WriteCommand(
++        Command::kVkSetDepthBias2EXT, sizeof(ArgsVkSetDepthBias2EXT)));
++    args.depth_bias_constant_factor = depth_bias_constant_factor;
++    args.depth_bias_clamp = depth_bias_clamp;
++    args.depth_bias_slope_factor = depth_bias_slope_factor;
++    args.depth_bias_representation = depth_bias_representation;
++    args.depth_bias_exact = depth_bias_exact ? VK_TRUE : VK_FALSE;
++  }
++
+   void CmdVkSetScissor(uint32_t first_scissor, uint32_t scissor_count, const VkRect2D* scissors) {
+     const size_t header_size = rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D));
+     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+@@ -434,6 +449,7 @@ class DeferredCommandBuffer {
+     kVkSetCheckpointNV,
+     kVkSetBlendConstants,
+     kVkSetDepthBias,
++    kVkSetDepthBias2EXT,
+     kVkSetScissor,
+     kVkSetStencilCompareMask,
+     kVkSetStencilReference,
+@@ -645,6 +661,14 @@ class DeferredCommandBuffer {
+     float depth_bias_slope_factor;
+   };
+ 
++  struct ArgsVkSetDepthBias2EXT {
++    float depth_bias_constant_factor;
++    float depth_bias_clamp;
++    float depth_bias_slope_factor;
++    VkDepthBiasRepresentationEXT depth_bias_representation;
++    VkBool32 depth_bias_exact;
++  };
++
+   struct ArgsVkSetScissor {
+     uint32_t first_scissor;
+     uint32_t scissor_count;
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 4d10e2a..8444807 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -184,6 +184,9 @@ class VulkanDevice {
+     // VK_EXT_robustness2
+ 
+     bool nullDescriptor = false;
++    bool depthBiasControl = false;
++    bool leastRepresentableValueForceUnormRepresentation = false;
++    bool depthBiasExact = false;
+   };
+ 
+   // Properties of the core API and enabled extensions, and enabled features.
+@@ -212,6 +215,7 @@ class VulkanDevice {
+     bool ext_EXT_custom_border_color = false;
+     // Has optional features not implied by this being true.
+     bool ext_EXT_robustness2 = false;
++    bool ext_EXT_depth_bias_control = false;
+     // Has optional features not implied by this being true.
+     bool ext_1_3_KHR_maintenance4 = false;  // #414
+     // Has optional features not implied by this being true.
+@@ -242,6 +246,7 @@ class VulkanDevice {
+ #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+ #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
++#include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
+     // VK_NV_device_diagnostic_checkpoints (#207)
+ #include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
+     // VK_KHR_push_descriptor (#81)
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 16b8c7b..ae231fb 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -70,6 +70,9 @@ REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_worker, true, "GPU/Vulkan",
+                     "With vulkan_async_submission, publish and paint each frame on the "
+                     "submission worker after the frame's submission instead of waiting for the "
+                     "worker at every swap");
++REXCVAR_DEFINE_BOOL(vulkan_depth_bias_force_unorm, true, "GPU/Vulkan",
++    "Use exact constant depth bias units where VK_EXT_depth_bias_control supports it");
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -6917,6 +6920,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+ 
+   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+     // Depth bias.
++    const auto& bias_features = GetVulkanDevice()->properties();
++    const bool depth_bias_force_unorm = REXCVAR_GET(vulkan_depth_bias_force_unorm) &&
++        bias_features.depthBiasControl && bias_features.leastRepresentableValueForceUnormRepresentation &&
++        bias_features.depthBiasExact;
+     float depth_bias_constant_factor, depth_bias_slope_factor;
+     draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
+                                              depth_bias_constant_factor);
+@@ -6924,6 +6931,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+         regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
+             ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+             : draw_util::kD3D10PolygonOffsetFactorFloat24;
++    if (depth_bias_force_unorm &&
++        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
++      depth_bias_constant_factor *= 0.5f;
++    }
+     // With non-square resolution scaling, make sure the worst-case impact is
+     // reverted (slope only along the scaled axis), thus max. More bias is
+     // better than less bias, because less bias means Z fighting with the
+@@ -6940,8 +6951,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+     if (dynamic_depth_bias_update_needed_) {
+       dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
+       dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
+-      deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
+-                                                 dynamic_depth_bias_slope_factor_);
++      if (depth_bias_force_unorm) {
++        deferred_command_buffer_.CmdVkSetDepthBias2EXT(dynamic_depth_bias_constant_factor_, 0.0f,
++            dynamic_depth_bias_slope_factor_,
++            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT, true);
++      } else {
++        deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
++            dynamic_depth_bias_slope_factor_);
++      }
+       dynamic_depth_bias_update_needed_ = false;
+     }
+ 
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b14acfc..8376544 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -332,6 +332,24 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                               args.depth_bias_clamp, args.depth_bias_slope_factor);
+       } break;
+ 
++      case Command::kVkSetDepthBias2EXT: {
++        auto& args = *reinterpret_cast<const ArgsVkSetDepthBias2EXT*>(stream);
++        VkDepthBiasRepresentationInfoEXT representation_info = {};
++        representation_info.sType =
++            VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT;
++        representation_info.depthBiasRepresentation =
++            args.depth_bias_representation;
++        representation_info.depthBiasExact = args.depth_bias_exact;
++        VkDepthBiasInfoEXT depth_bias_info = {};
++        depth_bias_info.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT;
++        depth_bias_info.pNext = &representation_info;
++        depth_bias_info.depthBiasConstantFactor =
++            args.depth_bias_constant_factor;
++        depth_bias_info.depthBiasClamp = args.depth_bias_clamp;
++        depth_bias_info.depthBiasSlopeFactor = args.depth_bias_slope_factor;
++        dfn.vkCmdSetDepthBias2EXT(command_buffer, &depth_bias_info);
++      } break;
++
+       case Command::kVkSetScissor: {
+         auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(stream);
+         dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count,
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 2e62b79..dbcb036 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -240,6 +240,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       // #198. Also must be enabled for VK_KHR_spirv_1_4.
+       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float_controls, 1, 2)
+       // #252.
++      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
+       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
+       // #55.
+       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
+@@ -358,6 +359,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
+       features_EXT_robustness2;
+ 
++  VulkanFeatures<VkPhysicalDeviceDepthBiasControlFeaturesEXT,
++      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT> features_EXT_depth_bias_control;
++
+   if (get_physical_device_properties2_supported) {
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+       features_1_2.Link(supported_features_2, device_create_info);
+@@ -405,6 +409,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+     }
+     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
++    if (device->extensions_.ext_EXT_depth_bias_control) {
++      features_EXT_depth_bias_control.Link(supported_features_2, device_create_info);
++    }
+     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
+   }
+ 
+@@ -773,6 +780,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     }
+   }
+ 
++  if (device->extensions_.ext_EXT_depth_bias_control && with_gpu_emulation) {
++    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasControl)
++    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, leastRepresentableValueForceUnormRepresentation)
++    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasExact)
++  }
++
+ #undef XE_UI_VULKAN_LIMIT
+ #undef XE_UI_VULKAN_ENUM_LIMIT
+ #undef XE_UI_VULKAN_FEATURE
+@@ -860,6 +873,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ #endif
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ 
++  if (device->extensions_.ext_EXT_depth_bias_control) {
++#include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
++  }
+ #undef XE_UI_VULKAN_FUNCTION
+ 
+   if (!functions_loaded) {
+diff --git a/include/rex/ui/vulkan/functions/device_ext_depth_bias_control.inc b/include/rex/ui/vulkan/functions/device_ext_depth_bias_control.inc
+new file mode 100644
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/device_ext_depth_bias_control.inc
+@@ -0,0 +1 @@
++XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias2EXT)

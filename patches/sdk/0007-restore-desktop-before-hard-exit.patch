@@ -1,0 +1,69 @@
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index eb107c2..c71a57c 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -34,6 +34,9 @@ class WindowSDL final : public Window {
+   ~WindowSDL() override;
+ 
+   void* GetNativeWindowHandle() const override;
++  // UI thread only, after the presenter has been detached. The caller must
++  // terminate immediately afterwards rather than run normal window callbacks.
++  void RestoreDesktopBeforeHardExit();
+   void ApplyConfiguredSizeAndMonitor() override;
+   bool SetRelativeMouseMode(bool enable) override;
+   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 558b456..17d0823 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -37,6 +37,7 @@
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
+ #include <rex/ui/keybinds.h>
++#include <rex/ui/window_sdl.h>
+ #include <rex/version.h>
+ 
+ #include <fmt/format.h>
+@@ -527,6 +528,15 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
+   if (runtime_ && runtime_->kernel_state()) {
+     runtime_->kernel_state()->TerminateTitle();
+   }
++  // OnBeforeClose normally detaches the surface and destroys the SDL window
++  // after this listener returns. The hard exit below used to skip both,
++  // leaving fullscreen/Auto HDR presentation restoration to driver cleanup.
++  if (window_) {
++    window_->SetPresenter(nullptr);
++    if (auto* sdl_window = dynamic_cast<ui::WindowSDL*>(window_.get())) {
++      sdl_window->RestoreDesktopBeforeHardExit();
++    }
++  }
+   // Hard-exit rather than run subsystem teardown, which can deadlock on a host
+   // lock still held by a straggler TerminateTitle left running. Flush (not
+   // ShutdownLogging, which frees loggers a straggler may still use); the OS
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 015db96..448eee6 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -220,6 +220,22 @@ void WindowSDL::DestroySDLWindow() {
+   }
+ }
+ 
++void WindowSDL::RestoreDesktopBeforeHardExit() {
++  if (!sdl_window_) return;
++  // Explicitly leave fullscreen while SDL can still restore the display and
++  // notify the compositor. _Exit skips SDL's normal window/video teardown.
++  if (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_FULLSCREEN) {
++    if (!SDL_SetWindowFullscreen(sdl_window_, false)) {
++      REXLOG_WARN("Fullscreen restoration on exit failed: {}", SDL_GetError());
++    } else if (!SDL_SyncWindow(sdl_window_)) {
++      REXLOG_WARN("Fullscreen restoration sync failed: {}", SDL_GetError());
++    }
++  }
++  SDL_HideWindow(sdl_window_);
++  DestroySDLWindow();
++  REXLOG_INFO("Desktop presentation restored; SDL window destroyed before hard exit");
++}
++
+ void* WindowSDL::GetNativeWindowHandle() const {
+ #if REX_PLATFORM_WIN32
+   if (!sdl_window_) {

@@ -1,4 +1,4 @@
-﻿// fm4-launcher - profiles, settings and game install for the recompiled
+// fm4-launcher - profiles, settings and game install for the recompiled
 // Forza Motorsport 4. Sits next to fm4.exe; writes fm4.user.toml (read by the
 // game after its own fm4.toml) and launches the game.
 //
@@ -359,7 +359,7 @@ struct App {
         if (entry == out.end()) out.push_back(mod); else *entry = mod;
       }
     }
-    return ShadowVerificationManifest(dir, out);
+    return PhysicsVerificationManifest(dir, ShadowVerificationManifest(dir, out));
   }
 
   void CheckGame() {
@@ -482,6 +482,11 @@ struct App {
   void LaunchGame() {
     if (!fs::exists(game_exe)) {
       notice = std::string(L("Not found: ", "No se encuentra ")) + game_exe.u8string();
+      return;
+    }
+    const auto physics_error = SetPlus120Physics(GameDir(), settings.experimental_120fps);
+    if (!physics_error.empty()) {
+      notice = physics_error;
       return;
     }
     // Compatibility fixes are part of the port, not player-facing settings.
@@ -1027,29 +1032,6 @@ void TabProfiles(App& app) {
   }
 }
 
-// Quality presets map onto the individual settings; anything else is "custom".
-struct Preset {
-  int id;
-  int scale, aniso;
-  const char* aa;
-  const char* present;
-};
-const Preset kPresets[] = {
-    {0, 1, 3, "none", "bilinear"},
-    {1, 2, 5, "none", "bilinear"},
-    {2, 3, 5, "fxaa", "cas"},
-};
-
-int CurrentPreset(const Settings& s) {
-  for (const auto& p : kPresets) {
-    if (s.resolution_scale == p.scale && s.anisotropic_override == p.aniso && s.swap_post_effect == p.aa &&
-        s.present_effect == p.present) {
-      return p.id;
-    }
-  }
-  return 3;
-}
-
 void TabGraphics(App& app) {
   Settings& s = app.settings;
   bool changed = false;
@@ -1090,45 +1072,47 @@ void TabGraphics(App& app) {
     }
     Row(L("Keep 16:9", "Mantener 16:9"));
     changed |= Toggle("##letterbox", &s.present_letterbox);
+    Row(L("Vertical sync (VSync)", "Sincronizacion vertical (VSync)"));
+    changed |= Toggle("##vsync", &s.vsync);
     Row(L("Frame rate", "Fotogramas por segundo"));
     changed |= Segmented<bool>("##framerate",s.experimental_120fps,
         {{false,"60 FPS / 60 Hz"},{true,"120 FPS / 120 Hz"}});
     EndRows();
   }
   if(s.experimental_120fps) {
-    TextColored(kWarn,L("Experimental 120 FPS mode - restart the game to apply.", "Modo experimental de 120 FPS - reinicia el juego para aplicarlo."));
-    ImGui::TextWrapped("%s",L("Sets the guest refresh target to 120 Hz. Set Windows to 120 Hz or higher. Actual FPS depend on performance; physics, animations and audio at 120 Hz still require validation. Return to 60 FPS if timing changes.",
-        "Configura el refresco virtual a 120 Hz. Ajusta Windows a 120 Hz o más. Los FPS reales dependen del rendimiento; física, animaciones y audio a 120 Hz están pendientes de validar. Vuelve a 60 FPS si cambia la velocidad del juego."));
+    TextColored(kWarn, "Experimental");
   }
   EndCard();
 
   BeginCard("##quality", L("Image quality", "Calidad de imagen"));
-  int preset = CurrentPreset(s);
-  if (Segmented<int>("preset", preset,
-                     {{0, "Original 720p"}, {1, L("High 1440p", "Alta 1440p")}, {2, "Ultra 4K"},
-                      {3, L("Custom", "Personalizada")}}) &&
-      preset < 3) {
-    const Preset& p = kPresets[preset];
-    s.resolution_scale = p.scale;
-    s.anisotropic_override = p.aniso;
-    s.swap_post_effect = p.aa;
-    s.present_effect = p.present;
+  int preset = s.graphics_preset;
+  if (Segmented<int>("quality_preset", preset,
+      {{0, L("Low", "Bajo")}, {1, L("Medium", "Medio")},
+       {2, L("High", "Alto")}, {3, L("Custom", "Personalizado")}})) {
+    s.ApplyGraphicsPreset(preset);
     changed = true;
   }
-  ImGui::Dummy(ImVec2(0, S(8)));
-  if (BeginRows("##q")) {
-    Row(L("Internal resolution", "Resolución interna"), L("Xbox 360: 720p", "Xbox 360: 720p"));
+  const char* preset_details[] = {
+      L("1x (720p) / Anisotropic filtering 4x / AMD FSR",
+        "1x (720p) / Filtrado anisotropico 4x / AMD FSR"),
+      L("2x (1440p) / Anisotropic filtering 8x / AMD FSR",
+        "2x (1440p) / Filtrado anisotropico 8x / AMD FSR"),
+      L("2x (1440p) / Anisotropic filtering 16x / Bilinear",
+        "2x (1440p) / Filtrado anisotropico 16x / Bilineal"),
+      L("Choose render scale, anisotropic filtering and output scaling below.",
+        "Elige la escala, el filtrado anisotropico y el escalado a pantalla.")};
+  TextColored(kBad, preset_details[std::clamp(s.graphics_preset, 0, 3)]);
+  if (s.graphics_preset == 3 && BeginRows("##q")) {
+    Row(L("Render scale", "Escala de renderizado"));
     changed |= Segmented<int>("scale", s.resolution_scale,
-                              {{1, "720p (1x)"}, {2, "1440p (2x)"}, {3, "4K (3x)"}, {4, "5K (4x)"}});
-    Row(L("Anisotropic filtering", "Filtrado anisótropo"));
+                              {{1, "1x 720p"}, {2, "2x 1440p"},
+                               {3, "3x 4K"}, {4, "4x 5K"}});
+    Row(L("Anisotropic filtering", "Filtrado anisotropico"));
     changed |= Combo<int>("##aniso", s.anisotropic_override,
-                          {{0, L("Off", "Desactivado")}, {1, "1x"}, {2, "2x"}, {3, "4x"}, {4, "8x"}, {5, "16x"}});
-    Row(L("Anti-aliasing", "Antialiasing"));
-    changed |= Segmented<std::string>(
-        "aa", s.swap_post_effect, {{"none", L("None", "Ninguno")}, {"fxaa", "FXAA"}, {"fxaa_extreme", "FXAA+"}});
+        {{0, L("Off", "No")}, {1, "1x"}, {2, "2x"}, {3, "4x"}, {4, "8x"}, {5, "16x"}});
     Row(L("Output scaling", "Escalado a pantalla"));
-    changed |= Segmented<std::string>(
-        "present", s.present_effect, {{"bilinear", L("Bilinear", "Bilineal")}, {"cas", "AMD CAS"}, {"fsr", "AMD FSR"}});
+    changed |= Segmented<std::string>("present", s.present_effect,
+        {{"bilinear", L("Bilinear", "Bilineal")}, {"cas", "AMD CAS"}, {"fsr", "AMD FSR"}});
     EndRows();
   }
   EndCard();
@@ -1487,10 +1471,18 @@ void TabAudio(App& app) {
   EndCard();
   BeginCard("##sound", L("Sound", "Sonido"));
   if (BeginRows("##s")) {
+    Row(L("Output mode", "Modo de salida"));
+    changed |= Combo<std::string>("##audio_mode", s.audio_output_mode,
+        {{"auto", L("Automatic", "Automatico")}, {"stereo", L("Stereo", "Estereo")},
+         {"surround", "5.1 Surround (PCM)"}});
     Row(L("Mute the game", "Silenciar el juego"));
     changed |= Toggle("##mute", &s.audio_mute);
     EndRows();
   }
+  if (ImGui::Button(L("Windows sound / Dolby...", "Sonido de Windows / Dolby...")))
+    SDL_OpenURL("ms-settings:sound");
+  TextDim(L("Dolby is configured in Windows for compatible devices. Restart the game after changing output mode.",
+      "Dolby se configura en Windows para dispositivos compatibles. Reinicia el juego al cambiar el modo de salida."));
   EndCard();
   if (changed) app.Save();
 }
