@@ -1,107 +1,133 @@
-﻿#include "../src/wheel.h"
+﻿#include "../src/wheel_mapping.h"
 #include "../src/wheel_effects.h"
 #include "../launcher/src/settings.h"
-#include <SDL3/SDL.h>
-#include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
-#include <thread>
 
 using namespace fm4::wheel;
 void Check(bool value,const char* message) {if(!value) throw std::runtime_error(message);}
-template<class Predicate> Snapshot Wait(DeviceMonitor& m,Predicate p) {
-  for(int i=0;i<250;++i) {
-    SDL_PumpEvents(); SDL_UpdateJoysticks();
-    auto s=m.Read(); if(p(s)) return s;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  auto state=m.Read();
-  std::fprintf(stderr,"Monitor connected=%d device=%s axes=%zu first=%d buttons=%zu status=%s\n",
-      state.connected,state.name.c_str(),state.axes.size(),state.axes.empty()?0:state.axes[0],state.buttons.size(),state.status.c_str());
-  throw std::runtime_error("Timed out waiting for wheel monitor");
-}
+
 int main() {
   try {
-    Config c;
-    Check(!Valid(c),"Uncalibrated wheel accepted");
-    c.calibration=127;
-    Check(Valid(c),"Valid calibration rejected");
-    Check(Steering(-32768,c)==-1 && Steering(0,c)==0 && Steering(32767,c)==1,"Steering endpoints incorrect");
-    Check(std::abs(Steering(16384,c)-0.5f)<0.001f,"Steering midpoint incorrect");
-    std::swap(c.left,c.right);
-    Check(Steering(32767,c)==-1 && Steering(-32768,c)==1,"Inverted steering failed");
-    c.center=5000;
-    Check(Steering(5000,c)==0,"Asymmetric center calibration failed");
-    Check(Pedal(32767,32767,-32768)==0 && Pedal(-32768,32767,-32768)==1,"Inverted pedals failed");
-    Check(Pedal(15000,0,10000)==1 && Pedal(-2000,0,10000)==0,"Pedal clamping failed");
-    Check(Pedal(1,0,0)==0,"Degenerate pedal calibration unsafe");
-    c.right=c.center; Check(!Valid(c),"Degenerate steering calibration accepted");
-    c=Config{};c.calibration=127;c.throttle_axis=c.brake_axis;
-    Check(!Valid(c),"Shared pedal axis accepted as independent pedals");
-    c=Config{};c.calibration=127;c.center=INT32_MAX;
-    Check(!Valid(c),"Out-of-range calibration accepted");
-    ForceEffect force;force.id=5;force.type=1;force.gain=255;force.magnitude=-127;
-    SDL_HapticEffect output{};
-    Check(BuildHapticEffect(force,false,output) && output.constant.level==-32767 && output.constant.length==100,"Native negative constant force translation failed");
-    Check(BuildHapticEffect(force,true,output) && output.constant.level==32767,"Constant force inversion failed");
-    force.magnitude=INT32_MAX;
-    Check(BuildHapticEffect(force,false,output) && output.constant.level==32767,"Force overflow/clamping failed");
-    force.type=8;force.positive_coefficient=127;force.negative_coefficient=-127;
-    force.positive_saturation=255;force.negative_saturation=255;force.deadband=255;
-    Check(BuildHapticEffect(force,false,output) && output.condition.right_coeff[0]==32767 &&
-        output.condition.left_coeff[0]==-32767 && output.condition.right_sat[0]==65535 &&
-        output.condition.deadband[0]==32767 && output.condition.length==100,"Condition force translation failed");
-    for(int type:{8,9,10,11}) {force.type=type;Check(BuildHapticEffect(force,false,output),"Native condition effect rejected");}
-    force.type=999;Check(!BuildHapticEffect(force,false,output),"Unknown force type accepted");
-    const auto now=std::chrono::steady_clock::now();
-    Check(ForceOutputAllowed(true,true,now-std::chrono::milliseconds(10),now),"Fresh force output blocked");
-    Check(!ForceOutputAllowed(false,true,now,now),"Force output allowed without focus");
-    Check(!ForceOutputAllowed(true,false,now,now),"Force output allowed while paused/disabled");
-    Check(!ForceOutputAllowed(true,true,now-std::chrono::milliseconds(200),now),"Stale force output allowed");
-    Check(!ForceOutputAllowed(true,true,now+std::chrono::milliseconds(10),now),"Future heartbeat accepted");
-    const auto config_file=std::filesystem::current_path()/"wheel-test-settings.toml";
-    launcher::Settings saved;
-    saved.wheel.enabled=true;saved.wheel.device="test-guid|test-path";saved.wheel.calibration=127;
-    saved.wheel.buttons[0]=17;saved.wheel.brake_full=-30000;
-    saved.wheel.buttons[10]=12;saved.wheel.buttons[13]=15;
-    saved.wheel.buttons[14]=8;saved.wheel.buttons[15]=9;
-    saved.wheel.clutch_enabled=true;saved.wheel.clutch_axis=6;saved.wheel.clutch_rest=32767;
-    saved.wheel.clutch_full=-32768;saved.wheel.clutch_calibration=3;saved.wheel.clutch_action=1;saved.wheel.clutch_threshold=40;
-    saved.wheel.ffb=true;saved.wheel.ffb_invert=true;saved.wheel.ffb_gain=100;
-    Check(saved.Save(config_file),"Cannot save wheel settings");
-    launcher::Settings loaded;
-    Check(loaded.Load(config_file) && loaded.wheel.enabled && loaded.wheel.device==saved.wheel.device &&
-        loaded.wheel.buttons[0]==17 && loaded.wheel.buttons[10]==12 && loaded.wheel.buttons[13]==15 &&
-        loaded.wheel.brake_full==-30000 && loaded.wheel.calibration==127 &&
-        loaded.wheel.ffb && loaded.wheel.ffb_invert && loaded.wheel.ffb_gain==100 &&
-        loaded.wheel.buttons[14]==8 && loaded.wheel.buttons[15]==9 && ValidClutch(loaded.wheel) &&
-        loaded.wheel.clutch_full==-32768 && loaded.wheel.clutch_threshold==40,"Wheel settings lost on reload");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
-    Check(SDL_Init(SDL_INIT_JOYSTICK),SDL_GetError());
-    SDL_VirtualJoystickDesc desc{}; SDL_INIT_INTERFACE(&desc);
-    desc.type=SDL_JOYSTICK_TYPE_WHEEL;desc.naxes=3;desc.nbuttons=10;desc.nhats=1;desc.name="FM4 test wheel";
-    const auto id=SDL_AttachVirtualJoystick(&desc);Check(id!=0,SDL_GetError());
-    auto* joystick=SDL_OpenJoystick(id);Check(joystick!=nullptr,SDL_GetError());
+    // Bindings, in the Pinyon Shift syntax.
+    auto pedal=ParseAxisBinding("SimJack|-axis2");
+    Check(pedal && pedal->device=="SimJack" && pedal->axis==2 && pedal->direction==AxisDirection::kInverted,"Device axis binding");
+    Check(ParseAxisBinding("+axis5")->device.empty() && ParseAxisBinding("a1")->axis==1,"Base axis binding");
+    Check(!ParseAxisBinding("") && !ParseAxisBinding("axisX"),"Malformed axis accepted");
+    auto buttons=ParseButtonBindings("UP=h0.up,A=0,1,B=0eb7:0004|+axis3,GEAR1=0079:0006|0,REVERSE=0079:0006|7,LT=4,junk=9,X=");
+    Check(buttons.size()==7,"Button binding count");
+    Check(buttons[0].hat==0 && buttons[0].hat_mask==1 && buttons[0].xbuttons==0x0001,"Hat binding");
+    Check(buttons[1].button==0 && buttons[2].button==1 && buttons[2].xbuttons==0x1000,"A=0,1 continues the name");
+    Check(buttons[3].axis==3 && buttons[3].device=="0eb7:0004" && buttons[3].xbuttons==0x2000,"Lever axis as B");
+    Check(buttons[4].gear==1 && buttons[5].gear==-1,"Shifter gates");
+    Check(buttons[6].left_trigger,"LT target");
+    auto camera=ParseButtonBindings("CAM_FOV_IN=4,cam_seat_reset=h0.left");
+    Check(camera.size()==2 && camera[0].camera==int(CameraAction::kFovIn) && !camera[0].xbuttons &&
+          camera[1].camera==int(CameraAction::kSeatReset) && camera[1].hat_mask==8 && buttons[0].camera<0,"Camera actions");
+    Check(std::string(CameraActionName(CameraAction::kSeatForward))=="CAM_SEAT_FORWARD","Camera action names");
+    Check(ButtonsFromNames("B")==0x2000 && ButtonsFromNames("A+LB")==0x1100 && ButtonsFromNames("")==0,"Clutch button names");
+
+    // Device matching.
+    Check(DeviceMatches("0eb7:0004","FANATEC CSL DD",0x0eb7,0x0004,"\\\\?\\hid#1"),"vid:pid match");
+    Check(!DeviceMatches("0eb7:0005","FANATEC CSL DD",0x0eb7,0x0004,""),"vid:pid mismatch");
+    Check(DeviceMatches("csl dd","FANATEC CSL DD",0,0,""),"Name part match");
+    Check(DeviceMatches("path:\\\\?\\HID#1","x",0,0,"\\\\?\\hid#1") && !DeviceMatches("path:a","x",0,0,""),"Path match");
+    Check(MigrateDeviceKey("0300bd14b70e00000400000000000000|\\\\?\\HID#VID_0EB7")=="path:\\\\?\\HID#VID_0EB7","FM4 0.3 key");
+    Check(MigrateDeviceKey("0eb7:0004")=="0eb7:0004","New keys unchanged");
+
+    // Steering and pedals.
+    Check(SteeringFromAxis(0,false,100,0)==0 && SteeringFromAxis(32767,false,100,0)==32767,"Steering ends");
+    Check(SteeringFromAxis(-32768,false,100,0)==-32767 && SteeringFromAxis(32767,true,100,0)==-32767,"Steering invert");
+    Check(SteeringFromAxis(16384,false,200,0)==32767,"Steering sensitivity reaches lock at half rotation");
     {
-      DeviceMonitor monitor;
-      auto inventory=Wait(monitor,[](const Snapshot& s){return std::any_of(s.devices.begin(),s.devices.end(),[](const Device& d){return d.name=="FM4 test wheel";});});
-      const auto item=std::find_if(inventory.devices.begin(),inventory.devices.end(),[](const Device& d){return d.name=="FM4 test wheel";});
-      monitor.Select(item->key);
-      auto s=Wait(monitor,[](const Snapshot& s){return s.connected && s.name=="FM4 test wheel";});
-      Check(s.axes.size()==3 && s.buttons.size()==10,"Virtual wheel capabilities lost");
-      Check(SDL_SetJoystickVirtualAxis(joystick,0,12345),SDL_GetError());
-      Check(SDL_SetJoystickVirtualAxis(joystick,1,-23456),SDL_GetError());
-      Check(SDL_SetJoystickVirtualButton(joystick,3,true),SDL_GetError());
-      s=Wait(monitor,[](const Snapshot& s){return s.axes.size()==3 && s.axes[0]==12345 && s.axes[1]==-23456 && s.buttons[3];});
-      Check(s.haptic_status.empty(),"Motor diagnostic ran without a request");
-      SDL_CloseJoystick(joystick);SDL_DetachVirtualJoystick(id);
-      Wait(monitor,[](const Snapshot& s){return !s.connected && s.axes.empty() && s.buttons.empty();});
+      Settings rotation;
+      Check(SteeringScale(rotation)==100,"Rotation off keeps the sensitivity");
+      rotation.wheel_rotation=900; rotation.game_rotation=360;
+      Check(SteeringScale(rotation)==250,"900 degree wheel on a 360 degree game wheel");
+      // Half of 360 degrees on a 900 degree wheel: 180 / 450 of half travel reaches full lock.
+      Check(SteeringFromAxis(int16_t(32767*180/450),false,SteeringScale(rotation),0)>=32760,"Full lock at the game's rotation");
+      rotation.steering_scale=50;
+      Check(SteeringScale(rotation)==125,"Sensitivity still applies with the rotation");
     }
-    SDL_Quit();
-    std::puts("Wheel calibration, settings, raw axes/buttons and disconnect tests passed.");
+    Check(SteeringFromAxis(1000,false,100,5)==0,"Steering deadzone");
+    Check(PedalFromAxis(-32768,AxisDirection::kNormal,0,0)==0 && PedalFromAxis(32767,AxisDirection::kNormal,0,0)==255,"Pedal ends");
+    Check(PedalFromAxis(32767,AxisDirection::kInverted,0,0)==0,"Inverted pedal rest");
+    Check(PedalFromAxis(-32768+1000,AxisDirection::kNormal,3,0)==0,"Pedal bottom deadzone");
+    Check(PedalFromAxis(30000,AxisDirection::kNormal,0,10)==255,"Pedal top deadzone");
+    Check(ResolveAxisDirection(AxisDirection::kAuto,32767)==AxisDirection::kInverted,"Auto direction");
+    Check(DpadFromHat(1|2)==(0x0001|0x0008),"Hat to D-pad");
+
+    // Force feedback scaling of the game's +/-127 effects.
+    ForceTuning tuning; tuning.strength=100;
+    ForceEffect constant; constant.id=1; constant.type=kConstant; constant.gain=255; constant.magnitude=127;
+    Check(EffectConstantLevel(constant,tuning)==32767,"Full constant force");
+    tuning.strength=25;
+    Check(std::abs(EffectConstantLevel(constant,tuning)-8191)<=1,"Strength scales force");
+    tuning.invert=true;
+    Check(EffectConstantLevel(constant,tuning)<0,"Invert reverses force");
+    {
+      // The game's force opposes the steering's sign; SDL's runs the other way.
+      Settings normal;
+      Check(TuningFrom(normal).invert && EffectConstantLevel(constant,TuningFrom(normal))<0,"Game force negated for SDL");
+      normal.ffb_invert=true;
+      Check(!TuningFrom(normal).invert,"Reverse force direction undoes it");
+      normal.ffb_strength=100;
+      const int16_t at100=TestForceLevel(normal);
+      normal.ffb_strength=200;
+      Check(at100==16383 && TestForceLevel(normal)==32767,"Test force follows Strength");
+    }
+    tuning={}; tuning.strength=100; tuning.min_force=10;
+    constant.magnitude=1;
+    Check(EffectConstantLevel(constant,tuning)>=3276,"Minimum force lifts small forces");
+    constant.magnitude=0;
+    Check(EffectConstantLevel(constant,tuning)==0,"Minimum force keeps zero at zero");
+    ForceEffect spring; spring.id=2; spring.type=kSpring; spring.gain=255;
+    spring.positive_coefficient=spring.negative_coefficient=127; spring.positive_saturation=spring.negative_saturation=255;
+    tuning={}; tuning.strength=100; tuning.spring=50;
+    auto condition=EffectCondition(spring,tuning);
+    Check(std::abs(condition.right_coeff-16383)<=1 && condition.right_sat==65535,"Spring share scales coefficients only");
+    SDL_HapticEffect sdl{};
+    Check(BuildHapticEffect(spring,tuning,sdl) && sdl.type==SDL_HAPTIC_SPRING,"Spring maps to SDL");
+    ForceEffect unknown; unknown.id=3; unknown.type=4;
+    Check(!BuildHapticEffect(unknown,tuning,sdl),"Unknown effect accepted");
+    Settings rumble; rumble.ffb_strength=100; rumble.ffb_rumble=100; rumble.ffb_rumble_road=0;
+    Check(RumbleMagnitude(65535,0,rumble)==0 && RumbleMagnitude(0,65535,rumble)==32767,"Rumble shares");
+    Check(ParseFfbMode("difference")==FfbMode::kEffects && ParseFfbMode("OFF")==FfbMode::kOff,"FFB modes");
+
+    // The launcher writes and reads the same keys, and carries FM4 0.3 settings over.
+    const auto dir=std::filesystem::temp_directory_path()/"fm4-wheel-tests";
+    std::filesystem::create_directories(dir);
+    launcher::Settings out;
+    out.wheel.enabled=true; out.wheel.device="0eb7:0004"; out.wheel.throttle="SimJack|+axis0";
+    out.wheel.buttons="RB=4,LB=5,B=SimJack|-axis3"; out.wheel.ffb_strength=40; out.wheel.telemetry_udp=true;
+    out.wheel.deadzone_top={{5,0,2}}; out.wheel.wheel_rotation=1080; out.wheel.game_rotation=540;
+    out.display_wide_view=false;
+    out.display_hud_edges=true;
+    Check(out.Save(dir/"user.toml"),"Settings save");
+    launcher::Settings in;
+    Check(in.Load(dir/"user.toml"),"Settings load");
+    Check(in.wheel.device==out.wheel.device && in.wheel.throttle==out.wheel.throttle && in.wheel.buttons==out.wheel.buttons &&
+          in.wheel.ffb_strength==40 && in.wheel.telemetry_udp && in.wheel.deadzone_top[0]==5 && in.wheel.deadzone_top[2]==2 &&
+          in.wheel.wheel_rotation==1080 && in.wheel.game_rotation==540 && !in.display_wide_view && in.display_hud_edges,
+          "Settings round trip");
+    {
+      std::ofstream old(dir/"old.toml");
+      old << "wheel_enabled = true\nwheel_device = '0300bd14b70e00000400000000000000|\\\\?\\HID#X'\n"
+             "wheel_ffb = true\nwheel_ffb_gain = 15\nwheel_throttle_axis = 2\nwheel_throttle_rest = 32767\nwheel_throttle_full = -32768\n"
+             "wheel_brake_axis = 5\nwheel_brake_rest = -32768\nwheel_brake_full = 32767\nwheel_left = 32767\nwheel_right = -32768\n"
+             "wheel_button_a = 3\nwheel_button_shift_up = 0\nwheel_shift_up_action = 5\nwheel_clutch_action = 0\n";
+    }
+    launcher::Settings migrated;
+    Check(migrated.Load(dir/"old.toml"),"Old settings load");
+    Check(migrated.wheel.device=="path:\\\\?\\HID#X" && migrated.wheel.throttle=="-axis2" && migrated.wheel.brake=="+axis5",
+          "Old pedal axes carried over");
+    Check(migrated.wheel.steering_invert && migrated.wheel.ffb_mode=="on" && migrated.wheel.ffb_strength==15,"Old steering and FFB carried over");
+    Check(migrated.wheel.buttons.find("A=3")!=std::string::npos && migrated.wheel.buttons.find("RB=0")!=std::string::npos &&
+          migrated.wheel.clutch_button=="A","Old buttons carried over");
+    std::filesystem::remove_all(dir);
+    std::puts("Wheel bindings, device matching, pedal/steering maths, FFB scaling and settings passed.");
     return 0;
   } catch(const std::exception& e) {std::fprintf(stderr,"Wheel test failed: %s\n",e.what());return 1;}
 }
-

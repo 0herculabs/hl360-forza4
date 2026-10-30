@@ -74,8 +74,8 @@ The SDL3 / Dear ImGui launcher has an English/Spanish interface and an integrate
 - **Profiles:** named offline profiles with separate save directories.
 - **Graphics:** fullscreen/windowed output, monitor selection, 16:9 output, quality presets, 1x–4x internal resolution, anisotropic filtering, FXAA/FXAA+, and Bilinear, AMD CAS or AMD FSR output scaling.
 - **Frame rate:** default 60 FPS / 60 Hz target and an optional experimental 120 FPS / 120 Hz target.
-- **Controls:** SDL/XInput controllers, keyboard bindings, optional mouse-to-right-stick input, and a wheel calibration wizard.
-- **Wheels:** live Axis percentages, button/D-pad mappings, paddle assignments and an optional clutch pedal.
+- **Controls:** SDL/XInput controllers, keyboard bindings and optional mouse-to-right-stick input.
+- **Wheel:** guided binding from any USB devices, a live wheel/pedal/button view, native force feedback tuning and SimHub telemetry.
 - **Language and audio:** in-game language selection, audio mute, and Automatic, Stereo or 5.1 PCM output.
 - **Project Forza Plus 4:** optional installation, original/mod switching and removal with save preservation.
 
@@ -83,32 +83,16 @@ The sidebar shows separate green indicators for the installed game and Project F
 
 ## Steering wheels and force feedback
 
-Wheel input uses SDL joystick capabilities rather than a brand whitelist. A **MOZA R3 with pedals connected to the base** has been tested by the user; support for other bases and brands is not certified. Aggregating a separate USB pedal device is not implemented.
+The launcher's **Wheel** tab is the racing wheel setup from the Pinyon Shift (Forza Horizon 1) port: a guided setup that binds steering, pedals, buttons and an optional H-shifter from **any USB devices** (a direct-drive base with separate pedals, a shifter, a handbrake or a button box), a live view of the wheel, pedals and buttons exactly as the game will read them, and per-row rebinding.
 
-### Guided calibration
+- **Force feedback** is the game's own: FM4's native wheel effects (constant force, spring, damper, friction, inertia) are played on the device you choose, with strength, minimum force, per-effect strength, rumble and direction settings and a left/right Test.
+- **SimHub telemetry**: RPM, gear, speed, pedals, wheel slip and suspension in Forza's Data Out layout (Forza Motorsport 7 or Forza Horizon 4/5 in SimHub). See [telemetry](doc/telemetry.md).
 
-1. Configure the rotation range in your wheelbase software before calibrating.
-2. In **Controls**, select the device and press **Start guided calibration**.
-3. Follow the eight prompts: center/release all controls, press/release the accelerator, press/release the brake, full left, full right, and center again.
-4. Hold each requested position and press **Next**, then **Finish and save**.
-5. Look for **OK — wheel calibrated**. Live bars display each detected Axis number and percentage, and all axes can be expanded for inspection.
+Set the rotation in your wheel software first and start with a low strength on a direct-drive base. FM4's clutch is a button: the clutch pedal presses one (B by default); select **Manual with clutch** in the game. Changes apply from the next game start.
 
-The wizard detects axis numbers and pedal direction automatically. Cancelling keeps the previous calibration. Manual calibration remains available in the advanced section.
+`fm4-wheel-probe.exe` lists every device and its raw values without requesting force effects. See [wheel setup and implementation notes](doc/wheels.md). 
 
-Assign menu buttons and the D-pad as needed. Under **Paddles and clutch**, assign upshift/downshift paddles and match their destination buttons to the wheel layout selected in FM4. Select **Manual** or **Manual with clutch** inside the game.
-
-The optional clutch has a separate three-step axis calibration. It currently activates a configurable Xbox button above a pedal threshold; **native proportional clutch support is not implemented**.
-
-### Experimental FFB
-
-The adapter translates FM4's native constant-force, spring, damper, inertia and friction effects into SDL haptic effects. Controller rumble is not used as steering torque.
-
-- Game FFB is off by default, with a default gain of 10% and an adjustable 0–100% limit.
-- The explicit hardware test sends a separate **20% pulse for 150 ms**, with a cooldown between tests.
-- The user's working R3 setup uses **360° in MOZA Pit House** and **Invert constant torque enabled**. This is a tested starting point for that setup, not a universal preset.
-- Set the rotation before calibration and recalibrate steering if you change it. Begin with a low gain and adjust gradually.
-
-Close the game before changing wheel settings. The read-only `fm4-wheel-probe.exe` reports devices and axis values without requesting force effects. See [wheel setup and implementation notes](doc/wheels.md).
+In game, the field of view and seat position can be changed live with keys or wheel buttons: see [camera](doc/camera.md). Wide windows (21:9, 32:9) fill with more of the world at the sides and the HUD at 16:9 or at the edges: see [wide screens](doc/wide-screens.md).
 
 ## Project Forza Plus 4
 
@@ -233,7 +217,7 @@ fm4-launcher.exe --screenshot <file.bmp> --tab instructions|profiles|graphics|co
 | `tests/` | Regression fixtures and checks. |
 | `doc/` | Implementation notes and setup documentation. |
 | `doc/img/` | Launcher and gameplay screenshots. |
-| `patches/sdk/` | Runtime changes required by the SDK integration. |
+| `patches/sdk/` | Runtime changes required by the SDK integration (0006: wide-screen HUD placement, video mode from window, thunk reuse). |
 
 ## Antivirus report
 

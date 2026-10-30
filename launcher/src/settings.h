@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
-#include "../../src/wheel.h"
+#include "../../src/wheel_mapping.h"
 
 namespace launcher {
 
@@ -17,6 +17,9 @@ struct KeyBind {
   const char* group_es;
   const char* default_keys;
   std::string keys;
+  // The game's camera adjustments (keybind_camera_*): work without the
+  // keyboard pad, shown in their own card.
+  bool camera = false;
 };
 
 // A local profile: the gamertag the game shows and the offline XUID its saves
@@ -43,6 +46,10 @@ struct Settings {
   int window_width = 1600;
   int window_height = 900;
   bool present_letterbox = true;
+  // Wide windows show more of the world at the sides (the game's Hor+); the
+  // HUD and 16:9 screens keep their proportions.
+  bool display_wide_view = true;
+  bool display_hud_edges = false;
   bool experimental_120fps = false;
 
   // Quality
@@ -62,7 +69,7 @@ struct Settings {
 
   // Input
   std::string input_backend = "sdl";  // sdl | xinput
-  fm4::wheel::Config wheel;
+  fm4::wheel::Settings wheel;  // wheel_* and telemetry_* keys
   bool mnk_mode = true;
   bool mnk_mouse = false;
   double mnk_sensitivity = 1.0;
@@ -73,7 +80,8 @@ struct Settings {
   std::string audio_output_mode = "auto";
 
   Settings();
-  void ResetBinds();
+  // The keyboard pad's keys, or the camera's.
+  void ResetBinds(bool camera = false);
   void ResetDisplay();
   bool Load(const std::filesystem::path& file);
   bool Save(const std::filesystem::path& file) const;

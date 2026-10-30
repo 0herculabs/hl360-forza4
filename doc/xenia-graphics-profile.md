@@ -55,7 +55,7 @@ console step; pauses are clamped to 100 ms. No racing physics is changed.
 tests/showroom_timing_tests.cpp checks ten seconds of camera time at
 30/60/120/240 updates per second, camera changes and pause handling.
 
-The SDK port in patches/sdk/0006-vulkan-depth-bias-control.patch brings over
+The SDK port in patches/sdk/0007-vulkan-depth-bias-control.patch brings over
 Canary's VK_EXT_depth_bias_control handling: exact constant UNORM bias units
 where supported, float24 constant-factor adjustment, and a deferred command
 for vkCmdSetDepthBias2EXT. Unsupported GPUs retain the existing bias path.
