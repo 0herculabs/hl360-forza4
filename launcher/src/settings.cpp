@@ -236,6 +236,7 @@ void Settings::ResetDisplay() {
   anisotropic_override = defaults.anisotropic_override;
   swap_post_effect = defaults.swap_post_effect;
   present_effect = defaults.present_effect;
+  dlss_preset = defaults.dlss_preset;
   video_mode_width = defaults.video_mode_width;
   video_mode_height = defaults.video_mode_height;
   present_fsr_sharpness_reduction = defaults.present_fsr_sharpness_reduction;
@@ -285,6 +286,10 @@ bool Settings::Load(const std::filesystem::path& file) {
   gpu_backend = "vulkan";
   Read(t, "swap_post_effect", swap_post_effect);
   Read(t, "present_effect", present_effect);
+  if (present_effect != "bilinear" && present_effect != "cas" && present_effect != "fsr" &&
+      !TemporalUpscaler())
+    present_effect = "fsr";
+  Read(t, "present_dlss_preset", dlss_preset);
   // Xenia profile baseline: default 720p guest mode, independent of output size.
   video_mode_width = 1280;
   video_mode_height = 720;
@@ -360,6 +365,7 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("anisotropic_override", anisotropic_override);
   t.insert("swap_post_effect", swap_post_effect);
   t.insert("present_effect", present_effect);
+  t.insert("present_dlss_preset", dlss_preset);
   t.insert("video_mode_width", 1280);
   t.insert("video_mode_height", 720);
   t.insert("present_fsr_sharpness_reduction", 0.2);

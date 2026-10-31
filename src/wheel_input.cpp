@@ -4,6 +4,7 @@
 // the force device. Settings and binding syntax follow the Pinyon Shift
 // racing wheel work, so its Wheel screen and docs apply.
 #include "wheel_input.h"
+#include "scripted_input.h"
 #include "wheel.h"
 #include <cmath>
 #include <map>
@@ -303,6 +304,7 @@ void ResetEffects() {if(auto s=Service()) s->ClearForce();}
 void SetDriving(bool driving) {if(auto s=Service()) s->SetDriving(driving);}
 std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
   auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+  if (!tool_mode) AddScriptedInput(*input);
   if (!tool_mode && REXCVAR_GET(wheel_enabled)) {
     const Settings s = ReadSettings();
     REXLOG_INFO("Wheel input enabled: base \"{}\" steering axis {}, throttle \"{}\", brake \"{}\", clutch \"{}\", "

@@ -54,6 +54,19 @@ int main() {
             Get(race).find("SkipShadowMapUnlessCockpit") != std::string::npos, "switching options failed");
     Require(SetRenderScenarios(root, RenderScenarioOptions{false}).empty() && Get(race) == xml,
         "console values not restored");
+    // A temporal upscaler: no MSAA where the file sets its tiling, split screen untouched.
+    const auto split = root / "Media/RenderScenarios/Splitscreen_Race.xml";
+    const std::string tiled = "<DynamicRenderSettings>\r\n  <TilingScenario value=\"1\"/>\r\n</DynamicRenderSettings>\r\n";
+    fs::remove_all(root / ".fm4-shadow-originals");  // new originals
+    Put(race, tiled); Put(split, tiled);
+    RenderScenarioOptions upscaler{false};
+    upscaler.no_msaa = true;
+    Require(SetRenderScenarios(root, upscaler).empty() &&
+            Get(race).find("<TilingScenario value=\"2\"/>") != std::string::npos && Get(split) == tiled,
+            "upscaler MSAA not turned off");
+    Require(SetRenderScenarios(root, RenderScenarioOptions{false}).empty() && Get(race) == tiled,
+        "upscaler tiling not restored");
+    fs::remove(split); fs::remove_all(root / ".fm4-shadow-originals"); Put(race, xml);
     Put(root / "Media/RenderScenarios/8-Car_Race.xml", "malformed");
     Require(!SetRaceShadowWorkaround(root, true).empty(), "malformed XML accepted");
     Require(Get(race) == xml && !RaceShadowWorkaroundEnabled(root), "partial patch survived failure");

@@ -31,6 +31,8 @@ set(FM4_SOURCES
     src/camera_view.cpp
     src/wide_view.cpp
     src/frame_pacing.cpp
+    src/scripted_input.cpp
+    src/debug_capture.cpp
     src/telemetry/forza_dash.cpp
     src/telemetry/telemetry_out.cpp
     src/telemetry/fm4_car.cpp
@@ -138,7 +140,7 @@ if(FM4_BUILD_TESTS)
     target_include_directories(fm4-wheel-ffb-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fm4-wheel-ffb-tests PRIVATE rex::runtime)
     add_test(NAME wheel-native-ffb COMMAND fm4-wheel-ffb-tests)
-    add_executable(fm4-wheel-runtime-tests tests/wheel_runtime_tests.cpp src/wheel.cpp src/wheel_mapping.cpp src/wheel_input.cpp)
+    add_executable(fm4-wheel-runtime-tests tests/wheel_runtime_tests.cpp src/wheel.cpp src/wheel_mapping.cpp src/wheel_input.cpp src/scripted_input.cpp)
     target_link_libraries(fm4-wheel-runtime-tests PRIVATE rex::runtime)
     add_test(NAME wheel-runtime COMMAND fm4-wheel-runtime-tests)
     add_executable(fm4-wheel-haptic-backend-tests tests/wheel_haptic_backend_tests.cpp)

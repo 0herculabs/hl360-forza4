@@ -3,6 +3,7 @@
 #include "fm4_app.h"
 
 #include "crash_handler.h"
+#include "debug_capture.h"
 #include "file_signatures.h"
 #include "wheel_input.h"
 #include "audio_output.h"
@@ -93,6 +94,7 @@ void Fm4App::OnPreSetup(rex::RuntimeConfig& config) {
   // name and build stamp).
   rex::ui::SetBuildLabel("Forza Motorsport 4");
 #endif
+  fm4::PrepareDebugCapture();
   config.input_factory = fm4::wheel::CreateInputSystem;
   config.audio_factory = [](rex::runtime::FunctionDispatcher* dispatcher) {
     return std::make_unique<fm4::OutputSystem>(dispatcher);
@@ -145,6 +147,7 @@ void Fm4App::OnPostSetup() {
                                   window()->GetActualPhysicalHeight());
   }
   MountCachePartition(runtime(), user_data_root());
+  fm4::StartDebugCapture(window(), runtime()->graphics_system());
 
   auto* profile = runtime()->kernel_state()->user_profile();
 

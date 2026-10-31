@@ -57,7 +57,12 @@ struct Settings {
   int resolution_scale = 2;      // internal render scale over 1280x720
   int anisotropic_override = 4;  // 0..5 = off,1x,2x,4x,8x,16x
   std::string swap_post_effect = "none";    // none | fxaa | fxaa_extreme
-  std::string present_effect = "fsr";  // bilinear | cas | fsr
+  std::string present_effect = "fsr";  // bilinear | cas | fsr | fsr2 | fsr3 | dlss
+  std::string dlss_preset = "auto";    // auto | k | m | j | l | default
+  // DLSS, FSR 2 and FSR 3 rebuild the frame from earlier ones (temporal).
+  bool TemporalUpscaler() const {
+    return present_effect == "dlss" || present_effect == "fsr2" || present_effect == "fsr3";
+  }
   int video_mode_width = 1280;
   int video_mode_height = 720;
   double present_fsr_sharpness_reduction = 0.2;

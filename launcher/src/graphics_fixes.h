@@ -16,6 +16,7 @@ struct RenderScenarioOptions {
   bool scenery_shadows = false;       // cones and barriers
   int reflections = 0;                // 0 console, 1 every race, 2 double rate
   bool crowds_every_race = false;     // 1- and 16-car races have none
+  bool no_msaa = false;               // a temporal upscaler smooths edges itself
   bool Any() const;  // anything not at the console's values
 };
 

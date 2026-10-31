@@ -805,7 +805,8 @@ struct App {
   RenderScenarioOptions ScenarioOptions() const {
     const Settings& s = settings;
     return {!s.exterior_shadows, s.car_detail,     s.full_rate_mirror, s.full_rate_bloom,
-            s.soft_particles,    s.scenery_shadows, s.reflections,     s.crowds_every_race};
+            s.soft_particles,    s.scenery_shadows, s.reflections,     s.crowds_every_race,
+            s.TemporalUpscaler()};
   }
 
   void StartTask(std::string title, TaskKind kind, std::function<bool()> body) {
@@ -1624,9 +1625,28 @@ void TabGraphics(App& app) {
     changed |= Combo<int>("##aniso", s.anisotropic_override,
         {{0, L("Off", "No")}, {1, "1x"}, {2, "2x"}, {3, "4x"}, {4, "8x"}, {5, "16x"}});
     Row(L("Output scaling", "Escalado a pantalla"));
-    changed |= Segmented<std::string>("present", s.present_effect,
-        {{"bilinear", L("Bilinear", "Bilineal")}, {"cas", "AMD CAS"}, {"fsr", "AMD FSR"}});
+    changed |= Combo<std::string>("##present", s.present_effect,
+        {{"bilinear", L("Bilinear", "Bilineal")}, {"cas", "AMD CAS"}, {"fsr", "AMD FSR 1"},
+         {"dlss", "NVIDIA DLSS"}, {"fsr3", "AMD FSR 3"}, {"fsr2", "AMD FSR 2"}});
+    if (s.present_effect == "dlss") {
+      Row(L("DLSS preset", "Preset de DLSS"));
+      changed |= Combo<std::string>("##dlsspreset", s.dlss_preset,
+          {{"auto", L("Automatic", "Automático")}, {"k", "K"}, {"m", "M"}, {"j", "J"}, {"l", "L"},
+           {"default", L("Driver / NVIDIA app", "Controlador / app de NVIDIA")}});
+    }
     EndRows();
+    if (s.TemporalUpscaler()) {
+      // The upscaler rebuilds the render-scale frame at the screen's size.
+      TextDim(L("DLSS (NVIDIA RTX) and FSR 2/3 (any GPU) upscale from the render scale to your screen, using "
+                "the game's depth and motion, and smooth edges themselves (MSAA is turned off in races). "
+                "On a 1440p screen, 1x upscales 2x (performance) and 2x renders at the screen's size "
+                "(anti-aliasing only, like DLAA). A render larger than the screen is downscaled without them.",
+                "DLSS (NVIDIA RTX) y FSR 2/3 (cualquier GPU) reescalan desde la escala de renderizado a tu "
+                "pantalla con la profundidad y el movimiento del juego, y suavizan los bordes ellos mismos (el "
+                "MSAA se desactiva en carrera). En una pantalla 1440p, 1x reescala 2x (rendimiento) y 2x "
+                "renderiza a la resolución de la pantalla (solo antialiasing, como DLAA). Un renderizado mayor "
+                "que la pantalla se reduce sin ellos."));
+    }
   }
   EndCard();
 
