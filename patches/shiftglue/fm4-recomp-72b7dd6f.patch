@@ -1,0 +1,426 @@
+﻿diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 480adeda..97dcd59a 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -400,6 +400,21 @@ class DeferredCommandBuffer {
+     args.depth_bias_slope_factor = depth_bias_slope_factor;
+   }
+ 
++  // VK_EXT_depth_bias_control.
++  void CmdVkSetDepthBias2EXT(
++      float depth_bias_constant_factor, float depth_bias_clamp,
++      float depth_bias_slope_factor,
++      VkDepthBiasRepresentationEXT depth_bias_representation,
++      bool depth_bias_exact) {
++    auto& args = *reinterpret_cast<ArgsVkSetDepthBias2EXT*>(WriteCommand(
++        Command::kVkSetDepthBias2EXT, sizeof(ArgsVkSetDepthBias2EXT)));
++    args.depth_bias_constant_factor = depth_bias_constant_factor;
++    args.depth_bias_clamp = depth_bias_clamp;
++    args.depth_bias_slope_factor = depth_bias_slope_factor;
++    args.depth_bias_representation = depth_bias_representation;
++    args.depth_bias_exact = depth_bias_exact ? VK_TRUE : VK_FALSE;
++  }
++
+   void CmdVkSetScissor(uint32_t first_scissor, uint32_t scissor_count, const VkRect2D* scissors) {
+     const size_t header_size = rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D));
+     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+@@ -475,6 +490,7 @@ class DeferredCommandBuffer {
+     kVkEndDebugLabel,
+     kVkSetBlendConstants,
+     kVkSetDepthBias,
++    kVkSetDepthBias2EXT,
+     kVkSetFragmentShadingRateKHR,
+     kVkSetScissor,
+     kVkSetStencilCompareMask,
+@@ -705,6 +721,14 @@ class DeferredCommandBuffer {
+     float depth_bias_slope_factor;
+   };
+ 
++  struct ArgsVkSetDepthBias2EXT {
++    float depth_bias_constant_factor;
++    float depth_bias_clamp;
++    float depth_bias_slope_factor;
++    VkDepthBiasRepresentationEXT depth_bias_representation;
++    VkBool32 depth_bias_exact;
++  };
++
+   struct ArgsVkSetScissor {
+     uint32_t first_scissor;
+     uint32_t scissor_count;
+diff --git a/include/rex/system/xam/content_manager.h b/include/rex/system/xam/content_manager.h
+index 4fbc2607..5fff0267 100644
+--- a/include/rex/system/xam/content_manager.h
++++ b/include/rex/system/xam/content_manager.h
+@@ -68,9 +68,15 @@ struct XCONTENT_DATA {
+   }
+ 
+   std::string file_name() const {
+-    std::string value;
+-    value.assign(file_name_raw, std::min(strlen(file_name_raw), countof(file_name_raw)));
+-    return value;
++    // fm3-recomp: content file names are printable ASCII; stop at the first
++    // byte that is not (a name filling all 42 chars may be followed by game
++    // data rather than a terminator), so later UTF-8 conversions can't throw.
++    size_t length = 0;
++    while (length < countof(file_name_raw) && file_name_raw[length] >= 0x20 &&
++           static_cast<unsigned char>(file_name_raw[length]) < 0x7F) {
++      ++length;
++    }
++    return std::string(file_name_raw, length);
+   }
+ 
+   void set_display_name(const std::u16string_view value) {
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index 64730526..509c767e 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -228,6 +228,10 @@ class UserProfile {
+ 
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+ 
++  // fm3-recomp: let the host app sign in a launcher-selected profile.
++  void set_xuid(uint64_t xuid) { xuid_ = xuid; }
++  void set_name(std::string name) { name_ = std::move(name); }
++
+   void AddSetting(std::unique_ptr<Setting> setting);
+   Setting* GetSetting(uint32_t setting_id);
+ 
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index a27d0884..f828efc1 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -182,6 +182,9 @@ class VulkanDevice {
+     // VK_EXT_robustness2
+ 
+     bool nullDescriptor = false;
++    bool depthBiasControl = false;
++    bool leastRepresentableValueForceUnormRepresentation = false;
++    bool depthBiasExact = false;
+ 
+     // VK_KHR_present_id (#295) and VK_KHR_present_wait (#249)
+ 
+@@ -239,6 +242,7 @@ class VulkanDevice {
+     bool ext_EXT_custom_border_color = false;
+     // Has optional features not implied by this being true.
+     bool ext_EXT_robustness2 = false;
++    bool ext_EXT_depth_bias_control = false;
+     // Has optional features not implied by this being true.
+     bool ext_1_3_KHR_maintenance4 = false;  // #414
+     // Has optional features not implied by this being true.
+@@ -278,6 +282,7 @@ class VulkanDevice {
+ #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+ #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
++#include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
+     // VK_NV_device_diagnostic_checkpoints (#207)
+ #include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
+     // VK_KHR_push_descriptor (#81)
+diff --git a/include/rex/ui/vulkan/functions/device_ext_depth_bias_control.inc b/include/rex/ui/vulkan/functions/device_ext_depth_bias_control.inc
+new file mode 100644
+index 00000000..2b41e140
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/device_ext_depth_bias_control.inc
+@@ -0,0 +1 @@
++XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias2EXT)
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 5df85337..3facdc27 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -34,6 +34,9 @@ class WindowSDL final : public Window {
+   ~WindowSDL() override;
+ 
+   void* GetNativeWindowHandle() const override;
++  // UI thread only, after the presenter has been detached. The caller must
++  // terminate immediately afterwards rather than run normal window callbacks.
++  void RestoreDesktopBeforeHardExit();
+   SafeAreaInsets GetSafeAreaInsets() const override;
+   void ApplyConfiguredSizeAndMonitor() override;
+   bool SetRelativeMouseMode(bool enable) override;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 1f793d57..5e203827 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -198,6 +198,9 @@ REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_worker, true, "GPU/Vulkan",
+                     "With vulkan_async_submission, publish and paint each frame on the "
+                     "submission worker after the frame's submission instead of waiting for the "
+                     "worker at every swap");
++REXCVAR_DEFINE_BOOL(vulkan_depth_bias_force_unorm, true, "GPU/Vulkan",
++    "Use exact constant depth bias units where VK_EXT_depth_bias_control supports it");
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -9755,6 +9758,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+ 
+   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+     // Depth bias.
++    const auto& bias_features = GetVulkanDevice()->properties();
++    const bool depth_bias_force_unorm = REXCVAR_GET(vulkan_depth_bias_force_unorm) &&
++        bias_features.depthBiasControl && bias_features.leastRepresentableValueForceUnormRepresentation &&
++        bias_features.depthBiasExact;
+     float depth_bias_constant_factor, depth_bias_slope_factor;
+     draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
+                                              depth_bias_constant_factor);
+@@ -9762,6 +9769,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+         regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
+             ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+             : draw_util::kD3D10PolygonOffsetFactorFloat24;
++    if (depth_bias_force_unorm &&
++        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
++      depth_bias_constant_factor *= 0.5f;
++    }
+     // With non-square resolution scaling, make sure the worst-case impact is
+     // reverted (slope only along the scaled axis), thus max. More bias is
+     // better than less bias, because less bias means Z fighting with the
+@@ -9778,8 +9789,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+     if (dynamic_depth_bias_update_needed_) {
+       dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
+       dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
+-      deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
+-                                                 dynamic_depth_bias_slope_factor_);
++      if (depth_bias_force_unorm) {
++        deferred_command_buffer_.CmdVkSetDepthBias2EXT(dynamic_depth_bias_constant_factor_, 0.0f,
++            dynamic_depth_bias_slope_factor_,
++            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT, true);
++      } else {
++        deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
++            dynamic_depth_bias_slope_factor_);
++      }
+       dynamic_depth_bias_update_needed_ = false;
+     }
+ 
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index c7f8abb6..4f345b9f 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -384,6 +384,24 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                               args.depth_bias_clamp, args.depth_bias_slope_factor);
+       } break;
+ 
++      case Command::kVkSetDepthBias2EXT: {
++        auto& args = *reinterpret_cast<const ArgsVkSetDepthBias2EXT*>(stream);
++        VkDepthBiasRepresentationInfoEXT representation_info = {};
++        representation_info.sType =
++            VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT;
++        representation_info.depthBiasRepresentation =
++            args.depth_bias_representation;
++        representation_info.depthBiasExact = args.depth_bias_exact;
++        VkDepthBiasInfoEXT depth_bias_info = {};
++        depth_bias_info.sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT;
++        depth_bias_info.pNext = &representation_info;
++        depth_bias_info.depthBiasConstantFactor =
++            args.depth_bias_constant_factor;
++        depth_bias_info.depthBiasClamp = args.depth_bias_clamp;
++        depth_bias_info.depthBiasSlopeFactor = args.depth_bias_slope_factor;
++        dfn.vkCmdSetDepthBias2EXT(command_buffer, &depth_bias_info);
++      } break;
++
+       case Command::kVkSetScissor: {
+         auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(stream);
+         dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count,
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 8f111f7e..665c18eb 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -34,6 +34,10 @@
+ #include <rex/system/xtypes.h>
+ #include <rex/ui/flags.h>
+ 
++REXCVAR_DEFINE_BOOL(video_mode_from_window, true, "Display",
++                    "Without video_mode_width/height, report the window size as the guest "
++                    "video mode (off: 1280x720 or the preset; the image keeps its aspect)");
++
+ namespace {
+ // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
+ constexpr uint32_t kDisplayGammaType = 2;
+@@ -43,7 +47,8 @@ constexpr double kDisplayGammaPower = 2.22222233;
+ uint32_t GetConfiguredVideoModeWidth() {
+   int32_t configured_width = REXCVAR_GET(video_mode_width);
+   if (!rex::cvar::HasNonDefaultValue("video_mode_width")) {
+-    if (rex::cvar::HasNonDefaultValue("window_width") && REXCVAR_GET(window_width) > 0) {
++    if (REXCVAR_GET(video_mode_from_window) && rex::cvar::HasNonDefaultValue("window_width") &&
++        REXCVAR_GET(window_width) > 0) {
+       configured_width = REXCVAR_GET(window_width);
+     } else {
+       int32_t preset_width = 0;
+@@ -60,7 +65,8 @@ uint32_t GetConfiguredVideoModeWidth() {
+ uint32_t GetConfiguredVideoModeHeight() {
+   int32_t configured_height = REXCVAR_GET(video_mode_height);
+   if (!rex::cvar::HasNonDefaultValue("video_mode_height")) {
+-    if (rex::cvar::HasNonDefaultValue("window_height") && REXCVAR_GET(window_height) > 0) {
++    if (REXCVAR_GET(video_mode_from_window) && rex::cvar::HasNonDefaultValue("window_height") &&
++        REXCVAR_GET(window_height) > 0) {
+       configured_height = REXCVAR_GET(window_height);
+     } else {
+       int32_t preset_width = 0;
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 9ec90847..8a413543 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -944,6 +944,22 @@ void KernelState::RegisterRecompiledModule(const char* pe_name, const char* gues
+ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModule(
+     std::string_view guest_path) {
+   auto global_lock = global_critical_region_.Acquire();
++  // UserModule stores a VFS absolute path, while registrations are title-relative.
++  // Resolve both to the same file so unloading also removes the recompiled DLL.
++  auto requested_entry = file_system_->ResolvePath(guest_path);
++  if (requested_entry && executable_module_) {
++    const auto base_path =
++        rex::string::utf8_find_base_guest_path(executable_module_->path());
++    for (const auto& info : recompiled_modules_) {
++      const auto registered_path =
++          rex::string::utf8_join_guest_paths(base_path, info.guest_path);
++      auto registered_entry = file_system_->ResolvePath(registered_path);
++      if (registered_entry && rex::string::utf8_equal_case(
++              requested_entry->absolute_path(), registered_entry->absolute_path())) {
++        return info;
++      }
++    }
++  }
+   auto normalized = NormalizeGuestPath(guest_path);
+   for (const auto& info : recompiled_modules_) {
+     if (info.guest_path == normalized)
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 732fb5ba..a0456d1b 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -35,6 +35,8 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+ REXCVAR_DEFINE_INT32(host_present_fps_limit, 60, "UI/Presenter",
+                      "Host presentation FPS limit (0 disables pacing)")
+     .range(0, 240);
++REXCVAR_DEFINE_BOOL(host_present_stats, false, "UI/Presenter",
++                    "Log completed host presentations every five seconds");
+ 
+ REXCVAR_DEFINE_BOOL(host_present_sleep_spin, true, "UI/Presenter",
+                     "Use a sleep/yield hybrid for host presentation pacing");
+@@ -1572,6 +1574,20 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+   }
+   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+   if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
++    if (REXCVAR_GET(host_present_stats)) {
++      static thread_local auto stats_start = PresentationClock::now();
++      static thread_local uint64_t stats_count = 0;
++      ++stats_count;
++      const auto stats_now = PresentationClock::now();
++      const double stats_seconds = std::chrono::duration<double>(stats_now - stats_start).count();
++      if (stats_seconds >= 5.0) {
++        REXLOG_INFO("Host completed presentations: {:.1f} FPS ({} in {:.1f}s), limit={}",
++            double(stats_count) / stats_seconds, stats_count, stats_seconds,
++            REXCVAR_GET(host_present_fps_limit));
++        stats_count = 0;
++        stats_start = stats_now;
++      }
++    }
+     const int64_t present_time_ns =
+         std::chrono::duration_cast<std::chrono::nanoseconds>(
+             PresentationClock::now().time_since_epoch())
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 56ec1b26..49cb9a79 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -44,6 +44,7 @@
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
+ #include <rex/ui/keybinds.h>
++#include <rex/ui/window_sdl.h>
+ #include <rex/version.h>
+ #if REX_PLATFORM_ANDROID
+ #include <rex/ui/vulkan/android_gpu_driver.h>
+@@ -601,6 +602,15 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
+   if (runtime_ && runtime_->kernel_state()) {
+     runtime_->kernel_state()->TerminateTitle();
+   }
++  // OnBeforeClose normally detaches the surface and destroys the SDL window
++  // after this listener returns. The hard exit below used to skip both,
++  // leaving fullscreen/Auto HDR presentation restoration to driver cleanup.
++  if (window_) {
++    window_->SetPresenter(nullptr);
++    if (auto* sdl_window = dynamic_cast<ui::WindowSDL*>(window_.get())) {
++      sdl_window->RestoreDesktopBeforeHardExit();
++    }
++  }
+   // Hard-exit rather than run subsystem teardown, which can deadlock on a host
+   // lock still held by a straggler TerminateTitle left running. Flush (not
+   // ShutdownLogging, which frees loggers a straggler may still use); the OS
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 4d39f258..98c1e71d 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -487,6 +487,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       // #198. Also must be enabled for VK_KHR_spirv_1_4.
+       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float_controls, 1, 2)
+       // #252.
++      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
+       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
+       // #277.
+       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(EXT_shader_demote_to_helper_invocation, 1, 3)
+@@ -636,6 +637,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
+       features_KHR_fragment_shading_rate;
++  VulkanFeatures<VkPhysicalDeviceDepthBiasControlFeaturesEXT,
++                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT>
++      features_EXT_depth_bias_control;
+ 
+   if (get_physical_device_properties2_supported) {
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+@@ -702,6 +706,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     if (device->extensions_.ext_KHR_fragment_shading_rate) {
+       features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
+     }
++    if (device->extensions_.ext_EXT_depth_bias_control) {
++      features_EXT_depth_bias_control.Link(supported_features_2, device_create_info);
++    }
+     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
+     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
+   }
+@@ -1099,6 +1106,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (device->extensions_.ext_KHR_fragment_shading_rate) {
+     XE_UI_VULKAN_FEATURE_2(features_KHR_fragment_shading_rate, pipelineFragmentShadingRate)
+   }
++  if (device->extensions_.ext_EXT_depth_bias_control && with_gpu_emulation) {
++    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasControl)
++    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control,
++                           leastRepresentableValueForceUnormRepresentation)
++    XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasExact)
++  }
+ 
+ #undef XE_UI_VULKAN_LIMIT
+ #undef XE_UI_VULKAN_ENUM_LIMIT
+@@ -1194,6 +1207,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (device->extensions_.ext_KHR_fragment_shading_rate) {
+ #include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
+   }
++  if (device->extensions_.ext_EXT_depth_bias_control) {
++#include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
++  }
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ 
+ #undef XE_UI_VULKAN_FUNCTION
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index f3b4846a..34d82bdc 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -243,6 +243,22 @@ Window::SafeAreaInsets WindowSDL::GetSafeAreaInsets() const {
+   return insets;
+ }
+ 
++void WindowSDL::RestoreDesktopBeforeHardExit() {
++  if (!sdl_window_) return;
++  // Explicitly leave fullscreen while SDL can still restore the display and
++  // notify the compositor. _Exit skips SDL's normal window/video teardown.
++  if (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_FULLSCREEN) {
++    if (!SDL_SetWindowFullscreen(sdl_window_, false)) {
++      REXLOG_WARN("Fullscreen restoration on exit failed: {}", SDL_GetError());
++    } else if (!SDL_SyncWindow(sdl_window_)) {
++      REXLOG_WARN("Fullscreen restoration sync failed: {}", SDL_GetError());
++    }
++  }
++  SDL_HideWindow(sdl_window_);
++  DestroySDLWindow();
++  REXLOG_INFO("Desktop presentation restored; SDL window destroyed before hard exit");
++}
++
+ void* WindowSDL::GetNativeWindowHandle() const {
+ #if REX_PLATFORM_WIN32
+   if (!sdl_window_) {

@@ -1,22 +1,53 @@
-# Vulkan profile adapted from the user's working Xenia Canary settings.
+# Vulkan profile for ShiftGlue 72b7dd6f. The renderer settings follow
+# fm4-static-recomp's built-in defaults (src/built_in_defaults.cpp), which were
+# verified with FM4 on this SDK revision.
 gpu_backend = 'vulkan'
 vsync = false
 video_mode_width = 1280
 video_mode_height = 720
 video_mode_refresh_rate = 60.0
 host_present_fps_limit = 60
-async_shader_compilation = true
 readback_resolve = 'none'
 readback_memexport = false
 vulkan_depth_bias_force_unorm = true
-# Prefer transfers over FH1-specific color/stencil shortcuts for FM4.
-fh1_color_overwrite_claims = false
-fh1_scrambled_stencil_claims = false
-fh1_surfaceless_clears = false
-clear_memory_page_state = false
-vulkan_pipeline_creation_threads = -1
 gpu_allow_invalid_fetch_constants = true
-execute_unclipped_draw_vs_on_cpu = true
+
+# A draw whose pipeline is still compiling is dropped, and FM4 keeps some
+# render targets across frames: a cold cache darkened the asphalt for seconds.
+async_shader_compilation = false
+# The SDK default re-uploads every CPU-written page each frame.
+clear_memory_page_state = false
+gpu_record_thread = true
+# A race needs about 300 MB at 2x; 256 saves 300 MB.
+texture_cache_memory_limit_soft = 256
+fh1_async_readbacks = true
+execute_unclipped_draw_vs_on_cpu = false
+force_convert_quad_lists_to_triangle_lists = false
+wait_reg_mem_yield_us = 2000
+gpu_d3d_shader_cache = 0
+swap_post_effect_scene_only = false
+
+# SDK changes held at the behaviour FM4 was verified with.
+fh1_msaa_single_sample = false
+fh1_fold_clears = false
+fh1_resolve_to_textures = false
+fh1_direct_resolve_outdated = false
+fh1_stable_alpha_to_coverage = false
+fh1_skip_draws_without_effect = false
+fh1_native_stencil_export = false
+fh1_async_specialized_passes = false
+texture_band_reloads = false
+texture_layer_reloads = false
+texture_selective_binding_reset = false
+texture_cache_memory_budget_limits = false
+vulkan_texture_load_compute_copy = false
+vulkan_small_texture_copy_views = false
+fh1_readback_small_float_resolves = false
+guest_reservation_sections_unlocked = false
+rtl_critical_section_pcr_thread = false
+xma_direct_decode = false
+xma_lazy_decoder_state = false
+
 # Medium preset: 2x rendering, 8x anisotropic filtering, FSR.
 graphics_preset = 1
 resolution_scale = 2

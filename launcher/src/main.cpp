@@ -802,6 +802,12 @@ struct App {
 
   bool TaskRunning() const { return task.state == TaskProgress::State::kRunning; }
 
+  RenderScenarioOptions ScenarioOptions() const {
+    const Settings& s = settings;
+    return {!s.exterior_shadows, s.car_detail,     s.full_rate_mirror, s.full_rate_bloom,
+            s.soft_particles,    s.scenery_shadows, s.reflections,     s.crowds_every_race};
+  }
+
   void StartTask(std::string title, TaskKind kind, std::function<bool()> body) {
     if (worker.joinable()) worker.join();
     task_title = std::move(title);
@@ -830,7 +836,7 @@ struct App {
     }
     std::error_code ec;
     if (report.ok() && !task.cancel) {
-      const auto fix_error = SetRaceShadowWorkaround(dir, true);
+      const auto fix_error = SetRenderScenarios(dir, ScenarioOptions());
       if (!fix_error.empty()) {
         task.SetStatus(fix_error);
         return false;
@@ -955,8 +961,8 @@ struct App {
       notice = physics_error;
       return;
     }
-    // Compatibility fixes are part of the port, not player-facing settings.
-    const auto fix_error = SetRaceShadowWorkaround(GameDir(), true);
+    // The race render scenarios: the shadow workaround and the detail settings.
+    const auto fix_error = SetRenderScenarios(GameDir(), ScenarioOptions());
     if (!fix_error.empty()) {
       notice = std::string(L("Could not prepare the game: ", "No se pudo preparar el juego: ")) + fix_error;
       return;
@@ -1615,6 +1621,38 @@ void TabGraphics(App& app) {
         {{"bilinear", L("Bilinear", "Bilineal")}, {"cas", "AMD CAS"}, {"fsr", "AMD FSR"}});
     EndRows();
   }
+  EndCard();
+
+  // Values the game's race render scenarios take, written on Play.
+  BeginCard("##racedetail", L("Race detail", "Detalle en carrera"),
+            L("Applied to the game's race settings when you press Play. Console is the original game.",
+              "Se aplica a los ajustes de carrera del juego al pulsar Jugar. Consola es el juego original."));
+  if (BeginRows("##rd")) {
+    Row(L("Car detail", "Detalle de coches"));
+    changed |= Segmented<int>("car_detail", s.car_detail,
+                              {{0, L("Console", "Consola")}, {1, L("High", "Alto")}, {2, L("Ultra", "Ultra")}});
+    Row(L("Reflections", "Reflejos"));
+    changed |= Segmented<int>("reflections", s.reflections,
+                              {{0, L("Console", "Consola")}, {1, L("Every race", "Todas las carreras")},
+                               {2, L("Double", "Doble")}});
+    Row(L("Full-rate mirror", "Retrovisor completo"));
+    changed |= Toggle("##mirror", &s.full_rate_mirror);
+    Row(L("Full-rate bloom", "Bloom completo"));
+    changed |= Toggle("##bloom", &s.full_rate_bloom);
+    Row(L("Soft particles", "Partículas suaves"));
+    changed |= Toggle("##soft", &s.soft_particles);
+    Row(L("Cone and barrier shadows", "Sombras de conos y barreras"));
+    changed |= Toggle("##scenery", &s.scenery_shadows);
+    Row(L("Crowds in every race", "Público en todas las carreras"));
+    changed |= Toggle("##crowds", &s.crowds_every_race);
+    Row(L("Exterior car shadows (experimental)", "Sombras exteriores de coches (experimental)"));
+    changed |= Toggle("##extshadows", &s.exterior_shadows);
+    EndRows();
+  }
+  TextDim(L("Mirror: every frame, up to 16 cars. Reflections: the cars' environment cube redrawn more often. "
+            "Exterior shadows were off because of artifacts; try them with this renderer.",
+            "Retrovisor: cada fotograma, hasta 16 coches. Reflejos: el entorno de los coches se redibuja más a menudo. "
+            "Las sombras exteriores estaban desactivadas por fallos; pruébalas con este renderer."));
   EndCard();
 
   if (ImGui::Button(L("Restore defaults", "Restaurar valores predeterminados"))) {

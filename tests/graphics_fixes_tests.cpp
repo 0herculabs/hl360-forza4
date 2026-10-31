@@ -39,6 +39,21 @@ int main() {
     Put(race, patched);
     Require(SetRaceShadowWorkaround(root, false).empty(), "restore failed");
     Require(Get(race) == xml && !RaceShadowWorkaroundEnabled(root), "restore not byte exact");
+    // Detail options: written over the original, switchable, restorable.
+    RenderScenarioOptions ultra{false, 2, true, false, false, false, 2, false};
+    Require(SetRenderScenarios(root, ultra).empty(), "detail options failed");
+    const auto detailed = Get(race);
+    Require(detailed.find("<CarKeepLOD0 value=\"1\"/>\r\n") != std::string::npos &&
+            detailed.find("<MaxCarsInMirror value=\"16\"/>") != std::string::npos &&
+            detailed.find("<EnvMapFrequencyScale value=\"2.0\"/>") != std::string::npos &&
+            detailed.find("SkipShadowMapUnlessCockpit") == std::string::npos, "detail options not written");
+    Require(ShadowVerificationManifest(root, manifest)[0].path.find(".fm4-shadow-originals/") == 0,
+        "original not verified with detail options");
+    Require(SetRenderScenarios(root, RenderScenarioOptions{true}).empty() &&
+            Get(race).find("CarKeepLOD0") == std::string::npos &&
+            Get(race).find("SkipShadowMapUnlessCockpit") != std::string::npos, "switching options failed");
+    Require(SetRenderScenarios(root, RenderScenarioOptions{false}).empty() && Get(race) == xml,
+        "console values not restored");
     Put(root / "Media/RenderScenarios/8-Car_Race.xml", "malformed");
     Require(!SetRaceShadowWorkaround(root, true).empty(), "malformed XML accepted");
     Require(Get(race) == xml && !RaceShadowWorkaroundEnabled(root), "partial patch survived failure");
@@ -46,14 +61,15 @@ int main() {
     Settings loaded; Require(loaded.Load(root / "settings.toml"), "settings load failed");
     Require(loaded.Save(root / "settings.toml"), "settings migration failed");
     const auto migrated = Get(root / "settings.toml");
-    Require(migrated.find("async_shader_compilation = true") != std::string::npos &&
-        migrated.find("frame_stats = false") != std::string::npos, "shader preference lost or diagnostics not reset");
+    // Pipelines compile before the draw: a dropped draw darkened the asphalt.
+    Require(migrated.find("async_shader_compilation = false") != std::string::npos &&
+        migrated.find("frame_stats = false") != std::string::npos, "shader compilation or diagnostics not reset");
     loaded.readback_resolve = "fast";
-    loaded.async_shader_compilation = false;
+    loaded.async_shader_compilation = true;
     Require(loaded.Save(root / "settings.toml"), "compatibility settings save failed");
     Settings compatibility;
     Require(compatibility.Load(root / "settings.toml") && compatibility.readback_resolve == "none" &&
-        compatibility.async_shader_compilation, "Xenia compatibility baseline not enforced");
+        !compatibility.async_shader_compilation, "renderer compatibility baseline not enforced");
     Require(loaded.profile_name == "Tester", "profile lost during migration");
     Require(!loaded.experimental_120fps,"60 Hz is not the default");
     loaded.experimental_120fps=true;

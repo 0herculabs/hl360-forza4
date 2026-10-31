@@ -1,4 +1,4 @@
-﻿#include "settings.h"
+#include "settings.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -239,6 +239,14 @@ void Settings::ResetDisplay() {
   video_mode_width = defaults.video_mode_width;
   video_mode_height = defaults.video_mode_height;
   present_fsr_sharpness_reduction = defaults.present_fsr_sharpness_reduction;
+  exterior_shadows = defaults.exterior_shadows;
+  car_detail = defaults.car_detail;
+  full_rate_mirror = defaults.full_rate_mirror;
+  full_rate_bloom = defaults.full_rate_bloom;
+  soft_particles = defaults.soft_particles;
+  scenery_shadows = defaults.scenery_shadows;
+  reflections = defaults.reflections;
+  crowds_every_race = defaults.crowds_every_race;
   ApplyGraphicsPreset(1);
 }
 
@@ -281,12 +289,22 @@ bool Settings::Load(const std::filesystem::path& file) {
   video_mode_width = 1280;
   video_mode_height = 720;
   present_fsr_sharpness_reduction = 0.2;
-  async_shader_compilation = true;
+  async_shader_compilation = false;
   readback_resolve = "none";
   resolution_scale = std::clamp(resolution_scale, 1, 4);
   anisotropic_override = std::clamp(anisotropic_override, 0, 5);
   swap_post_effect = "none";
   if (graphics_preset < 3) ApplyGraphicsPreset(graphics_preset);
+  Read(t, "scenario_exterior_shadows", exterior_shadows);
+  ReadInt(t, "scenario_car_detail", car_detail);
+  car_detail = std::clamp(car_detail, 0, 2);
+  Read(t, "scenario_full_rate_mirror", full_rate_mirror);
+  Read(t, "scenario_full_rate_bloom", full_rate_bloom);
+  Read(t, "scenario_soft_particles", soft_particles);
+  Read(t, "scenario_scenery_shadows", scenery_shadows);
+  ReadInt(t, "scenario_reflections", reflections);
+  reflections = std::clamp(reflections, 0, 2);
+  Read(t, "scenario_crowds_every_race", crowds_every_race);
 
   Read(t, "input_backend", input_backend);
   ReadWheel(t, wheel);
@@ -316,8 +334,11 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("window_width", window_width);
   t.insert("window_height", window_height);
   t.insert("vsync", vsync);
-  // Vulkan picks its presentation mode itself: VSync on allows only FIFO.
+  // Vulkan: VSync on presents FIFO; off presents immediate, which also keeps
+  // an independent flip and so variable refresh rate (mailbox went through
+  // the desktop compositor on Nvidia).
   if (gpu_backend == "vulkan") {
+    t.insert("vulkan_present_mode", vsync ? "fifo" : "immediate");
     for (const char* mode : {"immediate", "mailbox", "fifo_relaxed"})
       t.insert(std::string("vulkan_allow_present_mode_") + mode, !vsync);
   }
@@ -328,6 +349,14 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("gpu_backend", gpu_backend);
   t.insert("resolution_scale", resolution_scale);
   t.insert("graphics_preset", graphics_preset);
+  t.insert("scenario_exterior_shadows", exterior_shadows);
+  t.insert("scenario_car_detail", car_detail);
+  t.insert("scenario_full_rate_mirror", full_rate_mirror);
+  t.insert("scenario_full_rate_bloom", full_rate_bloom);
+  t.insert("scenario_soft_particles", soft_particles);
+  t.insert("scenario_scenery_shadows", scenery_shadows);
+  t.insert("scenario_reflections", reflections);
+  t.insert("scenario_crowds_every_race", crowds_every_race);
   t.insert("anisotropic_override", anisotropic_override);
   t.insert("swap_post_effect", swap_post_effect);
   t.insert("present_effect", present_effect);
@@ -349,7 +378,7 @@ bool Settings::Save(const std::filesystem::path& file) const {
   for (const auto& b : binds) {
     t.insert(std::string("keybind_") + b.id, b.keys);
   }
-  t.insert("async_shader_compilation", true);
+  t.insert("async_shader_compilation", false);
   t.insert("frame_stats", false);
   t.insert("audio_mute", audio_mute);
   t.insert("audio_output_mode", audio_output_mode);

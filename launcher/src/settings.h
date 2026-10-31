@@ -64,8 +64,18 @@ struct Settings {
   int graphics_preset = 1;  // 0 low, 1 medium, 2 high, 3 custom
   void ApplyGraphicsPreset(int preset);
 
-  bool async_shader_compilation = true;
+  bool async_shader_compilation = false;
   std::string readback_resolve = "none";  // none | fast | full
+
+  // Race render scenario settings (graphics_fixes.h), applied on Play.
+  bool exterior_shadows = false;  // off: the race shadow workaround
+  int car_detail = 0;             // 0 console, 1 high, 2 ultra
+  bool full_rate_mirror = false;
+  bool full_rate_bloom = false;
+  bool soft_particles = false;
+  bool scenery_shadows = false;
+  int reflections = 0;            // 0 console, 1 every race, 2 double
+  bool crowds_every_race = false;
 
   // Input
   std::string input_backend = "sdl";  // sdl | xinput
