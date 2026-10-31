@@ -27,3 +27,4 @@ Thumbs.db
 /generated/speech/
 /generated/default.dll_manifest.h
 /generated/dll_targets.cmake
+/thirdparty/sdk-src/

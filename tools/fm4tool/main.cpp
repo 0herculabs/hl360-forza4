@@ -11,6 +11,10 @@
 //       <user_data_dir> with the runtime's ContentManager (files + license
 //       header), as the game expects. <game_dir> holds default.xex (Disc 1).
 //
+//   fm4tool install-package <game_dir> <user_data_dir> <package>...
+//       Installs the given downloadable content packages the same way.
+//       Anything that is not FM4 marketplace content is refused.
+//
 //   fm4tool image <game_root> <xex_name> <out_dir>
 //       Loads the XEX the same way codegen does and writes the decrypted,
 //       decompressed image (image.bin) plus its section table and the module
@@ -97,17 +101,12 @@ static int ExtractDevice(rex::filesystem::Device& device, const fs::path& out_di
   return 0;
 }
 
-static int InstallDlc(const fs::path& game_dir, const fs::path& disc2_dir,
-                      const fs::path& user_dir) {
-  fs::path src = disc2_dir / kDlcContentDir;
-  if (!fs::is_directory(src)) {
-    std::fprintf(stderr, "%s is not the FM4 content install disc\n", disc2_dir.string().c_str());
-    return 1;
-  }
-  // The runtime's ContentManager installs packages the way the game reads
-  // them: files under 0000000000000000/<title>/00000002/<package>/ plus a
-  // Headers/00000002/<package>.header holding the content data and the
-  // license mask from the STFS header. It needs the XEX loaded for the title ID.
+// The runtime's ContentManager installs packages the way the game reads
+// them: files under 0000000000000000/<title>/00000002/<package>/ plus a
+// Headers/00000002/<package>.header holding the content data and the
+// license mask from the STFS header. It needs the XEX loaded for the title ID.
+static int InstallPackages(const fs::path& game_dir, const fs::path& user_dir,
+                           const std::vector<fs::path>& packages) {
   rex::Runtime runtime(game_dir, user_dir);
   if (runtime.Setup(rex::RuntimeConfig{.kernel_init = rex::kernel::InitializeKernel,
                                        .tool_mode = true}) != rex::X_STATUS(0) ||
@@ -116,19 +115,63 @@ static int InstallDlc(const fs::path& game_dir, const fs::path& disc2_dir,
     return 1;
   }
   auto* content = runtime.kernel_state()->content_manager();
-  for (const auto& package : fs::directory_iterator(src)) {
-    if (!package.is_regular_file()) {
-      continue;
+  for (const auto& package : packages) {
+    // InstallContent files everything as marketplace content of the running
+    // title, so anything else (avatar items, other games) is refused here.
+    rex::filesystem::StfsContainerDevice device("", package);
+    const auto name = package.filename().string();
+    if (!device.Initialize()) {
+      std::printf("%s: FAILED (not an STFS package)\n", name.c_str());
+      return 1;
     }
-    auto result = content->InstallContent(package.path());
-    std::printf("%s: %s\n", package.path().filename().string().c_str(),
-                result == 0 ? "installed" : "FAILED");
+    const auto& metadata = device.header().metadata;
+    const auto type = static_cast<rex::system::XContentType>(metadata.content_type);
+    if (type != rex::system::XContentType::kMarketplaceContent ||
+        uint32_t(metadata.execution_info.title_id) != runtime.kernel_state()->title_id()) {
+      std::printf("%s: FAILED (not Forza Motorsport 4 downloadable content)\n", name.c_str());
+      return 1;
+    }
+    // Neither the installer nor the game opens files with long-path support.
+    char title[9];
+    std::snprintf(title, sizeof(title), "%08X", runtime.kernel_state()->title_id());
+    const fs::path install_root =
+        fs::absolute(user_dir) / "0000000000000000" / title / "00000002" / package.filename();
+    size_t longest = 0;
+    std::queue<rex::filesystem::Entry*> queue;
+    queue.push(device.ResolvePath("/"));
+    while (!queue.empty()) {
+      auto* entry = queue.front();
+      queue.pop();
+      for (auto& child : entry->children()) queue.push(child.get());
+      longest = std::max(longest, (install_root / rex::to_path(entry->path())).wstring().size());
+    }
+    if (longest > 259) {
+      std::printf("%s: FAILED (path too long: %zu characters, at most 259; choose a shorter user data folder)\n",
+                  name.c_str(), longest);
+      return 1;
+    }
+    auto result = content->InstallContent(package);
+    std::printf("%s: %s\n", name.c_str(), result == 0 ? "installed" : "FAILED");
     std::fflush(stdout);  // the launcher reads progress from a pipe
     if (result != 0) {
       return 1;
     }
   }
   return 0;
+}
+
+static int InstallDlc(const fs::path& game_dir, const fs::path& disc2_dir,
+                      const fs::path& user_dir) {
+  fs::path src = disc2_dir / kDlcContentDir;
+  if (!fs::is_directory(src)) {
+    std::fprintf(stderr, "%s is not the FM4 content install disc\n", disc2_dir.string().c_str());
+    return 1;
+  }
+  std::vector<fs::path> packages;
+  for (const auto& package : fs::directory_iterator(src)) {
+    if (package.is_regular_file()) packages.push_back(package.path());
+  }
+  return InstallPackages(game_dir, user_dir, packages);
 }
 
 static int DumpImage(const fs::path& game_root, const std::string& xex_name,
@@ -229,6 +272,9 @@ int main(int argc, char** argv) {
   if (mode == "install-dlc" && argc == 5) {
     return InstallDlc(argv[2], argv[3], argv[4]);
   }
+  if (mode == "install-package" && argc >= 5) {
+    return InstallPackages(argv[2], argv[3], std::vector<fs::path>(argv + 4, argv + argc));
+  }
   if (mode == "image" && argc == 5) {
     return DumpImage(argv[2], argv[3], argv[4]);
   }
@@ -240,6 +286,7 @@ int main(int argc, char** argv) {
                "  fm4tool iso <image.iso> <out_dir>\n"
                "  fm4tool stfs <package> <out_dir>\n"
                "  fm4tool install-dlc <game_dir> <disc2_dir> <user_data_dir>\n"
+               "  fm4tool install-package <game_dir> <user_data_dir> <package>...\n"
                "  fm4tool image <game_root> <xex_name> <out_dir>\n"
                "  fm4tool module-reload-test <game_root> <test_user_dir> <module_dll>\n");
   return 2;

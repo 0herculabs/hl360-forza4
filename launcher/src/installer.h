@@ -63,6 +63,32 @@ bool InstallContentDisc(const std::filesystem::path& iso, const std::filesystem:
 // Packages of the content disc installed in `user_dir` (files and header).
 constexpr size_t kContentPackages = 4;
 
+// Additional content of FM4: the four Disc 2 packs and downloadable content
+// (marketplace packages, type 00000002, of title 4D530910).
+struct ContentPackage {
+  std::filesystem::path path;  // the package file, or its installed folder
+  std::string file_name;       // the package's file name, which names the install
+  std::string display_name;
+  uint64_t size = 0;
+  bool disc2 = false;  // one of the Content Install Disc packs
+};
+
+// FM4 packages in `path`: a package file, or a folder searched recursively
+// (e.g. a 4D530910 folder copied from a console). Other titles and content
+// types, such as avatar items, are left out and counted in `skipped`.
+std::vector<ContentPackage> ScanContentPackages(const std::filesystem::path& path, size_t& skipped);
+
+// Packages installed in `user_dir` (folder plus header), Disc 2 packs first.
+std::vector<ContentPackage> ListInstalledContent(const std::filesystem::path& user_dir);
+
+// Installs package files with fm4tool, like the Disc 2 packs.
+bool InstallContentPackages(const std::vector<std::filesystem::path>& packages,
+                            const std::filesystem::path& game_dir, const std::filesystem::path& user_dir,
+                            const std::filesystem::path& tool, TaskProgress& progress);
+
+// Removes an installed package (its folder and header). Empty on success.
+std::string RemoveContentPackage(const std::filesystem::path& user_dir, const std::string& file_name);
+
 // The deepest Disc 2 file is 142 characters below the user data folder, and
 // both the installer and the game open files without long-path support
 // (MAX_PATH = 260 including the terminator).
@@ -71,6 +97,7 @@ constexpr size_t kMaxUserDirLength = 259 - 1 - kLongestContentPath;
 inline bool UserDirFitsContent(const std::filesystem::path& user_dir) {
   return user_dir.wstring().size() <= kMaxUserDirLength;
 }
+// Disc 2 packs installed in `user_dir`; downloadable content is not counted.
 size_t CountContentPackages(const std::filesystem::path& user_dir);
 
 bool InstallForzaPlus(const std::filesystem::path& script, const std::filesystem::path& zip,

@@ -636,10 +636,17 @@ struct App {
   GameState game_state = GameState::kUnknown;
   std::string game_state_detail;
   size_t content_packages = 0;
+  std::vector<ContentPackage> installed_content;  // Disc 2 packs and DLC
+  // Packages found in the folder or files the player picked to add.
+  std::vector<ContentPackage> found_content;
+  std::vector<char> found_selected;
+  size_t found_skipped = 0;
+  std::string found_source;
+  std::string remove_candidate;  // file name awaiting confirmation
   TaskProgress task;
   std::thread worker;
   std::string task_title;
-  enum class TaskKind { kNone, kPlayDisc, kContentDisc, kVerify, kForzaPlus, kRemoveForzaPlus };
+  enum class TaskKind { kNone, kPlayDisc, kContentDisc, kAddContent, kVerify, kForzaPlus, kRemoveForzaPlus };
   TaskKind task_kind = TaskKind::kNone;
   std::atomic<int> import_step{0};  // play disc: 1 = extracting, 2 = verifying
 
@@ -649,6 +656,7 @@ struct App {
   std::optional<std::string> picked_game_folder;
   std::optional<std::string> picked_user_folder;
   std::optional<std::string> picked_plus_zip, picked_plus_update;
+  std::optional<std::vector<std::string>> picked_content;
   std::string plus_zip, plus_update;
   int plus_mode = 0;
   std::unique_ptr<fm4::wheel::DeviceMonitor> wheel_monitor;
@@ -765,7 +773,9 @@ struct App {
   void CheckGame() {
     const fs::path dir = GameDir();
     std::error_code ec;
-    content_packages = CountContentPackages(UserDir());
+    installed_content = ListInstalledContent(UserDir());
+    content_packages = size_t(std::count_if(installed_content.begin(), installed_content.end(),
+                                            [](const ContentPackage& p) { return p.disc2; }));
     if (!fs::exists(dir / "default.xex", ec)) {
       game_state = GameState::kMissing;
       game_state_detail = L("Install Disc 1 in the Install tab.", "Instala el Disco 1 en la pestaña Instalación.");
@@ -877,6 +887,62 @@ struct App {
                              "Esa imagen no es un disco de Forza Motorsport 4 USA Rev 1: ")) +
                iso.filename().u8string();
     }
+  }
+
+  bool ContentIsInstalled(const std::string& file_name) const {
+    return std::any_of(installed_content.begin(), installed_content.end(), [&](const ContentPackage& p) {
+      return SDL_strcasecmp(p.file_name.c_str(), file_name.c_str()) == 0;
+    });
+  }
+
+  // Lists the FM4 packages in the picked folder or files; the player then
+  // chooses which to install. New packages start selected.
+  void ScanPickedContent(const std::vector<std::string>& paths) {
+    found_content.clear();
+    found_skipped = 0;
+    for (const auto& path : paths) {
+      size_t skipped = 0;
+      for (auto& package : ScanContentPackages(fs::u8path(path), skipped)) {
+        const bool duplicate = std::any_of(found_content.begin(), found_content.end(), [&](const ContentPackage& p) {
+          return SDL_strcasecmp(p.file_name.c_str(), package.file_name.c_str()) == 0;
+        });
+        if (!duplicate) found_content.push_back(std::move(package));
+      }
+      found_skipped += skipped;
+    }
+    found_selected.assign(found_content.size(), 0);
+    for (size_t i = 0; i < found_content.size(); ++i) {
+      found_selected[i] = !ContentIsInstalled(found_content[i].file_name);
+    }
+    found_source = paths.size() == 1 ? paths.front()
+                                     : std::to_string(paths.size()) + L(" files", " archivos");
+    if (found_content.empty()) {
+      notice = found_skipped ? L("No Forza Motorsport 4 content there (only other content, such as avatar items).",
+                                 "Ahí no hay contenido de Forza Motorsport 4 (solo otro contenido, como artículos de avatar).")
+                             : L("No content packages found there.", "No se encontraron paquetes de contenido ahí.");
+    }
+  }
+
+  void InstallSelectedContent() {
+    std::vector<fs::path> packages;
+    for (size_t i = 0; i < found_content.size(); ++i) {
+      if (found_selected[i]) packages.push_back(found_content[i].path);
+    }
+    if (packages.empty()) return;
+    Save();
+    found_content.clear();
+    found_selected.clear();
+    const fs::path game_dir = GameDir(), user_dir = UserDir();
+    StartTask(L("Additional content", "Contenido adicional"), TaskKind::kAddContent,
+              [this, packages, game_dir, user_dir] {
+                return InstallContentPackages(packages, game_dir, user_dir, tool_exe, task);
+              });
+  }
+
+  void RemoveContent(const std::string& file_name) {
+    const auto error = RemoveContentPackage(UserDir(), file_name);
+    notice = error.empty() ? std::string(L("Removed ", "Quitado ")) + file_name : error;
+    CheckGame();
   }
 
   void LaunchGame() {
@@ -1139,21 +1205,27 @@ float WindowHeight() { return S(840); }
 void CoverPanel(App& app, const ImVec2& size) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 p0 = ImGui::GetCursorScreenPos();
-  const ImVec2 p1(p0.x + size.x, p0.y + CoverHeight(app));
+  // A short window shrinks the cover, keeping its aspect, so the profile and
+  // the play button under it stay in sight.
+  const float full_h = CoverHeight(app);
+  const float cover_h = std::clamp(size.y - S(330), std::min(S(140), full_h), full_h);
+  const float cover_w = size.x * cover_h / full_h;
+  const ImVec2 c0(p0.x + (size.x - cover_w) / 2, p0.y);
+  const ImVec2 p1(c0.x + cover_w, p0.y + cover_h);
 
   // Column background, a darker shade of the card colour.
   dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), Col(ImVec4(0.085f, 0.09f, 0.10f, 1)));
   if (app.cover.texture) {
-    dl->AddImage(app.cover.id(), p0, p1);
+    dl->AddImage(app.cover.id(), c0, p1);
   } else {
     // No cover yet (Disc 1 not installed): a panel in the logo's colours.
-    dl->AddRectFilledMultiColor(p0, p1, IM_COL32(48, 50, 56, 255), IM_COL32(30, 31, 36, 255),
+    dl->AddRectFilledMultiColor(c0, p1, IM_COL32(48, 50, 56, 255), IM_COL32(30, 31, 36, 255),
                                 IM_COL32(14, 14, 16, 255), IM_COL32(24, 25, 29, 255));
     ImGui::PushFont(g_bold, ImGui::GetStyle().FontSizeBase * 2.6f);
-    dl->AddText(ImVec2(p0.x + S(28), p0.y + S(70)), Col(kAccent), "FORZA");
+    dl->AddText(ImVec2(c0.x + S(28), p0.y + S(70) * cover_h / full_h), Col(kAccent), "FORZA");
     ImGui::PopFont();
     ImGui::PushFont(g_bold, ImGui::GetStyle().FontSizeBase * 1.4f);
-    dl->AddText(ImVec2(p0.x + S(30), p0.y + S(130)), IM_COL32(235, 235, 240, 235), "MOTORSPORT 4");
+    dl->AddText(ImVec2(c0.x + S(30), p0.y + S(130) * cover_h / full_h), IM_COL32(235, 235, 240, 235), "MOTORSPORT 4");
     ImGui::PopFont();
   }
 
@@ -1196,6 +1268,10 @@ void CoverPanel(App& app, const ImVec2& size) {
     StatusDot(all ? kOk : kWarn);
       ImGui::Text(L("Disc 2 content: %zu of %zu packs", "Contenido del Disco 2: %zu de %zu packs"),
                   app.content_packages, kContentPackages);
+    if (const size_t dlc = app.installed_content.size() - app.content_packages) {
+      StatusDot(kOk);
+      ImGui::Text(L("Downloadable content: %zu packs", "Contenido descargable: %zu packs"), dlc);
+    }
   }
   ImGui::Dummy(ImVec2(0, S(6)));
 
@@ -1206,6 +1282,7 @@ void CoverPanel(App& app, const ImVec2& size) {
     const char* heading = app.task_kind == App::TaskKind::kRemoveForzaPlus ? L("UNINSTALLING FORZA PLUS", "DESINSTALANDO FORZA PLUS")
                           : app.task_kind == App::TaskKind::kPlayDisc      ? L("INSTALLING DISC 1", "INSTALANDO DISCO 1")
                           : app.task_kind == App::TaskKind::kContentDisc ? L("INSTALLING DISC 2", "INSTALANDO DISCO 2")
+                          : app.task_kind == App::TaskKind::kAddContent ? L("INSTALLING CONTENT", "INSTALANDO CONTENIDO")
                           : app.task_kind == App::TaskKind::kForzaPlus ? L("INSTALLING FORZA PLUS", "INSTALANDO FORZA PLUS")
                                                                          : L("VERIFYING FILES", "VERIFICANDO ARCHIVOS");
     ImGui::PushFont(g_bold, ImGui::GetStyle().FontSizeBase * 1.05f);
@@ -1254,8 +1331,10 @@ void CoverPanel(App& app, const ImVec2& size) {
     ImGui::PopTextWrapPos();
   }
   ImGui::EndGroup();
+  // Still taller than a very short window: the column scrolls.
+  const float content_h = ImGui::GetItemRectMax().y - p0.y + S(12);
   ImGui::SetCursorScreenPos(p0);
-  ImGui::Dummy(size);
+  ImGui::Dummy(ImVec2(size.x, std::max(size.y, content_h)));
 }
 
 // --- Tabs ------------------------------------------------------------------
@@ -1282,8 +1361,8 @@ void TabInstructions(App& app) {
   TextDim(L("Game images and mod archives are not included with this release.", "Las imágenes del juego y los archivos del mod no se incluyen en este release."));
   EndCard();
   BeginCard("##installdiscshelp",L("2. Install the game", "2. Instalar el juego"));
-  ImGui::TextWrapped("%s",L("1. Open Install and choose the Disc 1 ISO in Step 1. Wait for extraction and verification.\n2. In Step 2, choose the Disc 2 ISO to install the additional car and track packs.\n3. Choose or create a profile in Profiles, then press Play.",
-      "1. Abre Instalación y selecciona la ISO del Disco 1 en el paso 1. Espera a que termine la extracción y verificación.\n2. En el paso 2, selecciona la ISO del Disco 2 para instalar los packs adicionales de coches y circuitos.\n3. Elige o crea un perfil en Perfiles y pulsa Jugar."));
+  ImGui::TextWrapped("%s",L("1. Open Install and choose the Disc 1 ISO in Step 1. Wait for extraction and verification.\n2. In Step 2, choose the Disc 2 ISO to install the additional car and track packs.\n3. Optional: under Additional content, add DLC packages from a folder (for example 4D530910) or remove installed content.\n4. Choose or create a profile in Profiles, then press Play.",
+      "1. Abre Instalación y selecciona la ISO del Disco 1 en el paso 1. Espera a que termine la extracción y verificación.\n2. En el paso 2, selecciona la ISO del Disco 2 para instalar los packs adicionales de coches y circuitos.\n3. Opcional: en Contenido adicional, añade paquetes DLC desde una carpeta (por ejemplo 4D530910) o quita contenido instalado.\n4. Elige o crea un perfil en Perfiles y pulsa Jugar."));
   if(ImGui::Button(L("Open installation", "Abrir instalación"))) app.tab=Tab::kInstall;
   EndCard();
   BeginCard("##plushelp",L("3. Project Forza Plus 4 (optional)", "3. Project Forza Plus 4 (opcional)"));
@@ -2297,6 +2376,7 @@ void TabAudio(App& app) {
                            {4, "Français"},
                            {3, "Deutsch"},
                            {6, "Italiano"},
+                           {9, "Português"},
                            {11, "Polski"},
                            {12, L("Russian", "Ruso")},
                            {2, L("Japanese", "Japonés")},
@@ -2396,6 +2476,139 @@ void PickPlusZip(App& app, bool update) {
   }, new Request{&app, update}, app.window, filter, 1, nullptr, false);
 }
 
+// Picks package files (many at once) to add as additional content.
+void PickContentFiles(App& app) {
+  SDL_ShowOpenFileDialog(
+      [](void* user, const char* const* files, int) {
+        auto* a = static_cast<App*>(user);
+        if (!files || !files[0]) return;
+        std::vector<std::string> paths;
+        for (; *files; ++files) paths.emplace_back(*files);
+        std::lock_guard lock(a->dialog_mutex);
+        a->picked_content = std::move(paths);
+      },
+      &app, app.window, nullptr, 0, nullptr, true);
+}
+
+void PickContentFolder(App& app) {
+  SDL_ShowOpenFolderDialog(
+      [](void* user, const char* const* files, int) {
+        auto* a = static_cast<App*>(user);
+        if (!files || !files[0]) return;
+        std::lock_guard lock(a->dialog_mutex);
+        a->picked_content = std::vector<std::string>{files[0]};
+      },
+      &app, app.window, nullptr, false);
+}
+
+std::string FormatSize(uint64_t bytes) {
+  char text[32];
+  if (bytes >= 1000000000) std::snprintf(text, sizeof(text), "%.2f GB", double(bytes) / 1e9);
+  else std::snprintf(text, sizeof(text), "%.0f MB", double(bytes) / 1e6);
+  return text;
+}
+
+// Installed Disc 2 packs and downloadable content: list, add and remove.
+void CardContent(App& app) {
+  BeginCard("##content", L("Additional content", "Contenido adicional"),
+            L("The Disc 2 packs and downloadable content (DLC) installed for the game. Add packages from a "
+              "folder, such as a 4D530910 folder copied from a console, or remove the ones you don't want.",
+              "Los packs del Disco 2 y el contenido descargable (DLC) instalados para el juego. Añade paquetes "
+              "desde una carpeta, como una carpeta 4D530910 copiada de una consola, o quita los que no quieras."));
+  ImGui::BeginDisabled(app.TaskRunning() || app.game || app.PlusActive() || !app.Installed());
+
+  if (app.installed_content.empty()) {
+    TextDim(L("No additional content installed.", "No hay contenido adicional instalado."));
+  } else if (ImGui::BeginTable("##installed", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+    ImGui::TableSetupColumn(L("Name", "Nombre"), ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn(L("Source", "Origen"), ImGuiTableColumnFlags_WidthFixed, S(90));
+    ImGui::TableSetupColumn(L("Size", "Tamaño"), ImGuiTableColumnFlags_WidthFixed, S(80));
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, S(80));
+    ImGui::TableHeadersRow();
+    for (const auto& package : app.installed_content) {
+      ImGui::PushID(package.file_name.c_str());
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(package.display_name.c_str());
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", package.file_name.c_str());
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(package.disc2 ? L("Disc 2", "Disco 2") : "DLC");
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(FormatSize(package.size).c_str());
+      ImGui::TableNextColumn();
+      if (ImGui::SmallButton(L("Remove", "Quitar"))) {
+        app.remove_candidate = package.file_name;
+        ImGui::OpenPopup("##remove_content");
+      }
+      if (ImGui::BeginPopup("##remove_content")) {
+        ImGui::Text(L("Remove %s?", "¿Quitar %s?"), package.display_name.c_str());
+        TextDim(package.disc2 ? L("Install Disc 2 again to bring it back.", "Vuelve a instalar el Disco 2 para recuperarlo.")
+                              : L("Add its package again to bring it back.", "Vuelve a añadir su paquete para recuperarlo."));
+        if (ImGui::Button(L("Remove", "Quitar"))) {
+          app.RemoveContent(app.remove_candidate);
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(L("Cancel", "Cancelar"))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+      }
+      ImGui::PopID();
+    }
+    ImGui::EndTable();
+  }
+
+  ImGui::Dummy(ImVec2(0, S(4)));
+  if (ImGui::Button(L("Add from folder...", "Añadir desde carpeta..."), ImVec2(S(220), 0))) PickContentFolder(app);
+  ImGui::SameLine();
+  if (ImGui::Button(L("Add package files...", "Añadir archivos de paquete..."), ImVec2(S(240), 0))) PickContentFiles(app);
+
+  if (!app.found_content.empty()) {
+    ImGui::Dummy(ImVec2(0, S(6)));
+    ImGui::Text(L("Found in %s:", "Encontrado en %s:"), app.found_source.c_str());
+    if (app.found_skipped) {
+      TextDim((std::to_string(app.found_skipped) +
+               L(" other packages left out (avatar items or other games).",
+                 " paquetes de otro tipo se omiten (artículos de avatar u otros juegos).")).c_str());
+    }
+    size_t selected = 0;
+    for (size_t i = 0; i < app.found_content.size(); ++i) {
+      const auto& package = app.found_content[i];
+      ImGui::PushID(int(i));
+      bool checked = app.found_selected[i];
+      std::string label = package.display_name;
+      const auto same_name = std::count_if(app.found_content.begin(), app.found_content.end(),
+          [&](const ContentPackage& p) { return p.display_name == package.display_name; });
+      if (same_name > 1) label += " [" + package.file_name.substr(0, 8) + "]";
+      label += "  (" + FormatSize(package.size) + ")";
+      if (app.ContentIsInstalled(package.file_name)) label += L("  - installed", "  - instalado");
+      if (ImGui::Checkbox(label.c_str(), &checked)) app.found_selected[i] = checked;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", package.file_name.c_str());
+      selected += checked;
+      ImGui::PopID();
+    }
+    if (ImGui::SmallButton(L("All", "Todos"))) std::fill(app.found_selected.begin(), app.found_selected.end(), 1);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(L("None", "Ninguno"))) std::fill(app.found_selected.begin(), app.found_selected.end(), 0);
+    ImGui::BeginDisabled(selected == 0 || !UserDirFitsContent(app.UserDir()));
+    char install_label[64];
+    std::snprintf(install_label, sizeof(install_label), L("Install selected (%zu)", "Instalar seleccionados (%zu)"),
+                  selected);
+    if (PrimaryButton(install_label, ImVec2(S(280), S(36)))) app.InstallSelectedContent();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button(L("Cancel", "Cancelar"), ImVec2(S(120), S(36)))) {
+      app.found_content.clear();
+      app.found_selected.clear();
+    }
+  }
+  if (app.PlusInstalled()) {
+    TextDim(L("Forza Plus adapts the content installed when it is installed: reinstall it to include new DLC.",
+              "Forza Plus adapta el contenido instalado al instalarse: reinstálalo para incluir DLC nuevos."));
+  }
+  ImGui::EndDisabled();
+  EndCard();
+}
+
 // One step of the install wizard: number, title, state and its button.
 void WizardStep(App& app, int number, const char* title, const char* subtitle, bool done, bool enabled,
                 const char* state_text, const char* button) {
@@ -2445,6 +2658,7 @@ void TabInstall(App& app) {
       app.Installed() ? content_state : L("Install Disc 1 first", "Instala antes el Disco 1"),
       content_done ? L("Reinstall Disc 2...", "Reinstalar Disco 2...")
                    : L("Choose Disc 2 ISO and install", "Elegir ISO del Disco 2 e instalar"));
+  CardContent(app);
 
   if (!UserDirFitsContent(app.UserDir())) {
     TextColored(kWarn, L("The user data folder path is too long for the Disc 2 files: choose a shorter one below.",
@@ -2806,8 +3020,17 @@ int main(int argc, char** argv) {
 
   g_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
   if (g_scale <= 0) g_scale = 1.0f;
-  app.window = SDL_CreateWindow("Forza Motorsport 4", int(CoverWidth() + SettingsWidth()), int(WindowHeight()),
-                                SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+  // The usual fixed size, shrunk to fit the display's usable area, and
+  // resizable: on some multi-monitor setups it opened taller than the screen.
+  int window_w = int(CoverWidth() + SettingsWidth()), window_h = int(WindowHeight());
+  SDL_Rect usable{};
+  if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 && usable.h > 0) {
+    window_w = std::min(window_w, usable.w * 95 / 100);
+    window_h = std::min(window_h, usable.h * 92 / 100);
+  }
+  app.window = SDL_CreateWindow("Forza Motorsport 4", window_w, window_h,
+                                SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
+  SDL_SetWindowMinimumSize(app.window, std::min(window_w, int(S(900))), std::min(window_h, int(S(480))));
   // The SDK's SDL3 is built without the 2D renderer; SDL_GPU (D3D12 on
   // Windows, Vulkan elsewhere) is what it has.
   SDL_GPUDevice* gpu = SDL_CreateGPUDevice(
@@ -2945,6 +3168,11 @@ int main(int argc, char** argv) {
       }
       if (app.picked_plus_zip) { app.plus_zip = *app.picked_plus_zip; app.picked_plus_zip.reset(); }
       if (app.picked_plus_update) { app.plus_update = *app.picked_plus_update; app.picked_plus_update.reset(); }
+      if (app.picked_content) {
+        const auto paths = std::move(*app.picked_content);
+        app.picked_content.reset();
+        app.ScanPickedContent(paths);
+      }
     }
     static TaskProgress::State last_state = TaskProgress::State::kIdle;
     if (last_state == TaskProgress::State::kRunning && !app.TaskRunning()) {
@@ -2972,8 +3200,7 @@ int main(int argc, char** argv) {
 
     // Left: the cover column (fixed width, the cover shown whole).
     const float cover_w = CoverWidth();
-    ImGui::BeginChild("##cover", ImVec2(cover_w, vp->Size.y), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::BeginChild("##cover", ImVec2(cover_w, vp->Size.y), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     CoverPanel(app, ImVec2(cover_w, vp->Size.y));
     ImGui::EndChild();
     ImGui::SameLine(0, 0);

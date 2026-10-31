@@ -10,6 +10,7 @@
 #include <functional>
 #include <sstream>
 #include <thread>
+#include <tuple>
 
 #include "i18n.h"
 #include "sha256.h"
@@ -25,6 +26,53 @@ constexpr char kMagic[] = "MICROSOFT*XBOX*MEDIA";
 // Game-partition offsets: XGD2, XGD1, XGD3, plain XISO.
 constexpr uint64_t kPartitions[] = {0xFD90000, 0x18300000, 0x2080000, 0};
 constexpr char kContentDir[] = "Content/0000000000000000/4D530910/00000002/";
+
+// STFS package header: magic at 0, content type at 0x344, title ID at 0x360,
+// first display name (128 big-endian UTF-16 characters) at 0x411.
+constexpr size_t kStfsHeaderSize = 0x411 + 256;
+constexpr uint32_t kMarketplaceContent = 0x00000002;
+constexpr uint32_t kTitleId = 0x4D530910;
+
+uint32_t Be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
+
+std::string Utf16BeToUtf8(const uint8_t* p, size_t max_chars) {
+  std::string out;
+  for (size_t i = 0; i < max_chars; ++i) {
+    uint32_t c = uint32_t(p[i * 2]) << 8 | p[i * 2 + 1];
+    if (c == 0) break;
+    if (c >= 0xD800 && c < 0xDC00 && i + 1 < max_chars) {
+      const uint32_t low = uint32_t(p[i * 2 + 2]) << 8 | p[i * 2 + 3];
+      if (low >= 0xDC00 && low < 0xE000) {
+        c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00);
+        ++i;
+      }
+    }
+    if (c < 0x80) {
+      out += char(c);
+    } else if (c < 0x800) {
+      out += char(0xC0 | c >> 6);
+      out += char(0x80 | (c & 0x3F));
+    } else if (c < 0x10000) {
+      out += char(0xE0 | c >> 12);
+      out += char(0x80 | (c >> 6 & 0x3F));
+      out += char(0x80 | (c & 0x3F));
+    } else {
+      out += char(0xF0 | c >> 18);
+      out += char(0x80 | (c >> 12 & 0x3F));
+      out += char(0x80 | (c >> 6 & 0x3F));
+      out += char(0x80 | (c & 0x3F));
+    }
+  }
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  return out;
+}
+
+// The Content Install Disc's four packs: 4d53091000000001 to ...0004.
+bool IsDisc2Package(const std::string& file_name) {
+  static const char* kNames[] = {"4d53091000000001", "4d53091000000002", "4d53091000000003", "4d53091000000004"};
+  return std::any_of(std::begin(kNames), std::end(kNames),
+                     [&](const char* n) { return SDL_strcasecmp(n, file_name.c_str()) == 0; });
+}
 
 // XDVDFS preserves case; compare guest paths as Xbox/Windows paths.
 bool PathStartsWith(const std::string& path, const std::string& prefix) {
@@ -422,15 +470,146 @@ bool InstallContentDisc(const fs::path& iso, const fs::path& game_dir, const fs:
 }
 
 size_t CountContentPackages(const fs::path& user_dir) {
+  const auto installed = ListInstalledContent(user_dir);
+  return size_t(std::count_if(installed.begin(), installed.end(), [](const ContentPackage& p) { return p.disc2; }));
+}
+
+std::vector<ContentPackage> ScanContentPackages(const fs::path& path, size_t& skipped) {
+  std::vector<ContentPackage> found;
+  skipped = 0;
+  auto consider = [&](const fs::path& file) {
+    std::error_code ec;
+    const auto size = fs::file_size(file, ec);
+    if (ec || size < kStfsHeaderSize) return;
+    std::ifstream in(file, std::ios::binary);
+    uint8_t header[kStfsHeaderSize];
+    if (!in.read(reinterpret_cast<char*>(header), sizeof(header))) return;
+    if (std::memcmp(header, "LIVE", 4) != 0 && std::memcmp(header, "PIRS", 4) != 0 &&
+        std::memcmp(header, "CON ", 4) != 0) {
+      return;  // not a package
+    }
+    if (Be32(header + 0x344) != kMarketplaceContent || Be32(header + 0x360) != kTitleId) {
+      ++skipped;
+      return;
+    }
+    ContentPackage package;
+    package.path = file;
+    package.file_name = file.filename().u8string();
+    package.display_name = Utf16BeToUtf8(header + 0x411, 128);
+    if (package.display_name.empty()) package.display_name = package.file_name;
+    package.size = size;
+    package.disc2 = IsDisc2Package(package.file_name);
+    found.push_back(std::move(package));
+  };
+  std::error_code ec;
+  if (fs::is_regular_file(path, ec)) {
+    consider(path);
+  } else {
+    for (auto it = fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+      if (it->is_regular_file(ec)) consider(it->path());
+    }
+  }
+  std::sort(found.begin(), found.end(), [](const ContentPackage& a, const ContentPackage& b) {
+    return std::tie(a.display_name, a.file_name) < std::tie(b.display_name, b.file_name);
+  });
+  return found;
+}
+
+std::vector<ContentPackage> ListInstalledContent(const fs::path& user_dir) {
+  std::vector<ContentPackage> out;
   std::error_code ec;
   const fs::path title = user_dir / "0000000000000000" / "4D530910";
-  size_t count = 0;
   for (const auto& entry : fs::directory_iterator(title / "00000002", ec)) {
-    const fs::path header =
-        title / "Headers" / "00000002" / (entry.path().filename().u8string() + ".header");
-    if (entry.is_directory(ec) && fs::exists(header, ec)) ++count;
+    const std::string name = entry.path().filename().u8string();
+    const fs::path header_path = title / "Headers" / "00000002" / (name + ".header");
+    if (!entry.is_directory(ec) || !fs::exists(header_path, ec)) continue;
+    ContentPackage package;
+    package.path = entry.path();
+    package.file_name = name;
+    // The header is the runtime's XCONTENT_AGGREGATE_DATA: device ID, content
+    // type, then the display name (128 big-endian UTF-16 characters).
+    uint8_t header[8 + 256] = {};
+    std::ifstream in(header_path, std::ios::binary);
+    if (in.read(reinterpret_cast<char*>(header), sizeof(header))) {
+      package.display_name = Utf16BeToUtf8(header + 8, 128);
+    }
+    if (package.display_name.empty()) package.display_name = name;
+    for (auto it = fs::recursive_directory_iterator(entry.path(), ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+      if (it->is_regular_file(ec)) package.size += it->file_size(ec);
+    }
+    package.disc2 = IsDisc2Package(name);
+    out.push_back(std::move(package));
   }
-  return count;
+  std::sort(out.begin(), out.end(), [](const ContentPackage& a, const ContentPackage& b) {
+    if (a.disc2 != b.disc2) return a.disc2;
+    return std::tie(a.display_name, a.file_name) < std::tie(b.display_name, b.file_name);
+  });
+  return out;
+}
+
+bool InstallContentPackages(const std::vector<fs::path>& packages, const fs::path& game_dir,
+                            const fs::path& user_dir, const fs::path& tool, TaskProgress& progress) {
+  if (!fs::exists(game_dir / "default.xex")) {
+    progress.SetStatus(L("Install Disc 1 first: content is installed for it.",
+                         "Instala antes el Disco 1: el contenido se instala para él."));
+    return false;
+  }
+  if (!fs::exists(tool)) {
+    progress.SetStatus(std::string(L("Not found: ", "No se encuentra ")) + tool.u8string());
+    return false;
+  }
+  std::vector<std::string> args{"install-package", game_dir.u8string(), user_dir.u8string()};
+  std::vector<uint64_t> sizes;
+  uint64_t total = 0;
+  for (const auto& package : packages) {
+    std::error_code ec;
+    sizes.push_back(fs::file_size(package, ec));
+    total += sizes.back();
+    args.push_back(package.u8string());
+  }
+  progress.total = total;
+  progress.done = 0;
+  progress.SetStatus(L("Installing content packages...", "Instalando paquetes de contenido..."));
+  size_t installed = 0;
+  std::string last_error;
+  const int code = RunTool(
+      tool, args,
+      [&](const std::string& line) {
+        if (line.find(": installed") != std::string::npos) {
+          if (installed < sizes.size()) progress.done += sizes[installed];
+          ++installed;
+          progress.SetStatus(std::string(L("Installed ", "Instalado ")) + line.substr(0, line.find(':')));
+        } else if (line.find("FAILED") != std::string::npos || line.find("cannot") != std::string::npos) {
+          last_error = line;
+        }
+      },
+      progress);
+  if (code != 0 || installed != packages.size()) {
+    if (!progress.cancel) {
+      progress.SetStatus(std::string(L("Installing the content failed", "Falló la instalación del contenido")) +
+                         (last_error.empty() ? "." : ": " + last_error));
+    }
+    return false;
+  }
+  progress.done = progress.total.load();
+  progress.SetStatus(std::string(L("Installed ", "Instalados ")) + std::to_string(installed) +
+                     L(" content packages.", " paquetes de contenido."));
+  return true;
+}
+
+std::string RemoveContentPackage(const fs::path& user_dir, const std::string& file_name) {
+  if (!IsSafeRelativePath(file_name) || file_name.find_first_of("/\\") != std::string::npos) {
+    return L("Invalid package name.", "Nombre de paquete no válido.");
+  }
+  const fs::path title = user_dir / "0000000000000000" / "4D530910";
+  std::error_code ec;
+  fs::remove(title / "Headers" / "00000002" / fs::u8path(file_name + ".header"), ec);
+  if (ec) return std::string(L("Could not remove ", "No se pudo quitar ")) + file_name + ": " + ec.message();
+  fs::remove_all(title / "00000002" / fs::u8path(file_name), ec);
+  if (ec) return std::string(L("Could not remove ", "No se pudo quitar ")) + file_name + ": " + ec.message();
+  return {};
 }
 
 bool ExtractCover(const fs::path& game_dir, const fs::path& tool, const fs::path& cover) {

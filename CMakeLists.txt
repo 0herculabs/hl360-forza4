@@ -96,23 +96,6 @@ add_custom_command(TARGET fm4-launcher POST_BUILD
 configure_file(scripts/install-forza-plus.ps1 ${CMAKE_CURRENT_BINARY_DIR}/install-forza-plus.ps1 COPYONLY)
 configure_file(scripts/uninstall-forza-plus.ps1 ${CMAKE_CURRENT_BINARY_DIR}/uninstall-forza-plus.ps1 COPYONLY)
 
-# The installed SDK still contains the pre-0005 runtime. Its automatic DLL
-# copy can silently undo the module-unload fix after linking the game/tools.
-# Pin the validated Windows x64 runtime until the SDK installation is updated.
-if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
-    set(FM4_FIXED_RUNTIME "${CMAKE_CURRENT_SOURCE_DIR}/patches/sdk/runtime/rexruntime.dll")
-    file(SHA256 "${FM4_FIXED_RUNTIME}" FM4_FIXED_RUNTIME_HASH)
-    if(NOT FM4_FIXED_RUNTIME_HASH STREQUAL "dfc5ff61e3d8ad04d8e35dba111e9a9646956c46d6a79788f52019de2775bde3")
-        message(FATAL_ERROR "The validated module-reload runtime is missing or modified")
-    endif()
-    foreach(target fm4 fm4tool fm4-launcher)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${FM4_FIXED_RUNTIME}" "$<TARGET_FILE_DIR:${target}>/rexruntime.dll"
-            VERBATIM)
-    endforeach()
-endif()
-
 option(FM4_BUILD_TESTS "Build launcher compatibility regression checks" OFF)
 if(FM4_BUILD_TESTS)
     enable_testing()

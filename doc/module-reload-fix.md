@@ -37,8 +37,8 @@ DLL. The crash on 2026-10-19 at circuit exit reported duplicate loading of
 xmediafacade_default.xex followed by XamShowDirtyDiscErrorUI and a breakpoint.
 The shipped v0.3.9 runtime reproduced the failure on reload cycle 2.
 
-The validated Windows x64 runtime is now retained in patches/sdk/runtime and
-hash-checked by CMake. Post-link commands for the game, tool and launcher copy
-it after SDK DLL copying. Rebuilding and repeating the three-cycle probe passes.
-Desktop/FM4 was repaired with a timestamped backup. Full circuit exit validation
-still requires gameplay.
+A validated runtime DLL was then pinned in patches/sdk/runtime and copied after
+the SDK DLLs. That pin has been removed: the SDK is now built from ReXGlue
+v0.10.0 with patches 0001-0006 and 0008 applied, so its own runtime carries
+this fix together with the later 0006 thunk reuse. Full circuit exit
+validation still requires gameplay.
