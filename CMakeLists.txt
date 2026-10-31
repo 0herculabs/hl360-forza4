@@ -30,6 +30,7 @@ set(FM4_SOURCES
     src/wheel_ffb.cpp
     src/camera_view.cpp
     src/wide_view.cpp
+    src/frame_pacing.cpp
     src/telemetry/forza_dash.cpp
     src/telemetry/telemetry_out.cpp
     src/telemetry/fm4_car.cpp

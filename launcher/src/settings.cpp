@@ -371,6 +371,8 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("video_mode_refresh_rate", experimental_120fps?120.0:60.0);
   // The host presenter has its own limit; at 60 it capped the 120 FPS mode.
   t.insert("host_present_fps_limit", experimental_120fps?120:60);
+  // FM4 steps once per guest vblank (ShiftGlue's default is FH1's twice).
+  t.insert("fh1_guest_vblank_hz", experimental_120fps?120.0:60.0);
   WriteWheel(t, wheel);
   t.insert("mnk_mode", mnk_mode);
   t.insert("mnk_mouse", mnk_mouse);

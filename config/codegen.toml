@@ -36,6 +36,34 @@ SwitchToFiber = 0x82C85380
 
 
 
+# Frame pacing (src/frame_pacing.cpp), from fm4-static-recomp's hooks for FM4
+# 1.0 (config/rexglue/analysis/main-xex.toml), relocated to Rev 1 by their
+# instructions.
+#
+# The main loop stores its time step (stfs f31, 0x198(r31)) after the
+# cmplwi r30,16 / 17 test: r30 is the measured milliseconds since the last
+# tick. 1.0: 0x822F7D48.
+[[midasm_hook]]
+address = 0x822F77E8
+name = "Fm4MainLoopStep"
+registers = ["r30"]
+
+# The UI scene update has just loaded a fixed 1/60 s into f31 (lfs f31 at
+# 0x822A48DC), its only use the step passed on below; it runs in menus and the
+# showroom. 1.0: 0x822A46D0.
+[[midasm_hook]]
+address = 0x822A48E0
+name = "Fm4UiSceneStep"
+registers = ["f31"]
+
+# The showroom's update has just loaded 1/60 s as its camera queue's step
+# (lfs f1 at 0x824BDCE0, before the virtual call through camera +0xC).
+# 1.0: 0x824B9D84.
+[[midasm_hook]]
+address = 0x824BDCE4
+name = "Fm4ShowroomCameraStep"
+registers = ["f1"]
+
 # Byte-indexed computed branch, guarded by cmplwi r3,9. Automatic
 # discovery scanned beyond its ten entries into adjacent byte data.
 [[switch_tables]]
