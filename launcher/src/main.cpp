@@ -1588,6 +1588,13 @@ void TabGraphics(App& app) {
   if(s.experimental_120fps) {
     TextColored(kWarn, "Experimental");
   }
+  if (s.vsync) {
+    // Vulkan's FIFO presentation goes through the desktop compositor on
+    // Nvidia: no variable refresh rate, so 60 or 120 FPS judder on a 144 or
+    // 165 Hz display.
+    TextDim(L("With G-Sync or FreeSync, turn VSync off: the variable refresh rate keeps every frame even.",
+              "Con G-Sync o FreeSync, desactiva VSync: la frecuencia variable mantiene todos los fotogramas regulares."));
+  }
   EndCard();
 
   BeginCard("##quality", L("Image quality", "Calidad de imagen"));

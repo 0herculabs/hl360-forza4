@@ -6,7 +6,8 @@ vsync = false
 video_mode_width = 1280
 video_mode_height = 720
 video_mode_refresh_rate = 60.0
-host_present_fps_limit = 60
+# The guest vblank paces the frames; a host limit would be a second clock.
+host_present_fps_limit = 0
 # FM4 steps once per guest vblank. ShiftGlue's default (FH1, which waits two)
 # is twice the render limit: 120 Hz made FM4's menus and showroom run at
 # double speed and the frames it produced uneven against a 60 Hz present.
