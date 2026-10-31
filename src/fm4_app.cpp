@@ -27,10 +27,21 @@ REXCVAR_DEFINE_STRING(profile_name, "", "FM4/Profile",
 REXCVAR_DEFINE_STRING(profile_xuid, "", "FM4/Profile",
                       "Offline XUID of the signed-in profile, 16 hex digits");
 
-REXCVAR_DEFINE_STRING(gpu_backend, "d3d12", "FM4/Graphics",
-                      "Graphics backend for the xenos GPU plugin: any, d3d12, vulkan")
+// The SDK's GPU plugin (CMake picks it): ShiftGlue's fh1 renderer, whose
+// Vulkan backend draws FM4 best, or ReXGlue's xenos.
+#ifndef FM4_GPU_PLUGIN
+#define FM4_GPU_PLUGIN "xenos"
+#endif
+
+#ifdef FM4_SDK_DEFINES_GPU_BACKEND
+// ShiftGlue's ReXApp defines it (default any); fm4.toml selects vulkan.
+REXCVAR_DECLARE(std::string, gpu_backend);
+#else
+REXCVAR_DEFINE_STRING(gpu_backend, "vulkan", "FM4/Graphics",
+                      "Graphics backend for the GPU plugin: any, d3d12, vulkan")
     .allowed({"any", "d3d12", "vulkan"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#endif
 
 REXCVAR_DEFINE_BOOL(crash_test, false, "FM4/Debug",
                     "Crash on purpose after startup to test the crash report")
@@ -86,12 +97,12 @@ void Fm4App::OnPreSetup(rex::RuntimeConfig& config) {
   if (config.graphics || !config.gpu_plugin.empty()) {
     return;  // --gpu_plugin given explicitly; let ReXApp load it.
   }
-  config.graphics = rex::system::LoadGpuPlugin("xenos", REXCVAR_GET(gpu_backend));
+  config.graphics = rex::system::LoadGpuPlugin(FM4_GPU_PLUGIN, REXCVAR_GET(gpu_backend));
   if (!config.graphics) {
     // Fall back to ReXApp's loader, which reports the failure to the user.
     REXLOG_ERROR("Could not create the '{}' backend, retrying with any",
                  REXCVAR_GET(gpu_backend));
-    config.gpu_plugin = "xenos";
+    config.gpu_plugin = FM4_GPU_PLUGIN;
   }
 }
 

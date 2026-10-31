@@ -3,7 +3,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$BuildDir = "out\build\win-amd64-release",
-    [string]$SdkSource = "thirdparty\sdk-src"
+    [string]$SdkSource = "thirdparty\shiftglue-src"
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -38,7 +38,8 @@ Get-ChildItem doc -File -Filter *.md | Copy-Item -Destination "$dest\doc"
 Get-ChildItem doc\img -File | Copy-Item -Destination "$dest\doc\img"
 
 # Third-party licences.
-Copy-Item (Join-Path $SdkSource "LICENSE") "$dest\licenses\ReXGlue-SDK.txt"
+$sdkName = if ($SdkSource -match "shiftglue") { "ShiftGlue-SDK.txt" } else { "ReXGlue-SDK.txt" }
+Copy-Item (Join-Path $SdkSource "LICENSE") "$dest\licenses\$sdkName"
 Copy-Item (Join-Path $SdkSource "thirdparty\sdl3\LICENSE.txt") "$dest\licenses\SDL3\LICENSE.txt"
 
 # Checksums of every packaged file, then the archive and its own checksum.

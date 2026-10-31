@@ -273,8 +273,8 @@ bool Settings::Load(const std::filesystem::path& file) {
   graphics_preset = 3;
   ReadInt(t, "graphics_preset", graphics_preset);
   graphics_preset = std::clamp(graphics_preset, 0, 3);
-  // Vulkan renders FM4 incorrectly: always D3D12 (drops stale values).
-  gpu_backend = "d3d12";
+  // ShiftGlue's Vulkan backend draws FM4 best: always Vulkan (drops stale values).
+  gpu_backend = "vulkan";
   Read(t, "swap_post_effect", swap_post_effect);
   Read(t, "present_effect", present_effect);
   // Xenia profile baseline: default 720p guest mode, independent of output size.
@@ -316,6 +316,11 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("window_width", window_width);
   t.insert("window_height", window_height);
   t.insert("vsync", vsync);
+  // Vulkan picks its presentation mode itself: VSync on allows only FIFO.
+  if (gpu_backend == "vulkan") {
+    for (const char* mode : {"immediate", "mailbox", "fifo_relaxed"})
+      t.insert(std::string("vulkan_allow_present_mode_") + mode, !vsync);
+  }
   t.insert("present_letterbox", present_letterbox);
   t.insert("display_wide_view", display_wide_view);
   t.insert("display_hud_edges", display_hud_edges);
@@ -335,6 +340,8 @@ bool Settings::Save(const std::filesystem::path& file) const {
 
   t.insert("input_backend", input_backend);
   t.insert("video_mode_refresh_rate", experimental_120fps?120.0:60.0);
+  // The host presenter has its own limit; at 60 it capped the 120 FPS mode.
+  t.insert("host_present_fps_limit", experimental_120fps?120:60);
   WriteWheel(t, wheel);
   t.insert("mnk_mode", mnk_mode);
   t.insert("mnk_mouse", mnk_mouse);

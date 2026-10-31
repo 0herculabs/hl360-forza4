@@ -42,7 +42,18 @@ else()
     add_executable(fm4 ${FM4_SOURCES})
 endif()
 
-rexglue_setup_target(fm4 GPU_PLUGINS xenos)
+# ShiftGlue ships its renderer as rexgpu-fh1, whose Vulkan backend draws FM4
+# best; the upstream ReXGlue SDK ships rexgpu-xenos.
+if(TARGET rex::gpu-fh1 OR TARGET rexgpu-fh1)
+    set(FM4_GPU_PLUGIN fh1)
+else()
+    set(FM4_GPU_PLUGIN xenos)
+endif()
+rexglue_setup_target(fm4 GPU_PLUGINS ${FM4_GPU_PLUGIN})
+target_compile_definitions(fm4 PRIVATE FM4_GPU_PLUGIN="${FM4_GPU_PLUGIN}")
+if(FM4_GPU_PLUGIN STREQUAL "fh1")
+    target_compile_definitions(fm4 PRIVATE FM4_SDK_DEFINES_GPU_BACKEND)
+endif()
 
 if(WIN32)
     target_compile_options(fm4 PRIVATE -gline-tables-only)

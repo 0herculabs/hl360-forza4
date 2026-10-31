@@ -1343,8 +1343,8 @@ void TabInstructions(App& app) {
   BeginCard("##quickstart",L("Getting started", "Primeros pasos"),
       L("Install your discs, choose a profile and play. Project Forza Plus 4 and wheel support are optional.",
         "Instala tus discos, elige un perfil y juega. Project Forza Plus 4 y el volante son opcionales."));
-  ImGui::TextWrapped("%s",L("Keep the launcher, executables and DLLs together. A short folder such as C:\\Games\\FM4 helps avoid long paths. Requires a Direct3D 12 GPU and the Visual C++ 2015-2022 x64 runtime.",
-      "Mantén el launcher, los ejecutables y las DLL juntos. Una carpeta corta como C:\\Games\\FM4 evita problemas de rutas largas. Requiere una GPU Direct3D 12 y Visual C++ 2015-2022 x64."));
+  ImGui::TextWrapped("%s",L("Keep the launcher, executables and DLLs together. A short folder such as C:\\Games\\FM4 helps avoid long paths. Requires a Vulkan GPU and the Visual C++ 2015-2022 x64 runtime.",
+      "Mantén el launcher, los ejecutables y las DLL juntos. Una carpeta corta como C:\\Games\\FM4 evita problemas de rutas largas. Requiere una GPU Vulkan y Visual C++ 2015-2022 x64."));
   EndCard();
   BeginCard("##compatibleisos",L("1. Compatible disc images", "1. Imágenes de disco compatibles"));
   ImGui::TextWrapped("%s",L("Forza Motorsport 4 - USA, Rev 1 (multilanguage). Extract the .iso from its ZIP before selecting it. The MD5 values below identify the ISO contents, not the ZIP archive.",

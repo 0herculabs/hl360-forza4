@@ -74,7 +74,7 @@ endfunction()
 
 # Configure a rexglue target with SDK libraries and platform settings.
 # Call after add_executable() in your CMakeLists.txt.
-# Usage: rexglue_setup_target(<target> [GPU_PLUGINS xenos])
+# Usage: rexglue_setup_target(<target> [GPU_PLUGINS fh1])
 macro(rexglue_setup_target target_name)
     if(REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
         add_library(${target_name}_recomp OBJECT

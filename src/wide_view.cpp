@@ -52,6 +52,9 @@ void Present(bool wide) {
   const float scale = wide ? g_scale.load() : 1.0f;
   rex::cvar::SetFlagByName("present_letterbox", wide ? "false" : "true");
   rex::cvar::SetFlagByName("hud_squeeze", fmt::format("{:.6f}", scale));
+  // ShiftGlue's renderers (Vulkan included) have only the centred squeeze,
+  // under its FH1 name; whichever the SDK lacks is ignored.
+  rex::cvar::SetFlagByName("fh1_hud_squeeze", fmt::format("{:.6f}", scale));
   // Edges: HUD elements in the outer thirds of the 16:9 image keep their size
   // but move with the window's left and right edges.
   rex::cvar::SetFlagByName("hud_squeeze_edges", REXCVAR_GET(display_hud_edges) ? "true" : "false");

@@ -53,7 +53,7 @@ struct Settings {
   bool experimental_120fps = false;
 
   // Quality
-  std::string gpu_backend = "d3d12";  // d3d12 | vulkan
+  std::string gpu_backend = "vulkan";  // d3d12 | vulkan
   int resolution_scale = 2;      // internal render scale over 1280x720
   int anisotropic_override = 4;  // 0..5 = off,1x,2x,4x,8x,16x
   std::string swap_post_effect = "none";    // none | fxaa | fxaa_extreme

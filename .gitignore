@@ -28,3 +28,5 @@ Thumbs.db
 /generated/default.dll_manifest.h
 /generated/dll_targets.cmake
 /thirdparty/sdk-src/
+/thirdparty/shiftglue-src/
+/thirdparty/sdk-shiftglue/
