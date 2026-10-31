@@ -1,5 +1,5 @@
 # Packages a release build into out/releases/FM4-<version>-windows-x64.zip.
-# Usage: powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -Version v0.4.0
+# Usage: powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -Version v0.3.10
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$BuildDir = "out\build\win-amd64-release",
