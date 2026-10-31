@@ -11,7 +11,14 @@ ReXGlue fork), GPU plugin `rexgpu-fh1`. The pinned revision is the one
   0005 (module unload path), 0007 (Vulkan depth bias control),
   0008 (restore the desktop before the hard exit), 0009 (presentation
   diagnostics) and the `video_mode_from_window` part of 0006. ShiftGlue
-  already reuses import thunks (the rest of 0006 is D3D12 only).
+  already reuses import thunks.
+- The wide-screen HUD of 0006 (D3D12) ported to the Vulkan renderer:
+  `hud_squeeze_edges`, `hud_squeeze_edges_threshold` and
+  `hud_squeeze_vertex_shaders` beside ShiftGlue's centred `fh1_hud_squeeze`.
+  Elements drawn on their own (the minimap) are squeezed towards their edge
+  with their scissor; HUD layers over the whole image are placed per vertex in
+  the vertex shader (`SystemConstants::hud_edges`) where D3D12 uses a geometry
+  shader per triangle.
 
 ## Building
 

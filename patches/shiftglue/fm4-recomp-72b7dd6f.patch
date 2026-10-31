@@ -1,4 +1,53 @@
-﻿diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+﻿diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 3021d919..820ddc08 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -333,8 +333,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     float tessellation_factor_range_min;
+     float tessellation_factor_range_max;
+ 
++    // fm4-recomp: hud_squeeze_edges for a HUD layer over the whole image -
++    // 1 / squeeze (0: off) and the threshold in NDC beyond which a vertex
++    // keeps its size at the left or right edge instead of the centre.
++    float hud_edges[2];
++
+     // UP-1.7: the slot pixel shaders with object_slot_output write, and the
+     // row of the full frame the surface's first row is (predicated tiles).
++    // Last: shaders without the slot image leave these two out.
+     uint32_t object_slot;
+     int32_t object_row_offset;
+   };
+@@ -972,6 +978,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     kSystemConstantEdramRTKeepMask,
+     kSystemConstantEdramRTClamp,
+     kSystemConstantEdramBlendConstant,
++    kSystemConstantHudEdges,
+     kSystemConstantObjectSlot,
+     kSystemConstantObjectRowOffset,
+   };
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 9caf082c..0c4a9f44 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -1582,9 +1582,17 @@ class VulkanCommandProcessor : public CommandProcessor {
+     uint32_t resolution_scale = 0;
+     double hud_squeeze = 0.0;
+     double hud_scale = 0.0;
++    float hud_anchor = -1.0f;
+     draw_util::ViewportInfo info;
+   };
+   std::unique_ptr<ViewportMemo[]> viewport_memos_{new ViewportMemo[kStateMemoCount]};
++  // fm4-recomp: the current draw's HUD squeeze in host pixels (anchor < 0:
++  // none), applied to its scissor in UpdateDynamicState.
++  float hud_scissor_anchor_ = -1.0f;
++  float hud_scissor_squeeze_ = 1.0f;
++  // 1 / squeeze for a whole-image HUD layer the vertex shader places
++  // (SystemConstants::hud_edges), 0 for every other draw.
++  float hud_edges_inverse_ = 0.0f;
+ 
+   // NA-2.4 owned draw programs (vulkan_draw_program.cpp, gpu_d3d_program):
+   // for each run of a pilot list (by buffer and the state it starts in), the
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
 index 480adeda..97dcd59a 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
 +++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
@@ -136,8 +185,63 @@ index 5df85337..3facdc27 100644
    SafeAreaInsets GetSafeAreaInsets() const override;
    void ApplyConfiguredSizeAndMonitor() override;
    bool SetRelativeMouseMode(bool enable) override;
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 829de852..d6db71e8 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -463,6 +463,7 @@ void SpirvShaderTranslator::StartTranslation() {
+       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
+       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
+       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
++      {"hud_edges", offsetof(SystemConstants, hud_edges), type_float2_},
+       {"object_slot", offsetof(SystemConstants, object_slot), type_uint_},
+       {"object_row_offset", offsetof(SystemConstants, object_row_offset), type_int_},
+   };
+@@ -2864,6 +2865,42 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
+   position_xyz =
+       builder_->createNoContractionBinOp(spv::OpFAdd, type_float3_, position_xyz, ndc_offset_mul_w);
+ 
++  // fm4-recomp: hud_squeeze_edges for a HUD layer over the whole image (the
++  // D3D12 port does this per triangle in a geometry shader): each vertex is
++  // narrowed by the squeeze towards the centre, or, beyond the threshold, kept
++  // in place relative to its own (left or right) edge. hud_edges.x is 0 for
++  // every other draw, which leaves x as it is.
++  {
++    id_vector_temp_.clear();
++    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantHudEdges));
++    const spv::Id hud_edges = builder_->createLoad(
++        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                    id_vector_temp_),
++        spv::NoPrecision);
++    const spv::Id inverse = builder_->createCompositeExtract(hud_edges, type_float_, 0);
++    const spv::Id threshold = builder_->createCompositeExtract(hud_edges, type_float_, 1);
++    const spv::Id x = builder_->createCompositeExtract(position_xyz, type_float_, 0);
++    const spv::Id x_ndc = builder_->createBinOp(spv::OpFDiv, type_float_, x, position_w);
++    const spv::Id centre = builder_->createBinOp(spv::OpFMul, type_float_, x_ndc, inverse);
++    const spv::Id inverse_minus_1 =
++        builder_->createBinOp(spv::OpFSub, type_float_, inverse, const_float_1_);
++    const spv::Id left = builder_->createBinOp(spv::OpFAdd, type_float_, centre, inverse_minus_1);
++    const spv::Id right = builder_->createBinOp(spv::OpFSub, type_float_, centre, inverse_minus_1);
++    const spv::Id beyond_left = builder_->createBinOp(
++        spv::OpFOrdLessThan, type_bool_, x_ndc,
++        builder_->createUnaryOp(spv::OpFNegate, type_float_, threshold));
++    const spv::Id beyond_right =
++        builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, x_ndc, threshold);
++    spv::Id placed = builder_->createTriOp(spv::OpSelect, type_float_, beyond_right, right, centre);
++    placed = builder_->createTriOp(spv::OpSelect, type_float_, beyond_left, left, placed);
++    const spv::Id enabled =
++        builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, inverse, const_float_0_);
++    const spv::Id new_x = builder_->createTriOp(
++        spv::OpSelect, type_float_, enabled,
++        builder_->createBinOp(spv::OpFMul, type_float_, placed, position_w), x);
++    position_xyz = builder_->createCompositeInsert(new_x, position_xyz, type_float3_, 0);
++  }
++
+   spv::Id kill_vertex = spv::NoResult;
+   if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b100) {
+     assert_true(var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult);
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 1f793d57..5e203827 100644
+index 1f793d57..93a2db08 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -198,6 +198,9 @@ REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_worker, true, "GPU/Vulkan",
@@ -150,7 +254,172 @@ index 1f793d57..5e203827 100644
  REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                      "Read render-to-texture results on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -9755,6 +9758,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -229,6 +232,21 @@ REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU",
+     .range(1.0, 4.0)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ #endif
++// fm4-recomp: wide-screen HUD placement, after hl360-forza4's D3D12 patch 0006.
++REXCVAR_DEFINE_BOOL(hud_squeeze_edges, false, "GPU",
++                    "With fh1_hud_squeeze: HUD elements drawn on their own in the outer parts "
++                    "of the image keep their size at the window's left or right edge")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_DOUBLE(hud_squeeze_edges_threshold, 1.0 / 3.0, "GPU",
++                      "hud_squeeze_edges: elements wholly beyond this fraction of the half width "
++                      "from the centre move to the edges")
++    .range(0.0, 1.0)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_STRING(hud_squeeze_vertex_shaders, "", "GPU",
++                      "Also narrow draws by these vertex shaders (ucode hashes, hex, comma "
++                      "separated) with fh1_hud_squeeze: screen-space overlays drawn into the "
++                      "scene (FM4's virtual mirror)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_DOUBLE(fh1_hud_scale, 1.0, "GPU",
+                       "Vulkan: scale of FH1's HUD around the screen centre, over a game world "
+                       "(menus without one keep their size)")
+@@ -336,6 +354,66 @@ namespace rex::graphics::vulkan {
+ 
+ namespace {
+ 
++// hud_squeeze_vertex_shaders, parsed when it changes.
++bool SqueezesVertexShader(uint64_t hash) {
++  static std::mutex mutex;
++  static std::string parsed_from;
++  static std::vector<uint64_t> hashes;
++  const std::string& value = REXCVAR_GET(hud_squeeze_vertex_shaders);
++  if (value.empty()) return false;
++  std::lock_guard lock(mutex);
++  if (value != parsed_from) {
++    parsed_from = value;
++    hashes.clear();
++    size_t start = 0;
++    while (start < value.size()) {
++      size_t end = value.find(',', start);
++      if (end == std::string::npos) end = value.size();
++      const std::string item = value.substr(start, end - start);
++      if (!item.empty()) hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
++      start = end + 1;
++    }
++  }
++  return std::find(hashes.begin(), hashes.end(), hash) != hashes.end();
++}
++
++// HudSqueezeAnchor: a whole-image HUD layer the vertex shader places.
++constexpr float kHudEdgesInShader = -2.0f;
++
++// Where fh1_hud_squeeze narrows a draw, as a point in guest pixels of the
++// image it squeezes towards: its centre, or with hud_squeeze_edges the left
++// (0) or right (image width) edge for an element drawn on its own in the outer
++// parts (FM4's minimap and speedometer). Negative: not squeezed. A layer over
++// the whole image stays centred (D3D12 splits it per triangle).
++float HudSqueezeAnchor(const RegisterFile& regs, uint64_t vertex_shader_hash,
++                       uint32_t normalized_color_mask, double hud_squeeze, bool triangles) {
++  if (hud_squeeze <= 1.0 || !normalized_color_mask) return -1.0f;
++  const float image = float(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch);
++  if (SqueezesVertexShader(vertex_shader_hash)) return 0.5f * image;
++  if (regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format !=
++      xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
++    return -1.0f;
++  }
++  if (!REXCVAR_GET(hud_squeeze_edges)) return 0.5f * image;
++  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
++  if (!vte.vport_x_scale_ena || !vte.vport_x_offset_ena) return 0.5f * image;
++  const float scale = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE));
++  const float offset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
++  draw_util::Scissor scissor;
++  draw_util::GetScissor(regs, scissor);
++  const bool whole = offset - scale <= 1.0f && offset + scale >= image - 1.0f &&
++                     scissor.offset[0] == 0 && float(scissor.extent[0]) >= image;
++  // A layer over the whole image: placed per vertex in the shader (hud_edges),
++  // when it is triangles.
++  if (whole) return triangles ? kHudEdgesInShader : 0.5f * image;
++  const float left = std::max(offset - scale, float(scissor.offset[0]));
++  const float right = std::min(offset + scale, float(scissor.offset[0] + scissor.extent[0]));
++  const float threshold = float(REXCVAR_GET(hud_squeeze_edges_threshold));
++  if (right <= image * 0.5f * (1.0f - threshold)) return 0.0f;
++  if (left >= image * 0.5f * (1.0f + threshold)) return image;
++  return 0.5f * image;
++}
++
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     /* .maxLights = */ 32,
+@@ -7150,6 +7228,19 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
+   // only for HUD draws over this frame's scene (fh1_native_executor).
+   const double hud_scale = hud_scale_now();
+   const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
++  // fm4-recomp: where the HUD squeeze anchors this draw, in guest pixels
++  // (negative: not squeezed); the scissor follows in UpdateDynamicState.
++  const float hud_anchor =
++      HudSqueezeAnchor(regs, vertex_shader->ucode_data_hash(), normalized_color_mask, hud_squeeze,
++                       primitive_processing_result.host_vertex_shader_type ==
++                               Shader::HostVertexShaderType::kVertex &&
++                           (primitive_processing_result.host_primitive_type ==
++                                xenos::PrimitiveType::kTriangleList ||
++                            primitive_processing_result.host_primitive_type ==
++                                xenos::PrimitiveType::kTriangleStrip));
++  hud_scissor_anchor_ = hud_anchor >= 0.0f ? hud_anchor * float(draw_resolution_scale_x) : -1.0f;
++  hud_scissor_squeeze_ = float(hud_squeeze);
++  hud_edges_inverse_ = hud_anchor == kHudEdgesInShader ? float(1.0 / hud_squeeze) : 0.0f;
+   if (program_hit) {
+     viewport_info = program_draw->viewport;
+   } else {
+@@ -7161,7 +7252,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
+         viewport_memo.depth_control == normalized_depth_control.value &&
+         viewport_memo.color_mask == normalized_color_mask &&
+         viewport_memo.resolution_scale == viewport_resolution_scale &&
+-        viewport_memo.hud_squeeze == hud_squeeze && viewport_memo.hud_scale == hud_scale) {
++        viewport_memo.hud_squeeze == hud_squeeze && viewport_memo.hud_scale == hud_scale &&
++        viewport_memo.hud_anchor == hud_anchor) {
+       viewport_info = viewport_memo.info;
+     } else {
+       draw_util::GetHostViewportInfo(
+@@ -7172,11 +7264,17 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
+           host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+       // FH1's HUD under Hor+, as on D3D12 (fh1_hud_squeeze): its draws into the
+       // front buffer's 2_10_10_10_AS_10_10_10_10 view keep 16:9 proportions.
+-      if (hud_squeeze > 1.0 && normalized_color_mask &&
+-          regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format ==
+-              xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) {
+-        viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
+-        viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
++      // fm4-recomp: every pixel x moves to anchor + (x - anchor) / squeeze; k is
++      // the anchor in the host viewport's NDC (0 for the centre of a whole-image
++      // viewport, the old centred squeeze).
++      if (hud_anchor >= 0.0f) {
++        const float squeeze = float(hud_squeeze);
++        const float extent = float(viewport_info.xy_extent[0]);
++        const float k = extent > 0.0f ? 2.0f * (hud_anchor * float(draw_resolution_scale_x) -
++                                                float(viewport_info.xy_offset[0])) / extent - 1.0f
++                                      : 0.0f;
++        viewport_info.ndc_scale[0] = viewport_info.ndc_scale[0] / squeeze;
++        viewport_info.ndc_offset[0] = viewport_info.ndc_offset[0] / squeeze + (1.0f - 1.0f / squeeze) * k;
+       }
+       if (hud_scale != 1.0) {
+         for (uint32_t i = 0; i < 2; ++i) {
+@@ -7191,6 +7289,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
+       viewport_memo.resolution_scale = viewport_resolution_scale;
+       viewport_memo.hud_squeeze = hud_squeeze;
+       viewport_memo.hud_scale = hud_scale;
++      viewport_memo.hud_anchor = hud_anchor;
+       viewport_memo.info = viewport_info;
+     }
+   }
+@@ -9733,6 +9832,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+   scissor.offset[1] *= draw_resolution_scale_y;
+   scissor.extent[0] *= draw_resolution_scale_x;
+   scissor.extent[1] *= draw_resolution_scale_y;
++  // fm4-recomp: a squeezed HUD draw's scissor moves with it.
++  if (hud_scissor_anchor_ >= 0.0f && hud_scissor_squeeze_ > 1.0f) {
++    const float anchor = hud_scissor_anchor_, squeeze = hud_scissor_squeeze_;
++    const float left = anchor + (float(scissor.offset[0]) - anchor) / squeeze;
++    const float right = anchor + (float(scissor.offset[0] + scissor.extent[0]) - anchor) / squeeze;
++    scissor.offset[0] = uint32_t(std::max(0.0f, std::floor(left)));
++    scissor.extent[0] = uint32_t(std::max(0.0f, std::ceil(right) - float(scissor.offset[0])));
++  }
+   if (untile_tiling_) {
+     scissor.offset[0] = uint32_t(int32_t(scissor.offset[0]) -
+                                  pa_sc_window_offset.window_x_offset *
+@@ -9755,6 +9862,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
  
    if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
      // Depth bias.
@@ -161,7 +430,7 @@ index 1f793d57..5e203827 100644
      float depth_bias_constant_factor, depth_bias_slope_factor;
      draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
                                               depth_bias_constant_factor);
-@@ -9762,6 +9769,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -9762,6 +9873,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
          regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
              ? draw_util::kD3D10PolygonOffsetFactorUnorm24
              : draw_util::kD3D10PolygonOffsetFactorFloat24;
@@ -172,7 +441,7 @@ index 1f793d57..5e203827 100644
      // With non-square resolution scaling, make sure the worst-case impact is
      // reverted (slope only along the scaled axis), thus max. More bias is
      // better than less bias, because less bias means Z fighting with the
-@@ -9778,8 +9789,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+@@ -9778,8 +9893,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
      if (dynamic_depth_bias_update_needed_) {
        dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
        dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
@@ -189,6 +458,23 @@ index 1f793d57..5e203827 100644
        dynamic_depth_bias_update_needed_ = false;
      }
  
+@@ -9966,6 +10087,16 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+     system_constants_.object_row_offset = object_row_offset;
+   }
+ 
++  // fm4-recomp: hud_squeeze_edges for a whole-image HUD layer, per draw.
++  {
++    const float threshold =
++        hud_edges_inverse_ > 0.0f ? float(REXCVAR_GET(hud_squeeze_edges_threshold)) : 0.0f;
++    dirty |= system_constants_.hud_edges[0] != hud_edges_inverse_ ||
++             system_constants_.hud_edges[1] != threshold;
++    system_constants_.hud_edges[0] = hud_edges_inverse_;
++    system_constants_.hud_edges[1] = threshold;
++  }
++
+   // Texture host swizzle in the shader.
+   if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+     uint32_t textures_remaining = used_texture_mask;
 diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
 index c7f8abb6..4f345b9f 100644
 --- a/src/graphics/vulkan/deferred_command_buffer.cpp

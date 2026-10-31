@@ -5,7 +5,8 @@
 // wider horizontal field of view into its 16:9 image, and the presenter
 // stretches that image over the window: the world keeps its proportions and
 // the sides show more of it. The HUD is narrowed back to its proportions by
-// the SDK (hud_squeeze).
+// the SDK: hud_squeeze on ReXGlue's D3D12, fh1_hud_squeeze on ShiftGlue's
+// renderers, hud_squeeze_edges on both (patches/shiftglue).
 //
 // sub_822B5E08 returns a viewport's width / height (FH1 sub_823E22C8,
 // identical). The main view's setup (sub_822CA758) passes it to the camera

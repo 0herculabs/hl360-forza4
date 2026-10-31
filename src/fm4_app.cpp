@@ -148,6 +148,12 @@ void Fm4App::OnPostSetup() {
   }
   MountCachePartition(runtime(), user_data_root());
   fm4::StartDebugCapture(window(), runtime()->graphics_system());
+  if (window()) {
+    REXLOG_INFO("Window: {}x{}{} (fullscreen {}, window_width {}, window_height {})",
+                window()->GetActualPhysicalWidth(), window()->GetActualPhysicalHeight(),
+                window()->IsFullscreen() ? " fullscreen" : "", rex::cvar::Query<bool>("fullscreen"),
+                rex::cvar::Query<int32_t>("window_width"), rex::cvar::Query<int32_t>("window_height"));
+  }
 
   auto* profile = runtime()->kernel_state()->user_profile();
 
