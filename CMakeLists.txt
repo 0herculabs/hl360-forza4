@@ -37,7 +37,8 @@ set(FM4_SOURCES
 )
 
 if(WIN32)
-    add_executable(fm4 WIN32 ${FM4_SOURCES})
+    enable_language(RC)
+    add_executable(fm4 WIN32 ${FM4_SOURCES} resources/fm4.rc)
 else()
     add_executable(fm4 ${FM4_SOURCES})
 endif()
@@ -53,6 +54,14 @@ rexglue_setup_target(fm4 GPU_PLUGINS ${FM4_GPU_PLUGIN})
 target_compile_definitions(fm4 PRIVATE FM4_GPU_PLUGIN="${FM4_GPU_PLUGIN}")
 if(FM4_GPU_PLUGIN STREQUAL "fh1")
     target_compile_definitions(fm4 PRIVATE FM4_SDK_DEFINES_GPU_BACKEND)
+    # DLSS and FSR 2/3 runtimes, kept in the SDK install (patches/shiftglue/README.md);
+    # the renderer loads them from upscalers/ beside the executable.
+    get_filename_component(FM4_SDK_PREFIX "${rexglue_DIR}/../../.." ABSOLUTE)
+    if(EXISTS "${FM4_SDK_PREFIX}/upscalers")
+        add_custom_command(TARGET fm4 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${FM4_SDK_PREFIX}/upscalers" "$<TARGET_FILE_DIR:fm4>/upscalers")
+    endif()
 endif()
 
 if(WIN32)
@@ -76,6 +85,7 @@ find_package(SDL3 REQUIRED CONFIG)
 add_executable(fm4-wheel-probe tools/wheel_probe.cpp src/wheel.cpp src/wheel_mapping.cpp)
 target_link_libraries(fm4-wheel-probe PRIVATE SDL3::SDL3-static)
 add_executable(fm4-launcher WIN32
+    resources/fm4.rc
     launcher/src/main.cpp
     launcher/src/graphics_fixes.cpp
     launcher/src/installer.cpp

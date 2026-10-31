@@ -28,13 +28,27 @@ files; replace each with the file it names before building. Then, from a
 `scripts\devenv.cmd` prompt:
 
 ```bat
-cmake --preset win-amd64 -DCMAKE_INSTALL_PREFIX=<repo>/thirdparty/sdk-shiftglue -DREXGLUE_ENABLE_TRACY=OFF
+cmake --preset win-amd64 -DCMAKE_INSTALL_PREFIX=<repo>/thirdparty/sdk-shiftglue -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_USE_VULKAN=ON
+```
+
+`REXGLUE_USE_VULKAN` is off by default on Windows: without it `rexgpu-fh1`
+has only D3D12 and the game fails to start ("requested backend 'vulkan' is
+not compiled into this plugin").
+
+```bat
 cmake --build --preset win-amd64-release
 cmake --install out/build/win-amd64 --config Release
 ```
 
 The SDK downloads NVIDIA's DLSS runtime and AMD's FidelityFX headers at
-configure time, checked by SHA-256. `scripts\build.cmd` uses
+configure time, checked by SHA-256. The installed SDK does not stage them for
+an external game, so copy them into the install, where CMake picks them up
+and copies them beside fm4.exe:
+
+- `upscalers/dlss/310.9.16/`: `out/build/win-amd64/nvidia-dlss-runtime/`
+  `nvngx_dlss.dll` and `LICENSE.txt`.
+- `upscalers/fidelityfx/1.1.4/`: `out/build/win-amd64/ffx-api-headers/runtime/`
+  `amd_fidelityfx_vk.dll` and `thirdparty/fidelityfx-vk/LICENSE.txt`. `scripts\build.cmd` uses
 `thirdparty\sdk-shiftglue` when it exists. Regenerate the guest code with
 this SDK's `rexglue.exe codegen fm4_manifest.toml` after changing revision.
 

@@ -28,6 +28,10 @@ Get-ChildItem $build -File | Where-Object {
 foreach ($f in "fm4.toml", "game_files.sha256", "install-forza-plus.ps1", "uninstall-forza-plus.ps1") {
     Copy-Item (Join-Path $build $f) $dest
 }
+# DLSS and FSR 2/3 runtimes with NVIDIA's and AMD's licences.
+if (Test-Path (Join-Path $build "upscalers")) {
+    Copy-Item -Recurse (Join-Path $build "upscalers") $dest
+}
 Set-Content -Encoding ascii "$dest\launch.cmd" "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"`" `"%~dp0fm4-launcher.exe`""
 
 # Documentation.

@@ -1,0 +1,3 @@
+// The game's and the launcher's icon. Explorer and SDL (window and taskbar)
+// use an executable's first icon.
+1 ICON "fm4.ico"

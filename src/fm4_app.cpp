@@ -20,6 +20,9 @@
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+#ifdef FM4_SDK_DEFINES_GPU_BACKEND
+#include <rex/ui/overlay/debug_overlay.h>
+#endif
 #include <rex/ui/overlay/achievement_notification.h>
 
 REXCVAR_DEFINE_STRING(profile_name, "", "FM4/Profile",
@@ -85,6 +88,11 @@ void Fm4App::OnPostInitLogging() {
 }
 
 void Fm4App::OnPreSetup(rex::RuntimeConfig& config) {
+#ifdef FM4_SDK_DEFINES_GPU_BACKEND
+  // ShiftGlue titles the window with the host's build label (else the SDK's
+  // name and build stamp).
+  rex::ui::SetBuildLabel("Forza Motorsport 4");
+#endif
   config.input_factory = fm4::wheel::CreateInputSystem;
   config.audio_factory = [](rex::runtime::FunctionDispatcher* dispatcher) {
     return std::make_unique<fm4::OutputSystem>(dispatcher);

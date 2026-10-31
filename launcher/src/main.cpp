@@ -3066,7 +3066,7 @@ int main(int argc, char** argv) {
     window_w = std::min(window_w, usable.w * 95 / 100);
     window_h = std::min(window_h, usable.h * 92 / 100);
   }
-  app.window = SDL_CreateWindow("Forza Motorsport 4", window_w, window_h,
+  app.window = SDL_CreateWindow("Forza Motorsport 4 Launcher", window_w, window_h,
                                 SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
   SDL_SetWindowMinimumSize(app.window, std::min(window_w, int(S(900))), std::min(window_h, int(S(480))));
   // The SDK's SDL3 is built without the 2D renderer; SDL_GPU (D3D12 on
