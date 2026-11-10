@@ -116,6 +116,15 @@ The adaptation uses separate `.fm4-plus` folders under the selected game and use
 
 With Forza Plus active, selecting 120 FPS applies the supplied physics profile (`CarPhysicsUpdateHz 695`, `TimeScale 1`) when pressing Play. Returning to 60 FPS restores the previous physics file on Play. Extra FOV and harder-AI options are not currently exposed in the launcher. Full compatibility with every mod feature is not established. See [integration and uninstall details](doc/forza-plus.md).
 
+## Cheats
+
+The launcher's **Cheats** tab has two options, applied from the next game start:
+
+- **Set credits at start** sets the active profile's credits to the chosen amount (at most 20,000,000, the most the game keeps when it loads a profile). While it is on, the amount is set again at every start, replacing what was earned or spent.
+- **Unicorn cars** puts the 17 cars that were only gifts on the Xbox 360 in the dealer, under their make and at their normal price.
+
+Back up your profile before using them. See [src/cheats.cpp](src/cheats.cpp) for how they work.
+
 ## Gameplay screenshots
 
 | On track | Garage |

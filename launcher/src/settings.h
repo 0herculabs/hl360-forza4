@@ -94,6 +94,12 @@ struct Settings {
   bool audio_mute = false;
   std::string audio_output_mode = "auto";
 
+  // Cheats (src/cheats.cpp): the profile's credits are set at every game
+  // start while cheat_set_credits is on.
+  bool cheat_set_credits = false;
+  int cheat_credits = 1000000;  // 0..20,000,000, the most a profile keeps
+  bool cheat_unicorn_dealer = false;
+
   Settings();
   // The keyboard pad's keys, or the camera's.
   void ResetBinds(bool camera = false);

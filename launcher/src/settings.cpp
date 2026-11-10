@@ -323,6 +323,10 @@ bool Settings::Load(const std::filesystem::path& file) {
   Read(t, "audio_output_mode", audio_output_mode);
   if (audio_output_mode != "auto" && audio_output_mode != "stereo" && audio_output_mode != "surround")
     audio_output_mode = "auto";
+  Read(t, "cheat_set_credits", cheat_set_credits);
+  ReadInt(t, "cheat_credits", cheat_credits);
+  cheat_credits = std::clamp(cheat_credits, 0, 20000000);
+  Read(t, "cheat_unicorn_dealer", cheat_unicorn_dealer);
   return true;
 }
 
@@ -392,6 +396,9 @@ bool Settings::Save(const std::filesystem::path& file) const {
   t.insert("frame_stats", false);
   t.insert("audio_mute", audio_mute);
   t.insert("audio_output_mode", audio_output_mode);
+  t.insert("cheat_set_credits", cheat_set_credits);
+  t.insert("cheat_credits", cheat_credits);
+  t.insert("cheat_unicorn_dealer", cheat_unicorn_dealer);
   return WriteFile(file,
                    "# Written by the FM4 launcher. The game loads this after fm4.toml,\n"
                    "# so these values win. Edit from the launcher.\n\n",

@@ -58,7 +58,7 @@ struct DeviceMonitor::Impl {
   std::atomic<bool> stop{false}, active{false}, test{false};
 
   // SDL owner only.
-  bool caller_thread;
+  bool launcher, caller_thread;
   bool initialized = false, init_attempted = false, haptics_initialized = false;
   struct Open { SDL_Joystick* joystick = nullptr; Device device; };
   std::map<SDL_JoystickID, Open> open;
@@ -76,7 +76,7 @@ struct DeviceMonitor::Impl {
   std::string haptic_status;
   std::thread thread;
 
-  explicit Impl(bool caller) : caller_thread(caller) {
+  Impl(bool launcher, bool caller) : launcher(launcher), caller_thread(caller) {
     if (!caller_thread) thread = std::thread([this] {
       while (!stop) { Tick(); std::this_thread::sleep_for(4ms); }
       Shutdown();
@@ -256,7 +256,7 @@ struct DeviceMonitor::Impl {
       } else if (!(features & SDL_HAPTIC_CONSTANT)) {
         haptic_status = "\"" + open[haptic_owner].device.name + "\" has no constant force; the game would only rumble it.";
         test_cooldown = now + 750ms;
-        if (caller_thread) CloseHaptic();
+        if (launcher) CloseHaptic();
       } else {
         test_stage = 1;
         test_next = now;
@@ -270,7 +270,7 @@ struct DeviceMonitor::Impl {
                       " % strength). If it pulled right first, tick Reverse force direction.";
       test_stage = 0;
       test_cooldown = now + 500ms;
-      if (caller_thread) CloseHaptic();
+      if (launcher) CloseHaptic();
       return;
     }
     // A positive level pulls left (SDL and DirectInput name the side a force
@@ -287,7 +287,7 @@ struct DeviceMonitor::Impl {
       haptic_status = std::string("The device refused a constant force: ") + SDL_GetError();
       test_stage = 0;
       test_cooldown = now + 750ms;
-      if (caller_thread) CloseHaptic();
+      if (launcher) CloseHaptic();
       return;
     }
     haptic_status = test_stage == 1 ? "Pulling LEFT..." : "Pulling RIGHT...";
@@ -319,17 +319,18 @@ struct DeviceMonitor::Impl {
     Snapshot next;
     ReadDevices(next);
     next.generation = generation;
+    next.ready = true;
     next.status = open.empty() ? "No game controllers found" : std::to_string(open.size()) + " devices";
 
     const FfbMode mode = ParseFfbMode(s.ffb_mode);
     // The game keeps the force device open while force feedback is on; the
     // launcher opens it only for Test, so the game can have it.
-    if (!caller_thread && mode != FfbMode::kOff && now - haptic_attempt >= 1s) {
+    if (!launcher && mode != FfbMode::kOff && now - haptic_attempt >= 1s) {
       const SDL_JoystickID want = ForceDevice(s);
       if (want != haptic_owner || !haptic) { haptic_attempt = now; OpenHaptic(want); }
     }
     RunTest(s, now);
-    if (haptic && test_stage == 0 && !caller_thread) {
+    if (haptic && test_stage == 0 && !launcher) {
       const bool focused = active;
       if (mode == FfbMode::kEffects && ForceOutputAllowed(focused, in_race, beat, now)) ApplyEffects(s, effects, starts, now);
       else StopEffects();
@@ -346,7 +347,8 @@ struct DeviceMonitor::Impl {
   }
 };
 
-DeviceMonitor::DeviceMonitor(bool caller_thread) : impl_(std::make_unique<Impl>(caller_thread)) {}
+DeviceMonitor::DeviceMonitor(bool launcher, bool caller_thread)
+    : impl_(std::make_unique<Impl>(launcher, caller_thread)) {}
 DeviceMonitor::~DeviceMonitor() = default;
 void DeviceMonitor::Pump() { if (impl_->caller_thread) impl_->Tick(); }
 Snapshot DeviceMonitor::Read() const { std::lock_guard lock(impl_->mutex); return impl_->snapshot; }

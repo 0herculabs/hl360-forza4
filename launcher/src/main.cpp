@@ -66,7 +66,7 @@ ImU32 Col(const ImVec4& c, float alpha = 1.0f) {
   return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * alpha));
 }
 
-enum class Tab { kInstructions, kProfiles, kGraphics, kControls, kWheel, kAudio, kInstall, kSupport };
+enum class Tab { kInstructions, kProfiles, kGraphics, kControls, kWheel, kAudio, kCheats, kInstall, kSupport };
 
 // --- Key capture -----------------------------------------------------------
 
@@ -970,8 +970,9 @@ struct App {
     }
     Save();
     // DirectInput wheel handles are exclusive. Release the preview before
-    // starting the child, including any diagnostic haptic effect.
-    wheel_monitor.reset();
+    // starting the child, including any diagnostic haptic effect. Its worker
+    // may still be waiting on Windows' device list: let it finish on its own.
+    if (wheel_monitor) std::thread([monitor = std::move(wheel_monitor)] {}).detach();
     wheel_ui.capture = {};
     const std::string exe = game_exe.u8string();
     const std::string cwd = exe_dir.u8string();
@@ -2275,7 +2276,10 @@ void TabWheel(App& app) {
   std::snprintf(summary, sizeof(summary), L("%d connected", "%d conectados"), int(devices.size()));
   CardHeader("devices", L("Devices", "Dispositivos"), summary, ui.open_devices);
   if (ui.open_devices) {
-    if (devices.empty())
+    if (!snap.ready)
+      TextDim(L("Looking for game controllers... If this takes long, a USB or Bluetooth device is not answering Windows; unplugging and reconnecting it usually helps.",
+                "Buscando mandos... Si tarda, hay un dispositivo USB o Bluetooth que no responde a Windows; desconectarlo y volver a conectarlo suele arreglarlo."));
+    else if (devices.empty())
       TextDim(L("No game controllers found. Connect your wheel, pedals and other devices; the list updates by itself.",
                 "No hay mandos. Conecta volante, pedales y otros dispositivos; la lista se actualiza sola."));
     const auto now = Clock::now();
@@ -2845,6 +2849,57 @@ void TabSupport() {
 }
 
 // Underlined text tabs across the top of the settings column.
+// Cheats (src/cheats.cpp), applied from the next game start.
+void TabCheats(App& app) {
+  Settings& s = app.settings;
+  bool changed = false;
+  BeginCard("##credits", L("Credits", "Créditos"),
+            L("Sets the active profile's credits every time the game starts. The game saves them with your career.",
+              "Fija los créditos del perfil activo cada vez que se inicia el juego. El juego los guarda con tu partida."));
+  if (BeginRows("##c")) {
+    Row(L("Set credits at start", "Fijar créditos al iniciar"),
+        L("While on, what you earn or spend is reset at the next start. Turn it off once you have the amount.",
+          "Mientras esté activado, lo que ganes o gastes se restablece en el siguiente inicio. Desactívalo cuando tengas la cantidad."));
+    changed |= Toggle("##set_credits", &s.cheat_set_credits);
+    Row(L("Credits", "Créditos"),
+        L("At most 20,000,000: the game lowers anything above that when it loads a profile.",
+          "Máximo 20.000.000: el juego recorta lo que pase de esa cifra al cargar el perfil."));
+    ImGui::BeginDisabled(!s.cheat_set_credits);
+    if (ImGui::InputInt("##credits", &s.cheat_credits, 10000, 1000000)) {
+      s.cheat_credits = std::clamp(s.cheat_credits, 0, 20000000);
+      changed = true;
+    }
+    for (const int amount : {1000000, 5000000, 20000000}) {
+      if (amount != 1000000) ImGui::SameLine();
+      const std::string label = amount == 20000000 ? std::string(L("Maximum", "Máximo"))
+                                                   : std::to_string(amount / 1000000) + " M";
+      if (ImGui::Button(label.c_str())) {
+        s.cheat_credits = amount;
+        changed = true;
+      }
+    }
+    ImGui::EndDisabled();
+    EndRows();
+  }
+  EndCard();
+  BeginCard("##unicorn", L("Unicorn cars", "Coches unicornio"),
+            L("17 cars that on the Xbox 360 were only gifts, such as the Ferrari F430 Scuderia, the Honda NSX-R GT "
+              "and the Toyota Supra Top Secret.",
+              "17 coches que en Xbox 360 solo se conseguían como regalo, como el Ferrari F430 Scuderia, el Honda NSX-R GT "
+              "y el Toyota Supra Top Secret."));
+  if (BeginRows("##u")) {
+    Row(L("Sell them in the dealer", "Venderlos en el concesionario"),
+        L("They appear under their make in Cars > Buy Cars, at their normal price.",
+          "Aparecen en su marca en Coches > Comprar coches, a su precio normal."));
+    changed |= Toggle("##unicorn_dealer", &s.cheat_unicorn_dealer);
+    EndRows();
+  }
+  EndCard();
+  TextDim(L("Changes apply the next time the game starts. Back up your profile before using cheats.",
+            "Los cambios se aplican la próxima vez que se inicie el juego. Haz una copia de tu perfil antes de usar trucos."));
+  if (changed) app.Save();
+}
+
 void TabBar(App& app) {
   const std::pair<Tab, const char*> tabs[] = {{Tab::kInstructions, L("Instructions", "Instrucciones")},
                                               {Tab::kProfiles, L("Profiles", "Perfiles")},
@@ -2852,6 +2907,7 @@ void TabBar(App& app) {
                                               {Tab::kControls, L("Controls", "Controles")},
                                               {Tab::kWheel, L("Wheel", "Volante")},
                                               {Tab::kAudio, L("Language & sound", "Idioma y sonido")},
+                                              {Tab::kCheats, L("Cheats", "Trucos")},
                                               {Tab::kInstall, L("Install", "Instalación")},
                                               {Tab::kSupport, L("Support", "Apoyar")}};
   ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -3142,7 +3198,7 @@ int main(int argc, char** argv) {
   gpu_info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
   ImGui_ImplSDLGPU3_Init(&gpu_info);
 
-  // --screenshot <file.bmp> [--tab profiles|graphics|controls|audio|install]:
+  // --screenshot <file.bmp> [--tab profiles|graphics|controls|audio|cheats|install]:
   // render a few frames, save the window and exit (docs and UI checks).
   std::string screenshot;
   int screenshot_frame = 4;
@@ -3158,6 +3214,7 @@ int main(int argc, char** argv) {
                 : t == "controls" ? Tab::kControls
                 : t == "wheel"    ? Tab::kWheel
                 : t == "audio"    ? Tab::kAudio
+                : t == "cheats"   ? Tab::kCheats
                 : t == "install"  ? Tab::kInstall
                                   : Tab::kProfiles;
     }
@@ -3202,7 +3259,6 @@ int main(int argc, char** argv) {
     if (app.wheel_monitor) {
       app.wheel_monitor->SetActive(
           app.tab == Tab::kWheel && !app.game && (SDL_GetWindowFlags(app.window) & SDL_WINDOW_INPUT_FOCUS) != 0);
-      app.wheel_monitor->Pump();
     }
     if (SDL_GetWindowFlags(app.window) & SDL_WINDOW_MINIMIZED) {
       app.PollGame();
@@ -3290,6 +3346,7 @@ int main(int argc, char** argv) {
       case Tab::kControls: TabControls(app); break;
       case Tab::kWheel: TabWheel(app); break;
       case Tab::kAudio: TabAudio(app); break;
+      case Tab::kCheats: TabCheats(app); break;
       case Tab::kInstall: TabInstall(app); break;
       case Tab::kSupport: TabSupport(); break;
     }

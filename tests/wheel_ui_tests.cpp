@@ -25,7 +25,7 @@ int main() {
     Check(id != 0, SDL_GetError());
     auto* joystick = SDL_OpenJoystick(id); Check(joystick != nullptr, SDL_GetError());
     for (int session = 0; session < 3; ++session) {
-      fm4::wheel::DeviceMonitor monitor(true);
+      fm4::wheel::DeviceMonitor monitor(true, true);
       fm4::wheel::Settings settings;
       settings.device = "UI test wheel";
       monitor.ConfigureForce(settings);

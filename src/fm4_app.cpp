@@ -8,14 +8,21 @@
 #include "wheel_input.h"
 #include "audio_output.h"
 #include "camera_view.h"
+#include "cheats.h"
 #include "wide_view.h"
 
+#include <atomic>
 #include <charconv>
+#include <chrono>
+#include <thread>
+
+#include <windows.h>
 
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/filesystem.h>
+#include <rex/logging/api.h>
 #include <rex/logging/macros.h>
 #include <rex/runtime.h>
 #include <rex/system/gpu_plugin.h>
@@ -136,6 +143,7 @@ static void MountCachePartition(rex::Runtime* runtime, const std::filesystem::pa
 
 void Fm4App::OnPostLoadXexImage() {
   fm4::ResignProtectedFiles(runtime(), game_data_root());
+  fm4::cheats::PatchImage(runtime());
 }
 
 void Fm4App::OnPostSetup() {
@@ -184,7 +192,35 @@ void Fm4App::OnWindowFocusChanged(bool focused) {
   fm4::wheel::SetFocus(focused);
   if (!focused) fm4::camera::ReleaseKeys();
 }
-bool Fm4App::OnWindowCloseRequested() { fm4::wheel::SetFocus(false);fm4::wheel::ResetEffects();return true; }
+namespace {
+
+// Closing the window ends the process from the SDK's OnClosing, but a step
+// before that exit can block and leave a frozen window (issue #30: the log
+// stops after "Execution complete"). Whatever is still running after a few
+// seconds, the process ends.
+void StartExitWatchdog() {
+  static std::atomic<bool> started{false};
+  if (started.exchange(true)) return;
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    // The log may be what is blocked: it gets a moment, not a say.
+    std::thread([] {
+      REXLOG_WARN("Shutdown still running after 3 s; ending the process");
+      rex::FlushLogging();
+    }).detach();
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    TerminateProcess(GetCurrentProcess(), 0);
+  }).detach();
+}
+
+}  // namespace
+
+bool Fm4App::OnWindowCloseRequested() {
+  StartExitWatchdog();
+  fm4::wheel::SetFocus(false);
+  fm4::wheel::ResetEffects();
+  return true;
+}
 void Fm4App::OnWindowMinimized() { fm4::wheel::SetFocus(false); }
 
 void Fm4App::FullscreenToggle::OnKeyDown(rex::ui::KeyEvent& e) {

@@ -31,6 +31,7 @@ set(FM4_SOURCES
     src/camera_view.cpp
     src/wide_view.cpp
     src/frame_pacing.cpp
+    src/cheats.cpp
     src/scripted_input.cpp
     src/debug_capture.cpp
     src/telemetry/forza_dash.cpp

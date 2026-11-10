@@ -27,21 +27,25 @@ const Device* FindDevice(const std::vector<Device>& devices, std::string_view ma
 struct Snapshot {
   std::vector<Device> devices;
   uint64_t generation = 0;  // changes when a device connects or disconnects
+  bool ready = false;       // the first device list is in
   std::string status, haptic_status, ffb_name;
   bool force_supported = false;  // the force device plays constant force
   bool rumble_supported = false;
   bool test_busy = false;
 };
 
-// Each instance has one SDL owner: a worker thread in the game, or the UI
-// caller in the launcher. SDL haptics are not thread-safe.
+// Each instance has one SDL owner: its worker thread, or the caller (tests).
+// SDL haptics are not thread-safe.
 class DeviceMonitor {
  public:
-  // UI mode: all SDL calls, including destruction, stay on the caller thread.
-  explicit DeviceMonitor(bool caller_thread = false);
+  // Launcher mode opens the force device only for TestHaptics, so the game
+  // can have it. A caller-thread monitor makes every SDL call, destruction
+  // included, from Pump's thread. The launcher keeps a worker: Windows can
+  // take tens of seconds to list controllers when a device stops answering.
+  explicit DeviceMonitor(bool launcher = false, bool caller_thread = false);
   ~DeviceMonitor();
   DeviceMonitor(const DeviceMonitor&) = delete;
-  void Pump();  // call once per UI frame in caller-thread mode
+  void Pump();  // call once per frame in caller-thread mode
   Snapshot Read() const;
   void SetActive(bool active);
   // The force device (FfbDevice matching) and how the game's effects play.
