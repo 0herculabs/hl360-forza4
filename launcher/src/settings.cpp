@@ -76,8 +76,15 @@ bool WriteFile(const std::filesystem::path& file, const std::string& header, con
 }
 
 
-// The wheel_* and telemetry_* keys (src/wheel_input.cpp, src/telemetry).
-void ReadWheel(const toml::table& t, fm4::wheel::Settings& w) {
+// The fm4_wheel_* and telemetry_* keys (src/wheel_input.cpp, src/telemetry).
+// Releases up to 0.3.11 wrote wheel_*, which the ShiftGlue SDK's own wheel
+// driver also reads; they are read when no fm4_wheel_* key replaces them.
+void ReadWheel(const toml::table& file, fm4::wheel::Settings& w) {
+  toml::table t = file;
+  for (const auto& [key, value] : file) {
+    const std::string_view name = key.str();
+    if (name.substr(0, 10) == "fm4_wheel_") t.insert_or_assign(std::string(name.substr(4)), value);
+  }
   Read(t, "wheel_enabled", w.enabled);
   Read(t, "wheel_device", w.device);
   w.device = fm4::wheel::MigrateDeviceKey(w.device);
@@ -159,7 +166,8 @@ void ReadWheel(const toml::table& t, fm4::wheel::Settings& w) {
   }
 }
 
-void WriteWheel(toml::table& t, const fm4::wheel::Settings& w) {
+void WriteWheel(toml::table& out, const fm4::wheel::Settings& w) {
+  toml::table t;
   t.insert("wheel_enabled", w.enabled);
   t.insert("wheel_device", w.device);
   t.insert("wheel_steering_axis", w.steering_axis);
@@ -197,6 +205,10 @@ void WriteWheel(toml::table& t, const fm4::wheel::Settings& w) {
   t.insert("telemetry_udp_format", w.telemetry_format == "horizon" ? "horizon" : "fm7");
   t.insert("telemetry_udp_target", w.telemetry_target);
   t.insert("telemetry_udp_moving_only", w.telemetry_moving_only);
+  for (auto&& [key, value] : t) {
+    const std::string name(key.str());
+    out.insert(name.rfind("wheel_", 0) == 0 ? "fm4_" + name : name, value);
+  }
 }
 
 }  // namespace

@@ -6,16 +6,16 @@
 #include <functional>
 #include <stdexcept>
 
-REXCVAR_DECLARE(bool,wheel_enabled);
-REXCVAR_DECLARE(std::string,wheel_device);
-REXCVAR_DECLARE(std::string,wheel_throttle);
-REXCVAR_DECLARE(std::string,wheel_brake);
-REXCVAR_DECLARE(std::string,wheel_clutch);
-REXCVAR_DECLARE(std::string,wheel_buttons);
-REXCVAR_DECLARE(std::string,wheel_clutch_button);
-REXCVAR_DECLARE(std::string,wheel_ffb_mode);
-REXCVAR_DECLARE(bool,wheel_clutch_analog);
-REXCVAR_DECLARE(int32_t,wheel_pedal_deadzone);
+REXCVAR_DECLARE(bool,fm4_wheel_enabled);
+REXCVAR_DECLARE(std::string,fm4_wheel_device);
+REXCVAR_DECLARE(std::string,fm4_wheel_throttle);
+REXCVAR_DECLARE(std::string,fm4_wheel_brake);
+REXCVAR_DECLARE(std::string,fm4_wheel_clutch);
+REXCVAR_DECLARE(std::string,fm4_wheel_buttons);
+REXCVAR_DECLARE(std::string,fm4_wheel_clutch_button);
+REXCVAR_DECLARE(std::string,fm4_wheel_ffb_mode);
+REXCVAR_DECLARE(bool,fm4_wheel_clutch_analog);
+REXCVAR_DECLARE(int32_t,fm4_wheel_pedal_deadzone);
 
 void Check(bool v,const char* why) {if(!v) throw std::runtime_error(why);}
 SDL_Joystick* Attach(const char* name,SDL_JoystickType type,int axes,int buttons,int hats,SDL_JoystickID& id) {
@@ -42,15 +42,19 @@ int main() {
     auto* wheel=Attach("FM4 runtime test wheel",SDL_JOYSTICK_TYPE_WHEEL,4,8,1,wheel_id);
     auto* pedals=Attach("FM4 test pedals",SDL_JOYSTICK_TYPE_UNKNOWN,3,0,0,pedal_id);
     SDL_SetJoystickVirtualAxis(pedals,0,-32768);SDL_SetJoystickVirtualAxis(pedals,1,32767);SDL_SetJoystickVirtualAxis(pedals,2,-32768);
-    REXCVAR_SET(wheel_enabled,true);
-    REXCVAR_SET(wheel_device,std::string("runtime test wheel"));
-    REXCVAR_SET(wheel_throttle,std::string("FM4 test pedals|+axis0"));
-    REXCVAR_SET(wheel_brake,std::string("FM4 test pedals|-axis1"));
-    REXCVAR_SET(wheel_clutch,std::string("FM4 test pedals|+axis2"));
-    REXCVAR_SET(wheel_buttons,std::string("UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right,A=3,RB=0,LB=1,X=FM4 test pedals|+axis0"));
-    REXCVAR_SET(wheel_clutch_button,std::string("B"));
-    REXCVAR_SET(wheel_ffb_mode,std::string("off"));
-    REXCVAR_SET(wheel_pedal_deadzone,0);
+    // The config file reaches settings through the registry by name. A name
+    // the SDK also defines (ShiftGlue's wheel_*) would leave this copy at its
+    // default and the wheel off.
+    Check(rex::cvar::SetFlagByName("fm4_wheel_enabled","true") && REXCVAR_GET(fm4_wheel_enabled),
+          "Wheel settings from the config file do not reach the wheel code");
+    REXCVAR_SET(fm4_wheel_device,std::string("runtime test wheel"));
+    REXCVAR_SET(fm4_wheel_throttle,std::string("FM4 test pedals|+axis0"));
+    REXCVAR_SET(fm4_wheel_brake,std::string("FM4 test pedals|-axis1"));
+    REXCVAR_SET(fm4_wheel_clutch,std::string("FM4 test pedals|+axis2"));
+    REXCVAR_SET(fm4_wheel_buttons,std::string("UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right,A=3,RB=0,LB=1,X=FM4 test pedals|+axis0"));
+    REXCVAR_SET(fm4_wheel_clutch_button,std::string("B"));
+    REXCVAR_SET(fm4_wheel_ffb_mode,std::string("off"));
+    REXCVAR_SET(fm4_wheel_pedal_deadzone,0);
     auto system=fm4::wheel::CreateInputSystem(false);
     auto* input=static_cast<rex::input::InputSystem*>(system.get());
     rex::input::X_INPUT_STATE state{};
@@ -85,7 +89,7 @@ int main() {
         "Wheel subtype or disabled FFB capability incorrect");
     input->Shutdown();system.reset();
 
-    REXCVAR_SET(wheel_clutch_analog,true);
+    REXCVAR_SET(fm4_wheel_clutch_analog,true);
     system=fm4::wheel::CreateInputSystem(false);
     input=static_cast<rex::input::InputSystem*>(system.get());
     SDL_SetJoystickVirtualAxis(pedals,2,32767);

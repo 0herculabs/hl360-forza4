@@ -1,7 +1,7 @@
 ﻿# Racing wheels, separate USB devices and native FFB
 
 The wheel support is the Pinyon Shift (Forza Horizon 1) racing wheel work
-brought to FM4: the same Wheel screen, binding syntax and `wheel_*` settings,
+brought to FM4: the same Wheel screen, binding syntax and settings,
 on top of FM4's own native force feedback hooks.
 
 - Steering, pedals, buttons and an H-shifter can each come from a different USB
@@ -51,34 +51,39 @@ move the wheel, pick the other entry.
 
 Devices are named by `vvvv:pppp` (USB vendor and product, hex), part of the
 name, or `path:<SDL path>`. Inputs are `[device|]input`; without a device they
-are on the wheel base (`wheel_device`).
+are on the wheel base (`fm4_wheel_device`).
+
+These were `wheel_*` up to 0.3.11, the same names as the ShiftGlue SDK's own
+wheel driver, which took them over (FFB at about 1 %). FM4 keeps its own
+driver: the SDK's is switched off in `patches/shiftglue`, and the launcher
+carries the old keys over.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `wheel_enabled` | `false` | Use the wheel bindings for player one. |
-| `wheel_device` | `""` | The wheel base; empty for the first device SDL types as a wheel. |
-| `wheel_steering_axis`, `wheel_steering_invert` | `0`, `false` | Steering axis on the base. |
-| `wheel_rotation`, `wheel_game_rotation` | `900`, `0` | The rotation set in the wheel's software and the in-game steering wheel's, degrees lock to lock. With `wheel_game_rotation` set, full lock comes when the wheel has turned that far (900 on 360: 250 % sensitivity), so the cockpit wheel follows the real one; `0` maps the wheel's full rotation to full lock. |
-| `wheel_steering_scale`, `wheel_steering_deadzone` | `100`, `0` | Sensitivity and dead zone, percent. |
-| `wheel_throttle`, `wheel_brake`, `wheel_clutch` | `""` | Pedal axes, `[device|][+|-]axisN` (`-`: the pedal rests at the top). |
-| `wheel_buttons` | the hat as the D-pad | `NAME=input,...`: `N` a button, `hN.up` a hat direction, `[+|-]axisN` an axis past half travel. NAME is A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START, UP, DOWN, LEFT, RIGHT, GEAR1-GEAR7 / REVERSE, or a camera action (CAM_FOV_IN, CAM_FOV_OUT, CAM_FOV_RESET, CAM_SEAT_UP, CAM_SEAT_DOWN, CAM_SEAT_FORWARD, CAM_SEAT_BACK, CAM_SEAT_RESET; see [camera](camera.md)). A NAME may appear more than once. |
-| `wheel_clutch_button` | `B` | Buttons the clutch pedal presses past half travel. |
-| `wheel_clutch_analog` | `false` | Also send the clutch as the right stick's Y axis (FH1's analog clutch; not confirmed in FM4). |
-| `wheel_pedal_deadzone`, `wheel_{throttle,brake,clutch}_deadzone_{bottom,top}` | `3`, `-1`/`0` | Pedal dead zones, percent; bottom `-1` uses `wheel_pedal_deadzone`. |
-| `wheel_ffb_device` | `""` | Device that receives forces; empty for the wheel base. |
-| `wheel_ffb_mode` | `on` | `on` (the game's effects), `rumble` (vibration only), `off`. |
-| `wheel_ffb_strength` | `25` | Overall strength, percent (0-200; above 100 the strongest forces clip at the base's maximum). |
-| `wheel_ffb_min_force` | `0` | Lift small forces for geared or belted wheels. |
-| `wheel_ffb_spring`, `_damper`, `_friction`, `_inertia` | `100` | Each of the game's condition effects, percent (0-200). |
-| `wheel_ffb_rumble`, `_rumble_engine`, `_rumble_road` | `50`, `100`, `100` | The game's rumble as a vibration, and each motor's share. |
-| `wheel_ffb_invert` | `false` | Reverse the force direction. |
-| `wheel_log_inputs` | `false` | Log raw axis, button and hat changes. |
+| `fm4_wheel_enabled` | `false` | Use the wheel bindings for player one. |
+| `fm4_wheel_device` | `""` | The wheel base; empty for the first device SDL types as a wheel. |
+| `fm4_wheel_steering_axis`, `fm4_wheel_steering_invert` | `0`, `false` | Steering axis on the base. |
+| `fm4_wheel_rotation`, `fm4_wheel_game_rotation` | `900`, `0` | The rotation set in the wheel's software and the in-game steering wheel's, degrees lock to lock. With `fm4_wheel_game_rotation` set, full lock comes when the wheel has turned that far (900 on 360: 250 % sensitivity), so the cockpit wheel follows the real one; `0` maps the wheel's full rotation to full lock. |
+| `fm4_wheel_steering_scale`, `fm4_wheel_steering_deadzone` | `100`, `0` | Sensitivity and dead zone, percent. |
+| `fm4_wheel_throttle`, `fm4_wheel_brake`, `fm4_wheel_clutch` | `""` | Pedal axes, `[device|][+|-]axisN` (`-`: the pedal rests at the top). |
+| `fm4_wheel_buttons` | the hat as the D-pad | `NAME=input,...`: `N` a button, `hN.up` a hat direction, `[+|-]axisN` an axis past half travel. NAME is A, B, X, Y, LB, RB, LT, RT, LS, RS, BACK, START, UP, DOWN, LEFT, RIGHT, GEAR1-GEAR7 / REVERSE, or a camera action (CAM_FOV_IN, CAM_FOV_OUT, CAM_FOV_RESET, CAM_SEAT_UP, CAM_SEAT_DOWN, CAM_SEAT_FORWARD, CAM_SEAT_BACK, CAM_SEAT_RESET; see [camera](camera.md)). A NAME may appear more than once. |
+| `fm4_wheel_clutch_button` | `B` | Buttons the clutch pedal presses past half travel. |
+| `fm4_wheel_clutch_analog` | `false` | Also send the clutch as the right stick's Y axis (FH1's analog clutch; not confirmed in FM4). |
+| `fm4_wheel_pedal_deadzone`, `fm4_wheel_{throttle,brake,clutch}_deadzone_{bottom,top}` | `3`, `-1`/`0` | Pedal dead zones, percent; bottom `-1` uses `fm4_wheel_pedal_deadzone`. |
+| `fm4_wheel_ffb_device` | `""` | Device that receives forces; empty for the wheel base. |
+| `fm4_wheel_ffb_mode` | `on` | `on` (the game's effects), `rumble` (vibration only), `off`. |
+| `fm4_wheel_ffb_strength` | `25` | Overall strength, percent (0-200; above 100 the strongest forces clip at the base's maximum). |
+| `fm4_wheel_ffb_min_force` | `0` | Lift small forces for geared or belted wheels. |
+| `fm4_wheel_ffb_spring`, `_damper`, `_friction`, `_inertia` | `100` | Each of the game's condition effects, percent (0-200). |
+| `fm4_wheel_ffb_rumble`, `_rumble_engine`, `_rumble_road` | `50`, `100`, `100` | The game's rumble as a vibration, and each motor's share. |
+| `fm4_wheel_ffb_invert` | `false` | Reverse the force direction. |
+| `fm4_wheel_log_inputs` | `false` | Log raw axis, button and hat changes. |
 
 H-shifter gears are sent as FH1 reads them (the held gear on the right stick's
 X axis, with a shifter reported in the capabilities); FM4 shares FH1's wheel
 code but this is not confirmed in FM4 yet. FH1's 900-degree flag does not exist
 in FM4 (no comparison against 900 in its code); the rotation is matched by
-scaling the steering instead (`wheel_game_rotation`). FM4 has no single
+scaling the steering instead (`fm4_wheel_game_rotation`). FM4 has no single
 steering rotation to read: each car has its own lock in its data
 (`SteerLock`, `SteeringWheelAngleScale`).
 
