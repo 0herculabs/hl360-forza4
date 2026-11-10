@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <string>
 #include <stdexcept>
 
 using namespace fm4::wheel;
@@ -106,6 +108,13 @@ int main() {
     out.display_wide_view=false;
     out.display_hud_edges=true;
     Check(out.Save(dir/"user.toml"),"Settings save");
+    {
+      // Own names, and the ShiftGlue SDK's wheel driver (wheel_*) kept off.
+      std::ifstream saved(dir/"user.toml");
+      const std::string text((std::istreambuf_iterator<char>(saved)),std::istreambuf_iterator<char>());
+      Check(text.find("fm4_wheel_enabled = true")!=std::string::npos && text.find("\nwheel_enabled = false")!=std::string::npos &&
+            text.find("\nwheel_ffb_strength")==std::string::npos,"Wheel keys saved under fm4_wheel_*");
+    }
     launcher::Settings in;
     Check(in.Load(dir/"user.toml"),"Settings load");
     Check(in.wheel.device==out.wheel.device && in.wheel.throttle==out.wheel.throttle && in.wheel.buttons==out.wheel.buttons &&
@@ -119,6 +128,13 @@ int main() {
              "wheel_brake_axis = 5\nwheel_brake_rest = -32768\nwheel_brake_full = 32767\nwheel_left = 32767\nwheel_right = -32768\n"
              "wheel_button_a = 3\nwheel_button_shift_up = 0\nwheel_shift_up_action = 5\nwheel_clutch_action = 0\n";
     }
+    {
+      // 0.3.11 wrote wheel_*; they carry over.
+      std::ofstream v0311(dir/"v0311.toml");
+      v0311 << "wheel_enabled = true\nwheel_ffb_strength = 120\nwheel_ffb_mode = 'on'\n";
+    }
+    launcher::Settings v0311;
+    Check(v0311.Load(dir/"v0311.toml") && v0311.wheel.enabled && v0311.wheel.ffb_strength==120,"0.3.11 wheel keys carried over");
     launcher::Settings migrated;
     Check(migrated.Load(dir/"old.toml"),"Old settings load");
     Check(migrated.wheel.device=="path:\\\\?\\HID#X" && migrated.wheel.throttle=="-axis2" && migrated.wheel.brake=="+axis5",
