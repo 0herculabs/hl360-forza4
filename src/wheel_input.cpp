@@ -303,10 +303,6 @@ void OperateEffect(int id,bool start) {if(auto s=Service()) s->OperateForce(id,s
 void ResetEffects() {if(auto s=Service()) s->ClearForce();}
 void SetDriving(bool driving) {if(auto s=Service()) s->SetDriving(driving);}
 std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
-  // An SDK with its own racing wheel driver (ShiftGlue) reads wheel_enabled;
-  // with this wheel on, keep that one off so only one drives the wheel.
-  if (!tool_mode && REXCVAR_GET(fm4_wheel_enabled) && !rex::cvar::GetFlagByName("wheel_enabled").empty())
-    rex::cvar::SetFlagByName("wheel_enabled", "false");
   auto input = rex::input::CreateDefaultInputSystem(tool_mode);
   if (!tool_mode) AddScriptedInput(*input);
   if (!tool_mode && REXCVAR_GET(fm4_wheel_enabled)) {

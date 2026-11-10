@@ -209,8 +209,6 @@ void WriteWheel(toml::table& out, const fm4::wheel::Settings& w) {
     const std::string name(key.str());
     out.insert(name.rfind("wheel_", 0) == 0 ? "fm4_" + name : name, value);
   }
-  // The ShiftGlue SDK's own wheel driver stays off; this one drives the wheel.
-  out.insert("wheel_enabled", false);
 }
 
 }  // namespace

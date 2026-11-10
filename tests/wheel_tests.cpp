@@ -109,10 +109,10 @@ int main() {
     out.display_hud_edges=true;
     Check(out.Save(dir/"user.toml"),"Settings save");
     {
-      // Own names, and the ShiftGlue SDK's wheel driver (wheel_*) kept off.
+      // Own names, not the ShiftGlue SDK wheel driver's wheel_*.
       std::ifstream saved(dir/"user.toml");
       const std::string text((std::istreambuf_iterator<char>(saved)),std::istreambuf_iterator<char>());
-      Check(text.find("fm4_wheel_enabled = true")!=std::string::npos && text.find("\nwheel_enabled = false")!=std::string::npos &&
+      Check(text.find("fm4_wheel_enabled = true")!=std::string::npos && text.find("\nwheel_enabled")==std::string::npos &&
             text.find("\nwheel_ffb_strength")==std::string::npos,"Wheel keys saved under fm4_wheel_*");
     }
     launcher::Settings in;

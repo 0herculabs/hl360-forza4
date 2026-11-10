@@ -53,11 +53,10 @@ Devices are named by `vvvv:pppp` (USB vendor and product, hex), part of the
 name, or `path:<SDL path>`. Inputs are `[device|]input`; without a device they
 are on the wheel base (`fm4_wheel_device`).
 
-These were `wheel_*` up to 0.3.11. The ShiftGlue SDK has its own racing
-wheel driver with settings of the same names, which took them over: this
-wheel stayed off and that driver played FM4's forces at about 1 % strength.
-The launcher carries the old keys over and writes `wheel_enabled = false` to
-keep that driver off.
+These were `wheel_*` up to 0.3.11, the same names as the ShiftGlue SDK's own
+wheel driver, which took them over (FFB at about 1 %). FM4 keeps its own
+driver: the SDK's is switched off in `patches/shiftglue`, and the launcher
+carries the old keys over.
 
 | Setting | Default | What it does |
 | --- | --- | --- |

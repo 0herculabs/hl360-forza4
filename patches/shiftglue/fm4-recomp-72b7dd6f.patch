@@ -504,6 +504,42 @@ index c7f8abb6..4f345b9f 100644
        case Command::kVkSetScissor: {
          auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(stream);
          dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count,
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index 0943f0cd..539eee8a 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -51,10 +51,9 @@ REXCVAR_DEFINE_INT32(pad_gyro_sensitivity, 100, "Input",
+ // Racing wheels (FB-2). The guest sees one XInput wheel: steering on the left
+ // stick X, throttle on the right trigger, brake on the left trigger.
+ // Off by default: wheels then go through the SDL gamepad path (hid_wheel_*).
+-REXCVAR_DEFINE_BOOL(wheel_enabled, false, "Input",
+-                    "Read racing wheels raw, each axis and button bound per device (wheel_*), "
+-                    "as one XInput wheel (subtype 2) that plays the title's own force feedback; "
+-                    "off uses the SDL gamepad path (hid_wheel_*)");
++// fm4-recomp: always off; FM4 has its own wheel driver (src/wheel_input.cpp,
++// fm4_wheel_*), and two drivers would fight over the wheel.
++constexpr bool kWheelEnabled = false;
+ REXCVAR_DEFINE_STRING(wheel_device, "", "Input",
+                       "The wheel base: empty for the first device SDL reports as a wheel, "
+                       "\"vvvv:pppp\" (USB IDs in hex) or part of its name");
+@@ -1254,7 +1253,7 @@ std::string JoystickPathForID(SDL_JoystickID instance_id) {
+ }  // namespace
+ 
+ bool SDLInputDriver::IsSteeringCandidate(SDL_JoystickID instance_id) {
+-  if (!REXCVAR_GET(wheel_enabled)) {
++  if (!kWheelEnabled) {
+     return false;
+   }
+   const std::string name = JoystickNameForID(instance_id);
+@@ -1274,7 +1273,7 @@ bool SDLInputDriver::IsSteeringCandidate(SDL_JoystickID instance_id) {
+ }
+ 
+ bool SDLInputDriver::IsWheelPart(SDL_JoystickID instance_id) {
+-  if (!REXCVAR_GET(wheel_enabled)) {
++  if (!kWheelEnabled) {
+     return false;
+   }
+   if (IsSteeringCandidate(instance_id)) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 8f111f7e..665c18eb 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp

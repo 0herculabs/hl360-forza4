@@ -12,6 +12,8 @@ ReXGlue fork), GPU plugin `rexgpu-fh1`. The pinned revision is the one
   0008 (restore the desktop before the hard exit), 0009 (presentation
   diagnostics) and the `video_mode_from_window` part of 0006. ShiftGlue
   already reuses import thunks.
+- The SDK's racing wheel driver is always off (`kWheelEnabled`): FM4 has
+  its own (`src/wheel_input.cpp`, `fm4_wheel_*`).
 - The wide-screen HUD of 0006 (D3D12) ported to the Vulkan renderer:
   `hud_squeeze_edges`, `hud_squeeze_edges_threshold` and
   `hud_squeeze_vertex_shaders` beside ShiftGlue's centred `fh1_hud_squeeze`.
